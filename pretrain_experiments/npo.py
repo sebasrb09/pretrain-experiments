@@ -1,0 +1,453 @@
+"""
+NPO unlearning (Zhang et al., *Negative Preference Optimization: From
+Catastrophic Collapse to Effective Unlearning*, COLM 2024).
+
+DPO's preference objective with the positive term dropped: a bounded,
+reference-anchored forget loss.
+
+    L_NPO(θ) = -(2/β) · E_{x ∼ D_forget} [ log σ( -β · log( π_θ(x) / π_ref(x) ) ) ]
+
+In code we compute per-sequence **summed** NLL over non-pad next-token
+targets, `nll(x) = -log π(x)`, so
+
+    -log( π_θ(x) / π_ref(x) ) = nll_θ(x) − nll_ref(x)
+
+and the σ argument is just `β · (nll_θ − nll_ref)`. This matches the
+reference implementation, which forms `neg_log_ratios = forget_loss_current
+− forget_loss_oracle` from sum-reduced sequence losses.
+
+As the model forgets x, nll_θ grows away from the frozen nll_ref, the σ
+argument → +∞, log σ → 0, and the gradient vanishes. That bounded behavior
+is what separates NPO from gradient ascent, which keeps pushing forever.
+
+Optional retain term: standard cross-entropy on the OLMo-2 stage1 unseen
+slice, weighted by α (the "NPO-RT" variant; α=0 gives plain NPO).
+
+    L_total = L_NPO_forget + α · CE_retain
+
+Difference from `simnpo.py` — and why β does not transfer between them:
+NPO keeps the frozen reference and uses the **sum** of token NLLs, so the σ
+argument scales with sequence length; SimNPO drops the reference and divides
+by |x|. On a pretraining-corpus forget set with sequences up to
+`--max-seq-len` tokens, that length scaling is severe — β·(nll_θ − nll_ref)
+saturates the sigmoid far earlier than the β values quoted in the paper
+(tuned on TOFU's short QA answers) would suggest. Expect the useful β range
+here to sit well below TOFU's, and watch `sigmoid_arg_mean` in
+metrics.jsonl: if it is large and positive from the first step, the loss is
+already saturated and that cell is a no-op.
+
+Precision note: unlike `rmu.py`, whose retain term is an MSE on activations,
+NPO's forget term is a *difference of two large summed log-likelihoods* and
+is therefore exposed to catastrophic cancellation. `--frozen-dtype` defaults
+to float32 here (rmu.py defaults to bfloat16), and per-token CE is
+accumulated in fp32 on both sides regardless. Only drop the reference to
+bfloat16 if memory forces it.
+
+All model parameters of the updated model are trained (full fine-tune; no LoRA).
+
+Usage:
+    python -m pretrain_experiments.npo \
+        --model sbordt/OLMo-2-179M-Exp-Unlearning \
+        --revision stage1-step100000-tokens210B \
+        --olmo-config "$OLMO_REPO/configs/official-0425/OLMo2-1B-stage1.yaml" \
+        --retain-start-step 100000 \
+        --beta 0.1 \
+        --retain-loss-weight 1.0 \
+        --learning-rate 1e-5 \
+        --forget-batch-size 4 --retain-batch-size 4 \
+        --epochs 1 \
+        --output-dir /path/to/unlearning-npo/run-<id>
+
+Reference: https://arxiv.org/abs/2404.05868
+"""
+
+import argparse
+import json
+import random
+from contextlib import nullcontext
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from pretrain_experiments.logging_config import get_logger
+from pretrain_experiments.unlearning_utils import (
+    DEFAULT_MAX_SEQ_LEN,
+    DEFAULT_SEED,
+    build_olmo_retain_dataset,
+    collate_olmo_retain,
+    collate_pad,
+    load_forget_set,
+    save_hf_checkpoint,
+)
+
+logger = get_logger(__name__)
+
+MAX_EPOCHS_CAP = 20
+DEFAULT_CHECKPOINT_EVERY = 1
+
+
+def _infinite(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def _per_seq_sum_nll(model, input_ids, attention_mask):
+    """Summed NLL over real (non-pad) next-token targets, per sequence.
+
+    Returns a (B,) fp32 tensor. Summed — not averaged — to match NPO's
+    sequence-level log-likelihood ratio. Accumulation is forced to fp32
+    because the downstream quantity is a difference of two such sums.
+    """
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    )
+    logits = outputs.logits  # (B, T, V)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+    shift_mask = attention_mask[..., 1:].contiguous().float()
+    ce = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        reduction="none",
+    ).view(shift_labels.shape).float()  # (B, T-1)
+    return (ce * shift_mask).sum(dim=-1)  # (B,)
+
+
+def _avg_ce(model, input_ids, attention_mask):
+    """Mean CE over non-pad next-token targets in the batch."""
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    )
+    logits = outputs.logits
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+    shift_mask = attention_mask[..., 1:].contiguous().to(shift_logits.dtype)
+    ce = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        reduction="none",
+    ).view(shift_labels.shape)
+    return (ce * shift_mask).sum() / shift_mask.sum().clamp_min(1.0)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    # Model / IO
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--revision", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--metrics-jsonl", type=str, default=None)
+
+    # Frozen reference π_ref
+    parser.add_argument("--reference-model", type=str, default=None,
+                        help="Frozen reference model (default: --model, i.e. the "
+                             "pre-unlearning checkpoint — the standard NPO choice).")
+    parser.add_argument("--reference-revision", type=str, default=None,
+                        help="Revision for the reference. Defaults to --revision when "
+                             "--reference-model is not given; otherwise to that repo's main.")
+
+    # Forget set
+    parser.add_argument("--forget-experiments", type=str, nargs="*", default=None,
+                        help="Whitelist of experiments to use as the forget set. "
+                             "Default: all experiments minus iid-replacements-*.")
+
+    # Retain set
+    parser.add_argument("--olmo-config", type=str, required=True,
+                        help="Path to the OLMo TrainConfig YAML used to build the retain stream.")
+    parser.add_argument("--retain-start-step", type=int, required=True,
+                        help="Skip the first N training steps' worth of OLMo sequences "
+                             "(should match the step the loaded checkpoint represents).")
+    parser.add_argument("--retain-seed-override", type=int, default=None,
+                        help="Override the OLMo data seed (default: use seed from --olmo-config).")
+
+    # NPO hyperparams
+    parser.add_argument("--beta", type=float, default=0.1,
+                        help="Inverse temperature β (paper sweeps {0.05, 0.1, 0.5, 1.0}; "
+                             "default: 0.1). Note the sum-NLL scaling caveat in the "
+                             "module docstring — the useful range here is likely lower.")
+    parser.add_argument("--retain-loss-weight", type=float, default=1.0,
+                        help="α on retain CE term (0.0 = plain NPO, no retain pass).")
+
+    # Optimization
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--forget-batch-size", type=int, default=4)
+    parser.add_argument("--retain-batch-size", type=int, default=4)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=1,
+                        help=f"Passes over the forget set (capped at {MAX_EPOCHS_CAP}).")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Optional optimizer-step cap.")
+    parser.add_argument("--checkpoint-every-n-epochs", type=int,
+                        default=DEFAULT_CHECKPOINT_EVERY)
+
+    # System
+    parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dtype", type=str, choices=["float32", "bfloat16"],
+                        default="float32",
+                        help="Compute dtype for forward/backward of the updated model.")
+    parser.add_argument("--frozen-dtype", type=str, choices=["float32", "bfloat16"],
+                        default="float32",
+                        help="Storage dtype for the frozen reference (default: float32 — "
+                             "the log-ratio is a difference of large sums; see the "
+                             "precision note in the module docstring).")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.epochs > MAX_EPOCHS_CAP:
+        raise SystemExit(
+            f"--epochs {args.epochs} exceeds the configured cap of {MAX_EPOCHS_CAP}; "
+            f"raise MAX_EPOCHS_CAP in npo.py if you really mean to."
+        )
+    if args.gradient_accumulation_steps < 1:
+        raise SystemExit("--gradient-accumulation-steps must be >= 1")
+    if args.beta <= 0:
+        raise SystemExit("--beta must be > 0")
+    if args.retain_loss_weight < 0:
+        raise SystemExit("--retain-loss-weight must be >= 0")
+
+    use_retain = args.retain_loss_weight > 0
+
+    # Reference defaults to the loaded checkpoint itself; an explicit
+    # --reference-model opts out of inheriting --revision.
+    if args.reference_model is None:
+        ref_model_id = args.model
+        ref_revision = (
+            args.reference_revision if args.reference_revision is not None
+            else args.revision
+        )
+    else:
+        ref_model_id = args.reference_model
+        ref_revision = args.reference_revision
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = (
+        Path(args.metrics_jsonl) if args.metrics_jsonl else output_dir / "metrics.jsonl"
+    )
+
+    # ---- Models ---------------------------------------------------------
+    logger.info(f"Loading updated model {args.model} (revision={args.revision})...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, revision=args.revision, torch_dtype=torch.float32,
+    ).to(args.device)
+    model.train()
+
+    if args.gradient_checkpointing:
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled on updated model")
+
+    logger.info(
+        f"Loading frozen reference {ref_model_id} (revision={ref_revision}, "
+        f"dtype={args.frozen_dtype})..."
+    )
+    frozen_dtype = torch.bfloat16 if args.frozen_dtype == "bfloat16" else torch.float32
+    frozen = AutoModelForCausalLM.from_pretrained(
+        ref_model_id, revision=ref_revision, torch_dtype=frozen_dtype,
+    ).to(args.device)
+    frozen.eval()
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+
+    # ---- Forget loader -------------------------------------------------
+    forget_dataset, forget_info = load_forget_set(
+        tokenizer,
+        experiments=args.forget_experiments,
+        max_seq_len=args.max_seq_len,
+    )
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    forget_loader = DataLoader(
+        forget_dataset,
+        batch_size=args.forget_batch_size,
+        shuffle=True,
+        generator=g,
+        collate_fn=lambda b: collate_pad(b, pad_id),
+        drop_last=False,
+    )
+
+    # ---- Retain loader (optional) --------------------------------------
+    retain_info = None
+    retain_iter = None
+    if use_retain:
+        retain_dataset, retain_info = build_olmo_retain_dataset(
+            args.olmo_config,
+            start_step=args.retain_start_step,
+            max_seq_len=args.max_seq_len,
+            seed_override=args.retain_seed_override,
+        )
+        retain_loader = DataLoader(
+            retain_dataset,
+            batch_size=args.retain_batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(args.seed + 1),
+            collate_fn=collate_olmo_retain,
+            drop_last=True,
+            num_workers=0,
+        )
+        retain_iter = _infinite(retain_loader)
+    else:
+        logger.info("retain_loss_weight=0 → skipping retain loader (plain NPO)")
+
+    # ---- Optimizer -----------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+
+    config_record = {
+        "method": "npo",
+        "model": args.model,
+        "revision": args.revision,
+        "reference_model": ref_model_id,
+        "reference_revision": ref_revision,
+        "forget_experiments": args.forget_experiments,
+        "forget_set_info": forget_info,
+        "retain_set_info": retain_info,
+        "beta": args.beta,
+        "retain_loss_weight": args.retain_loss_weight,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "forget_batch_size": args.forget_batch_size,
+        "retain_batch_size": args.retain_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "epochs": args.epochs,
+        "max_steps": args.max_steps,
+        "checkpoint_every_n_epochs": args.checkpoint_every_n_epochs,
+        "max_seq_len": args.max_seq_len,
+        "seed": args.seed,
+        "dtype": args.dtype,
+        "frozen_dtype": args.frozen_dtype,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "micro_batches_per_epoch": len(forget_loader),
+    }
+    with open(output_dir / "npo_config.json", "w") as f:
+        json.dump(config_record, f, indent=2)
+
+    metrics_f = open(metrics_path, "w")
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if args.dtype == "bfloat16"
+        else nullcontext()
+    )
+    # An enclosing bf16 autocast would run the frozen forward in bf16 whatever
+    # --frozen-dtype says, silently undoing the fp32 reference. Disable it for
+    # the reference pass so the log-ratio really is computed at fp32.
+    frozen_ctx = (
+        torch.amp.autocast(device_type="cuda", enabled=False)
+        if args.dtype == "bfloat16" and args.frozen_dtype == "float32"
+        else nullcontext()
+    )
+
+    logger.info(
+        f"Starting NPO: lr={args.learning_rate}, β={args.beta}, "
+        f"α_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
+        f"forget_bs={args.forget_batch_size}, retain_bs={args.retain_batch_size}, "
+        f"accum={args.gradient_accumulation_steps}, epochs={args.epochs}, "
+        f"micro_batches/epoch={len(forget_loader)}, dtype={args.dtype}, "
+        f"frozen_dtype={args.frozen_dtype}"
+    )
+
+    optimizer_step = 0
+    micro_step = 0
+    stopped = False
+
+    for epoch in range(1, args.epochs + 1):
+        if stopped:
+            break
+        optimizer.zero_grad()
+        for forget_input_ids, forget_attn in forget_loader:
+            forget_input_ids = forget_input_ids.to(args.device)
+            forget_attn = forget_attn.to(args.device)
+
+            with autocast_ctx:
+                # Forget loss: NPO
+                nll_theta = _per_seq_sum_nll(model, forget_input_ids, forget_attn)  # (B,)
+                with torch.no_grad(), frozen_ctx:
+                    nll_ref = _per_seq_sum_nll(frozen, forget_input_ids, forget_attn)
+                # neg_log_ratio = -log(π_θ/π_ref) = nll_θ - nll_ref
+                neg_log_ratio = nll_theta - nll_ref.to(nll_theta.dtype)
+                arg = args.beta * neg_log_ratio
+                loss_forget = -(2.0 / args.beta) * F.logsigmoid(arg).mean()
+
+                # Retain loss: standard CE on the OLMo unseen slice
+                if use_retain:
+                    retain_input_ids, retain_attn = next(retain_iter)
+                    retain_input_ids = retain_input_ids.to(args.device)
+                    retain_attn = retain_attn.to(args.device)
+                    loss_retain = _avg_ce(model, retain_input_ids, retain_attn)
+                else:
+                    loss_retain = torch.zeros((), device=args.device, dtype=loss_forget.dtype)
+
+                loss = loss_forget + args.retain_loss_weight * loss_retain
+                loss = loss / args.gradient_accumulation_steps
+
+            loss.backward()
+            micro_step += 1
+
+            if micro_step % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                optimizer_step += 1
+
+            metrics_f.write(json.dumps({
+                "epoch": epoch,
+                "micro_step": micro_step,
+                "optimizer_step": optimizer_step,
+                "nll_theta_mean": float(nll_theta.detach().mean().item()),
+                "nll_ref_mean": float(nll_ref.detach().mean().item()),
+                "neg_log_ratio_mean": float(neg_log_ratio.detach().mean().item()),
+                "sigmoid_arg_mean": float(arg.detach().mean().item()),
+                "loss_forget": float(loss_forget.detach().item()),
+                "loss_retain": float(loss_retain.detach().item()),
+                "loss_total": float(
+                    (loss_forget + args.retain_loss_weight * loss_retain).detach().item()
+                ),
+            }) + "\n")
+            metrics_f.flush()
+
+            if args.max_steps is not None and optimizer_step >= args.max_steps:
+                logger.info(f"Reached --max-steps {args.max_steps}; stopping early.")
+                stopped = True
+                break
+
+        # Flush a partial accumulation cycle at epoch boundary so steps stay aligned.
+        if micro_step % args.gradient_accumulation_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            optimizer_step += 1
+
+        logger.info(f"epoch {epoch}/{args.epochs} done: opt_steps={optimizer_step}")
+
+        if epoch % args.checkpoint_every_n_epochs == 0 or epoch == args.epochs or stopped:
+            ckpt_dir = output_dir / f"epoch-{epoch}"
+            logger.info(f"  saving checkpoint to {ckpt_dir}")
+            save_hf_checkpoint(model, tokenizer, str(ckpt_dir))
+
+    metrics_f.close()
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
