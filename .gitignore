@@ -234,3 +234,9 @@ mia-data/*.pkl
 mia-finetune/
 mia-finetune-data/
 noise-vectors/
+
+# Credentials read by internal/uwiki/credentials.sh -- never commit a token
+.hf_token
+.wandb_token
+*.hf_token
+*.wandb_token
