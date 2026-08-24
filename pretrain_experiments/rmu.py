@@ -36,6 +36,7 @@ Reference: https://arxiv.org/abs/2403.03218
 import argparse
 import json
 import random
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -349,6 +350,9 @@ def main():
         f"epochs={args.epochs}, dtype={args.dtype}, frozen_dtype={args.frozen_dtype}"
     )
 
+    # Wall clock for the metrics rows: lets throughput be measured without
+    # model load and tokenization folded in, and gives a live ETA.
+    t_start = time.perf_counter()
     optimizer_step = 0
     micro_step = 0
     target_layer = args.target_layer
@@ -400,6 +404,7 @@ def main():
                 "epoch": epoch,
                 "micro_step": micro_step,
                 "optimizer_step": optimizer_step,
+                "elapsed_s": round(time.perf_counter() - t_start, 3),
                 "loss_forget": float(loss_forget.detach().item()),
                 "loss_retain": float(loss_retain.detach().item()),
                 "loss_total": float((loss_forget + args.alpha * loss_retain).detach().item()),

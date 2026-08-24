@@ -80,6 +80,7 @@ References:
 import argparse
 import json
 import random
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -388,6 +389,9 @@ def main():
         f"micro_batches/epoch={len(forget_loader)}, dtype={args.dtype}"
     )
 
+    # Wall clock for the metrics rows: lets throughput be measured without
+    # model load and tokenization folded in, and gives a live ETA.
+    t_start = time.perf_counter()
     optimizer_step = 0
     micro_step = 0
     stopped = False
@@ -436,6 +440,7 @@ def main():
                 "epoch": epoch,
                 "micro_step": micro_step,
                 "optimizer_step": optimizer_step,
+                "elapsed_s": round(time.perf_counter() - t_start, 3),
                 "ce_forget": ce_val,
                 "weight_mean": float(w_mean.item()),
                 "p_true_mean": float(p_true_mean.item()),

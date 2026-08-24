@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import random
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -175,6 +176,9 @@ def main():
         f"grad_ckpt={args.gradient_checkpointing}"
     )
 
+    # Wall clock for the metrics rows: lets throughput be measured without
+    # model load and tokenization folded in, and gives a live ETA.
+    t_start = time.perf_counter()
     optimizer_step = 0
     micro_step = 0
     for epoch in range(1, args.epochs + 1):
@@ -217,6 +221,7 @@ def main():
                 "epoch": epoch,
                 "micro_step": micro_step,
                 "optimizer_step": optimizer_step,
+                "elapsed_s": round(time.perf_counter() - t_start, 3),
                 "ce": ce_val,
             }) + "\n")
             metrics_f.flush()
