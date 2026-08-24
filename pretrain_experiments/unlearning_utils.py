@@ -73,18 +73,35 @@ def collate_pad(batch, pad_id: int):
     return input_ids, attention_mask
 
 
-def tokenize_and_strip(texts: Iterable[str], tokenizer) -> list[list[int]]:
-    """Tokenize and strip leading/trailing EOS — mirrors insertion_likelihood.py."""
+def tokenize_and_strip(texts: Iterable[str], tokenizer,
+                       batch_size: int = 1000) -> list[list[int]]:
+    """Tokenize and strip leading/trailing EOS — mirrors insertion_likelihood.py.
+
+    Tokenizes in batches rather than one text at a time. The forget set is
+    millions of texts and this runs at the start of EVERY job, so the
+    per-call overhead across the Python/Rust boundary dominated: batching
+    measured ~3x faster single-core (more with several, since the fast
+    tokenizer parallelises within a batch).
+
+    Output is identical to the per-text form: `tokenizer.encode(text)` and
+    `tokenizer([text])['input_ids'][0]` both default to
+    add_special_tokens=True with no padding or truncation. Stripping is done
+    with indices instead of repeated slicing, so each surviving sequence is
+    copied once.
+    """
     eos_id = tokenizer.eos_token_id
+    texts = list(texts)
     out: list[list[int]] = []
-    for text in texts:
-        ids = tokenizer.encode(text)
-        while ids and ids[0] == eos_id:
-            ids = ids[1:]
-        while ids and ids[-1] == eos_id:
-            ids = ids[:-1]
-        if ids:
-            out.append(ids)
+    for start in range(0, len(texts), batch_size):
+        chunk = texts[start:start + batch_size]
+        for ids in tokenizer(chunk)["input_ids"]:
+            a, b = 0, len(ids)
+            while a < b and ids[a] == eos_id:
+                a += 1
+            while b > a and ids[b - 1] == eos_id:
+                b -= 1
+            if b > a:
+                out.append(ids[a:b])
     return out
 
 
@@ -245,7 +262,7 @@ def build_olmo_retain_dataset(
     }
     logger.info(
         f"OLMo retain stream: {info['n_unseen_sequences']} unseen seq ids "
-        f"(skipped {skip} = {start_step}×{global_batch}); seq_len={seq_len}, "
+        f"(skipped {skip} = {start_step}x{global_batch}); seq_len={seq_len}, "
         f"slicing to {max_seq_len}"
     )
     return OlmoRetainDataset(mmap, unseen, max_seq_len), info

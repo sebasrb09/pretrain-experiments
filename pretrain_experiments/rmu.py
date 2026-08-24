@@ -344,7 +344,7 @@ def main():
 
     logger.info(
         f"Starting RMU: lr={args.learning_rate}, target_layer={args.target_layer}, "
-        f"layers_updated={layer_ids_updated}, c={args.steering_coef}, α={args.alpha}, "
+        f"layers_updated={layer_ids_updated}, c={args.steering_coef}, alpha={args.alpha}, "
         f"forget_bs={args.forget_batch_size}, retain_bs={args.retain_batch_size}, "
         f"epochs={args.epochs}, dtype={args.dtype}, frozen_dtype={args.frozen_dtype}"
     )

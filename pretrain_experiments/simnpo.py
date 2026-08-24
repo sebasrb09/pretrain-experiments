@@ -248,7 +248,7 @@ def main():
         )
         retain_iter = _infinite(retain_loader)
     else:
-        logger.info("retain_loss_weight=0 → skipping retain loader (pure forget loss)")
+        logger.info("retain_loss_weight=0 -> skipping retain loader (pure forget loss)")
 
     # ---- Optimizer -----------------------------------------------------
     optimizer = torch.optim.AdamW(
@@ -289,8 +289,8 @@ def main():
     )
 
     logger.info(
-        f"Starting SimNPO: lr={args.learning_rate}, β={args.beta}, γ={args.gamma}, "
-        f"α_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
+        f"Starting SimNPO: lr={args.learning_rate}, beta={args.beta}, gamma={args.gamma}, "
+        f"alpha_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
         f"forget_bs={args.forget_batch_size}, retain_bs={args.retain_batch_size}, "
         f"epochs={args.epochs}, dtype={args.dtype}"
     )

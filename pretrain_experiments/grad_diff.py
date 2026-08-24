@@ -237,7 +237,7 @@ def main():
         retain_iter = _infinite(retain_loader)
     else:
         logger.info(
-            "retain_loss_weight=0 → skipping retain loader; this run is plain "
+            "retain_loss_weight=0 -> skipping retain loader; this run is plain "
             "gradient ascent."
         )
 
@@ -280,7 +280,7 @@ def main():
 
     logger.info(
         f"Starting GradDiff: lr={args.learning_rate}, "
-        f"α_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
+        f"alpha_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
         f"forget_bs={args.forget_batch_size}, retain_bs={args.retain_batch_size}, "
         f"accum={args.gradient_accumulation_steps}, epochs={args.epochs}, "
         f"micro_batches/epoch={len(forget_loader)}, dtype={args.dtype}"

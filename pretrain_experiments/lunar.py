@@ -239,7 +239,7 @@ def main():
     )
     logger.info(
         f"Anchor activation: layer={args.redirection_layer}, source={args.anchor_source}, "
-        f"num_tokens={args.anchor_num_tokens}, ‖anchor‖={anchor.norm().item():.4f}, "
+        f"num_tokens={args.anchor_num_tokens}, ||anchor||={anchor.norm().item():.4f}, "
         f"shape={tuple(anchor.shape)}"
     )
 
@@ -344,7 +344,7 @@ def main():
 
     logger.info(
         f"Starting LUNAR: lr={args.learning_rate}, layer={args.redirection_layer}, "
-        f"scope={scope_label}, α_retain={args.retain_loss_weight}, "
+        f"scope={scope_label}, alpha_retain={args.retain_loss_weight}, "
         f"forget_bs={args.forget_batch_size}, retain_bs={args.retain_batch_size}, "
         f"epochs={args.epochs}, dtype={args.dtype}, frozen_dtype={args.frozen_dtype}"
     )

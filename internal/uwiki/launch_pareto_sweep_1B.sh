@@ -20,22 +20,24 @@
 # own published epoch count. Within a method, the four dots differ in exactly
 # one number.
 #
-# On MeluXina, point it at that site's wrapper -- everything else is identical:
+# Point CELL_SCRIPT at your site's wrapper -- everything else is identical:
 #
+#   CELL_SCRIPT=internal/asc/unlearn_cell_1B.sh \
+#     bash internal/uwiki/launch_pareto_sweep_1B.sh        # VSC-5
 #   CELL_SCRIPT=internal/meluxina/unlearn_cell_1B.sh \
-#     bash internal/uwiki/launch_pareto_sweep_1B.sh
+#     bash internal/uwiki/launch_pareto_sweep_1B.sh        # MeluXina
 #
 # Optional env vars:
 #   DRY_RUN      - 1 to print the sbatch commands without submitting
 #   CELL_SCRIPT  - per-site cell wrapper (default: internal/uwiki/unlearn_cell_1B.sh)
 #   METHODS      - space-separated subset to launch (default: all 8)
 #   RUN_TAG      - subdir under unlearning-pareto/ (default: 1B-pareto)
-#   TOTAL_BATCH  - forget sequences per optimizer step (default: 512)
-#   MICRO_BATCH  - per-forward micro batch (default: 8)
+#   TOTAL_BATCH  - forget sequences per optimizer step (default: 512, from the OLMo config)
+#   MICRO_BATCH  - per-forward micro batch (default: 4, from the OLMo config)
 #   EPOCHS       - override the per-method published epoch count for ALL methods
 #   MAX_STEPS    - override the step ceiling for ALL methods
 #   HARD_STEP_CAP- ceiling for methods with no step-based protocol (default: 10000)
-#   TIME         - SLURM walltime override (default: the cell script's 2-00:00:00)
+#   TIME         - SLURM walltime override (default: whatever the cell script sets)
 #   DTYPE, GRAD_CKPT, MODEL, REVISION, OLMO_CONFIG, START_STEP, FORGET_EXPS,
 #   SEED, MAX_SEQ_LEN  - forwarded verbatim to unlearn_cell_1B.sh
 #
@@ -49,6 +51,7 @@ set -o pipefail
 # Site is selected purely by which cell wrapper runs; the grid, the budget and
 # the dispatch are shared.
 #   galvani/ferranti (default): internal/uwiki/unlearn_cell_1B.sh
+#   VSC-5:                      internal/asc/unlearn_cell_1B.sh
 #   MeluXina:                   internal/meluxina/unlearn_cell_1B.sh
 CELL_SCRIPT="${CELL_SCRIPT:-internal/uwiki/unlearn_cell_1B.sh}"
 if [ ! -f "$CELL_SCRIPT" ]; then
@@ -58,11 +61,11 @@ fi
 
 DRY_RUN="${DRY_RUN:-0}"
 RUN_TAG="${RUN_TAG:-1B-pareto}"
-TOTAL_BATCH="${TOTAL_BATCH:-512}"
-MICRO_BATCH="${MICRO_BATCH:-8}"
-# EPOCHS and MAX_STEPS are deliberately NOT defaulted here: each method runs its
-# own published epoch count, set inside unlearn_cell_1B.sh. Exporting either one
-# from here would flatten that across all eight methods.
+# Nothing about the budget is defaulted here. TOTAL_BATCH and MICRO_BATCH come
+# from the OLMo-2 1B stage1 config (512 / 4) and EPOCHS from each method's
+# published protocol -- all set in unlearn_cell_body.sh. Re-defaulting any of
+# them here would silently override those, so they are forwarded only when you
+# export them explicitly.
 
 DEFAULT_METHODS="gradient-ascent ce-u wga grad-diff npo simnpo rmu satimp"
 METHODS="${METHODS:-$DEFAULT_METHODS}"
@@ -114,8 +117,8 @@ knob_for () {
 
 # Forward only the overrides that were actually set, so unlearn_cell_1B.sh keeps
 # its own defaults for everything else.
-EXPORTS="ALL,RUN_TAG=${RUN_TAG},TOTAL_BATCH=${TOTAL_BATCH},MICRO_BATCH=${MICRO_BATCH}"
-for var in EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS OUTPUT_ROOT; do
+EXPORTS="ALL,RUN_TAG=${RUN_TAG}"
+for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS OUTPUT_ROOT; do
   if [ -n "${!var:-}" ]; then
     EXPORTS="${EXPORTS},${var}=${!var}"
   fi
@@ -132,7 +135,7 @@ echo "============================================"
 echo "  Pareto sweep launch (1B)"
 echo "  run_tag:      $RUN_TAG"
 echo "  methods:      $METHODS"
-echo "  budget:       total_batch=$TOTAL_BATCH micro=$MICRO_BATCH"
+echo "  budget:       total_batch=${TOTAL_BATCH:-512 (default)} micro=${MICRO_BATCH:-4 (default)}"
 echo "                epochs=${EPOCHS:-<per-method published protocol>}"
 echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-10000}}"
 echo "  dry run:      $DRY_RUN"

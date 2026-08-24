@@ -24,6 +24,11 @@
 #   bash internal/uwiki/launch_lr_range_test.sh
 #   python internal/uwiki/analyze_lr_range_test.py           # once jobs finish
 #
+# On VSC-5 (or any other site) point it at that wrapper:
+#
+#   CELL_SCRIPT=internal/asc/unlearn_cell_1B.sh \
+#     bash internal/uwiki/launch_lr_range_test.sh
+#
 # Optional env vars:
 #   DRY_RUN      - 1 to print the sbatch commands without submitting
 #   CELL_SCRIPT  - per-site cell wrapper (default: internal/uwiki/unlearn_cell_1B.sh)

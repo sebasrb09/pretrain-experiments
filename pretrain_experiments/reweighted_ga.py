@@ -324,7 +324,7 @@ def main():
         retain_iter = _infinite(retain_loader)
     else:
         logger.info(
-            "retain_loss_weight=0 → skipping retain loader (forget-only; no OLMo "
+            "retain_loss_weight=0 -> skipping retain loader (forget-only; no OLMo "
             "dependency)"
         )
 
@@ -379,9 +379,9 @@ def main():
 
     logger.info(
         f"Starting {args.method_label}: lr={args.learning_rate}, "
-        f"β₁={args.beta1}, β₂={args.beta2}"
+        f"beta1={args.beta1}, beta2={args.beta2}"
         f"{f' (weight peaks at p={weight_peak:.3f})' if weight_peak is not None else ''}, "
-        f"λ_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
+        f"lambda_retain={args.retain_loss_weight}{' (disabled)' if not use_retain else ''}, "
         f"detach_weight={not args.differentiable_weight}, "
         f"forget_bs={args.forget_batch_size}, retain_bs={args.retain_batch_size}, "
         f"accum={args.gradient_accumulation_steps}, epochs={args.epochs}, "
