@@ -25,6 +25,16 @@
 # asking for one should schedule sooner. CUDA is verified by the first training
 # job instead.
 #
+# Nodes: p_datamining is a SMALL pool -- vader, galadriel, shelob and
+# dgx-h100-em2 are the ones this repo references. Excluding too many leaves
+# nothing schedulable ('Requested node configuration is not available'), so
+# this keeps only the vader,galadriel exclusion the other uwiki scripts use.
+# shelob is suspect (the first setup attempt hung there, and the archive
+# scripts flag it for NCCL and user-site torch issues). To avoid it too:
+#   sbatch --exclude=vader,galadriel,shelob internal/uwiki/setup_env.sh
+# To see what is actually there:
+#   sinfo -p p_datamining -o "%20N %8T %5c %10m %20f %14G"
+#
 # Accounts available to you:
 #   datamining   higher priority on the DM group's nodes   (default here)
 #   csunivie     the general default account
@@ -49,6 +59,11 @@
 set -u
 set -o pipefail
 
+# A batch job has no terminal: if anything prompts, reading EOF makes it fail
+# fast instead of hanging until the walltime expires (which is what happened
+# on the first attempt -- it sat in `module load` for two hours).
+exec </dev/null
+
 PE_REPO="${PE_REPO:-$HOME/pretrain-experiments}"
 PE_ENV_NAME="${PE_ENV_NAME:-pretrain-experiments}"
 INSTALL_OLMO="${INSTALL_OLMO:-0}"
@@ -69,17 +84,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 unset SSL_CERT_FILE
 
 step "1. Environment"
-# Same activation the existing uwiki eval scripts use: the miniforge module
-# reads ENV_MODE/ENV_NAME and activates the named environment.
-source /etc/profile.d/modules.sh
-export ENV_MODE="permanent"
-export ENV_NAME="$PE_ENV_NAME"
-module load miniforge || die "could not 'module load miniforge'"
-echo "  python:  $(command -v python)  ($(python --version 2>&1))"
-echo "  pip:     $(command -v pip)"
-if command -v conda >/dev/null 2>&1; then
-  conda env list 2>/dev/null | sed 's/^/    /' || true
-fi
+# Activation lives in internal/uwiki/activate_env.sh so setup and the cell
+# wrapper cannot drift. It loads miniforge for conda, then activates the env
+# explicitly -- the ENV_MODE/ENV_NAME route hung the first attempt.
+# shellcheck disable=SC1091
+source "${PE_REPO}/internal/uwiki/activate_env.sh" || die "environment activation failed"
 
 step "2. Install pretrain-experiments"
 cd "$PE_REPO"

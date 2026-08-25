@@ -45,15 +45,14 @@ export PE_SITE="uwiki"
 
 unset SSL_CERT_FILE
 
-source /etc/profile.d/modules.sh
-export ENV_MODE="permanent"
-export ENV_NAME="pretrain-experiments"
-module load miniforge
-
 PE_REPO="${PE_REPO:-$HOME/pretrain-experiments}"
 cd "$PE_REPO"
 
-# torch lives in user-site on some nodes (e.g. shelob/H200); prepend explicitly.
+# Loads miniforge and activates the conda env explicitly. Shared with
+# setup_env.sh; see that file for why the ENV_MODE/ENV_NAME route is avoided.
+# shellcheck disable=SC1091
+source "${PE_REPO}/internal/uwiki/activate_env.sh"
+
 export PYTHONPATH="$PWD:$HOME/.local/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 
 # HF_TOKEN / WANDB_API_KEY. See the header of credentials.sh for the three ways
