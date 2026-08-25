@@ -48,10 +48,31 @@ unset SSL_CERT_FILE
 PE_REPO="${PE_REPO:-$HOME/pretrain-experiments}"
 cd "$PE_REPO"
 
-# Activates the venv and verifies torch can see the GPU. Shared with
-# setup_env.sh; see activate_env.sh for why the miniforge module is avoided.
+# Activate the venv built by internal/uwiki/setup_env.sh. Deliberately NOT
+# `module load miniforge`: that modulefile runs `conda create` on load, which
+# once consumed a 2h walltime silently. See setup_env.sh for the full story.
+PE_VENV="${PE_VENV:-$HOME/venvs/pretrain-experiments}"
+[ -f "$PE_VENV/bin/activate" ] || {
+  echo "ERROR: no usable venv at $PE_VENV" >&2
+  echo "       Build it: sbatch internal/uwiki/setup_env.sh  (add FORCE=1 if partial)" >&2
+  exit 1
+}
 # shellcheck disable=SC1091
-source "${PE_REPO}/internal/uwiki/activate_env.sh"
+source "$PE_VENV/bin/activate"
+echo "  venv:   $PE_VENV"
+echo "  python: $(command -v python) ($(python --version 2>&1))"
+
+# Fail in seconds rather than after the forget-set tokenization if torch cannot
+# use the allocated GPU -- a cu13 wheel on a CUDA 12.9 driver does exactly that,
+# silently returning is_available()==False.
+if [ -n "${SLURM_JOB_GPUS:-${SLURM_GPUS_ON_NODE:-}}" ]; then
+  python - <<'TORCHCHK' || { echo "ERROR: GPU allocated but torch cannot use it. Rebuild with: FORCE=1 TORCH_INDEX=cu126 sbatch internal/uwiki/setup_env.sh" >&2; exit 1; }
+import sys, torch
+ok = torch.cuda.is_available()
+print(f"  torch:  {torch.__version__} (cuda {torch.version.cuda}) available={ok}")
+sys.exit(0 if ok else 1)
+TORCHCHK
+fi
 
 export PYTHONPATH="$PWD:$HOME/.local/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 
