@@ -48,8 +48,8 @@ unset SSL_CERT_FILE
 PE_REPO="${PE_REPO:-$HOME/pretrain-experiments}"
 cd "$PE_REPO"
 
-# Loads miniforge and activates the conda env explicitly. Shared with
-# setup_env.sh; see that file for why the ENV_MODE/ENV_NAME route is avoided.
+# Activates the venv and verifies torch can see the GPU. Shared with
+# setup_env.sh; see activate_env.sh for why the miniforge module is avoided.
 # shellcheck disable=SC1091
 source "${PE_REPO}/internal/uwiki/activate_env.sh"
 

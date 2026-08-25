@@ -50,7 +50,7 @@
 #
 # Optional env vars:
 #   PE_REPO              checkout location           (default: $HOME/pretrain-experiments)
-#   PE_ENV_NAME          miniforge env to activate   (default: pretrain-experiments)
+#   PE_VENV              venv to activate            (default: $HOME/venvs/pretrain-experiments)
 #   INSTALL_OLMO         1 to clone+install the OLMo fork (default: 0)
 #   OLMO_BRANCH          branch to check out         (default: pretrain-experiments)
 #   RUN_MEASURE          1 to run measure_forget_set (default: 0)
@@ -65,7 +65,7 @@ set -o pipefail
 exec </dev/null
 
 PE_REPO="${PE_REPO:-$HOME/pretrain-experiments}"
-PE_ENV_NAME="${PE_ENV_NAME:-pretrain-experiments}"
+PE_VENV="${PE_VENV:-$HOME/venvs/pretrain-experiments}"
 INSTALL_OLMO="${INSTALL_OLMO:-0}"
 OLMO_BRANCH="${OLMO_BRANCH:-pretrain-experiments}"
 RUN_MEASURE="${RUN_MEASURE:-0}"
@@ -77,7 +77,7 @@ die  () { echo "ERROR: $*" >&2; exit 1; }
 step "0. Context"
 echo "  host:    $(hostname)"
 echo "  repo:    $PE_REPO"
-echo "  env:     $PE_ENV_NAME"
+echo "  venv:    $PE_VENV"
 [ -d "$PE_REPO" ] || die "no repository at $PE_REPO -- clone it there or set PE_REPO"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -85,8 +85,8 @@ unset SSL_CERT_FILE
 
 step "1. Environment"
 # Activation lives in internal/uwiki/activate_env.sh so setup and the cell
-# wrapper cannot drift. It loads miniforge for conda, then activates the env
-# explicitly -- the ENV_MODE/ENV_NAME route hung the first attempt.
+# wrapper cannot drift. It activates the venv and, when a GPU is allocated,
+# checks that torch can actually use it.
 # shellcheck disable=SC1091
 source "${PE_REPO}/internal/uwiki/activate_env.sh" || die "environment activation failed"
 
@@ -182,7 +182,7 @@ fi
 
 step "Done"
 echo "  repo: $PE_REPO"
-echo "  env:  $PE_ENV_NAME"
+echo "  venv: $PE_VENV"
 echo ""
 echo "  Next: smoke-test one cell, then read the HARD_STEP_CAP note before"
 echo "  launching the method-hyperparameter sweep."
