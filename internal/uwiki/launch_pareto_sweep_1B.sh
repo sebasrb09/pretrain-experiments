@@ -29,7 +29,9 @@
 #
 # Optional env vars:
 #   DRY_RUN      - 1 to print the sbatch commands without submitting
-#   CELL_SCRIPT  - per-site cell wrapper (default: internal/uwiki/unlearn_cell_1B.sh)
+#   CELL_SCRIPT  - per-site cell wrapper (default: ASC/MUSICA when
+#                  internal/asc/env.sh and $SCRATCH/$DATA are present,
+#                  else internal/uwiki/unlearn_cell_1B.sh)
 #   METHODS      - space-separated subset to launch (default: all 8)
 #   RUN_TAG      - subdir under unlearning-pareto/ (default: 1B-pareto)
 #   TOTAL_BATCH  - forget sequences per optimizer step (default: 512, from the OLMo config)
@@ -53,7 +55,16 @@ set -o pipefail
 #   galvani/ferranti (default): internal/uwiki/unlearn_cell_1B.sh
 #   VSC-5:                      internal/asc/unlearn_cell_1B.sh
 #   MeluXina:                   internal/meluxina/unlearn_cell_1B.sh
-CELL_SCRIPT="${CELL_SCRIPT:-internal/uwiki/unlearn_cell_1B.sh}"
+# Default to the site we are actually on. A hardcoded u:wiki default sent a
+# whole LR-range batch to --partition=p_datamining from MUSICA before this was
+# fixed; an explicit CELL_SCRIPT= still overrides.
+if [ -n "${CELL_SCRIPT:-}" ]; then
+  :
+elif [ -f internal/asc/env.sh ] && [ -n "${SCRATCH:-}${DATA:-}" ]; then
+  CELL_SCRIPT="internal/asc/unlearn_cell_1B.sh"
+else
+  CELL_SCRIPT="internal/uwiki/unlearn_cell_1B.sh"
+fi
 if [ ! -f "$CELL_SCRIPT" ]; then
   echo "ERROR: $CELL_SCRIPT not found. Run this from the repo root." >&2
   exit 1
@@ -159,6 +170,7 @@ fi
 echo "============================================"
 echo "  Pareto sweep launch (1B)"
 echo "  run_tag:      $RUN_TAG"
+echo "  cell:         $CELL_SCRIPT"
 echo "  methods:      $METHODS"
 echo "  budget:       total_batch=${TOTAL_BATCH:-512 (default)} micro=${MICRO_BATCH:-4 (default)}"
 echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-100}} (BINDS: 1 epoch = 10249 steps, so EPOCHS is inert)"

@@ -43,7 +43,11 @@ stays valid if that setting changes.
 
 REQUIREMENTS
 ------------
-  * the OLMo fork installed   (sbatch INSTALL_OLMO=1 internal/uwiki/setup_env.sh)
+  * the OLMo fork installed. It is NOT installed by default anywhere:
+      ASC/MUSICA:  INSTALL_OLMO=1 sbatch internal/asc/setup_env.sh
+      u:wiki:      INSTALL_OLMO=1 sbatch internal/uwiki/setup_env.sh
+    On ASC the clone lands in $SCRATCH/OLMo, which is where --olmo-config
+    looks by default.
   * a stage1 config whose data.paths resolve from this machine -- if they are
     remote URLs the compute node needs outbound HTTPS; the script prints the
     first few paths so you can see which you have BEFORE the long fetch
@@ -116,8 +120,9 @@ def main():
     except ImportError as e:
         raise SystemExit(
             f"ERROR: {e}\n"
-            "The OLMo fork is required. Build it with:\n"
-            "  INSTALL_OLMO=1 FORCE=0 sbatch internal/uwiki/setup_env.sh")
+            "The OLMo fork is required, and is not installed by default." \
+            + "\n  ASC/MUSICA:  INSTALL_OLMO=1 sbatch internal/asc/setup_env.sh"
+            + "\n  u:wiki:      INSTALL_OLMO=1 sbatch internal/uwiki/setup_env.sh")
 
     if not os.path.exists(args.olmo_config):
         raise SystemExit(

@@ -156,8 +156,16 @@ else
     grep -E "global_train_batch_size|device_train_microbatch_size|max_sequence_length|^seed" "$CFG" || true
     echo ""
     echo "  NOTE: build_olmo_retain_dataset also needs the OLMo-2 stage1 memmap"
-    echo "  DATA, not just this YAML. Check cfg.data.paths before assuming the"
-    echo "  five retain-set methods can run here."
+    echo "  DATA, not just this YAML -- and MUSICA does not host it. That is no"
+    echo "  longer a dead end:"
+    echo "    gradient-ascent / ce-u / wga   import no olmo at all"
+    echo "    npo / simnpo / satimp          run forget-only at RETAIN_WEIGHT=0"
+    echo "    grad-diff / rmu                need a materialized slice; build one"
+    echo "                                   (~2 GB, fetched by random access):"
+    echo "      python internal/uwiki/build_retain_slice.py --dry-run"
+    echo ""
+    echo "  The dry run prints cfg.data.paths and says whether they are REMOTE"
+    echo "  (fetchable from a compute node) or LOCAL, before downloading anything."
   else
     echo "  WARNING: expected config not found at $CFG -- set OLMO_CONFIG explicitly"
   fi

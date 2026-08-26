@@ -68,7 +68,18 @@ esac
 export METHODS="${METHODS:-$DEFAULT_METHODS}"
 export LRS="${LRS:-3e-7 1e-6 3e-6 1e-5 3e-5 1e-4}"
 export TIME="${TIME:-4:00:00}"
-export CELL_SCRIPT="internal/uwiki/unlearn_cell_1B.sh"
+# Site wrapper. This used to be hardcoded to the u:wiki cell, which silently
+# sent every probe to --partition=p_datamining regardless of the cluster. Pick
+# ASC when its env.sh and $SCRATCH/$DATA are present; override explicitly with
+# CELL_SCRIPT=... for anything else.
+if [ -n "${CELL_SCRIPT:-}" ]; then
+  :
+elif [ -f internal/asc/env.sh ] && [ -n "${SCRATCH:-}${DATA:-}" ]; then
+  CELL_SCRIPT="internal/asc/unlearn_cell_1B.sh"
+else
+  CELL_SCRIPT="internal/uwiki/unlearn_cell_1B.sh"
+fi
+export CELL_SCRIPT
 
 n_methods=$(echo "$METHODS" | wc -w)
 n_lrs=$(echo "$LRS" | wc -w)
@@ -76,10 +87,11 @@ n_lrs=$(echo "$LRS" | wc -w)
 echo "============================================"
 echo "  LR range test -- Vienna cluster"
 echo "  group:    $GROUP"
+echo "  cell:     $CELL_SCRIPT"
 echo "  methods:  $METHODS"
 echo "  LRs:      $LRS"
 echo "  jobs:     $((n_methods * n_lrs))"
-echo "  account:  ${SBATCH_ACCOUNT:-datamining (script default)}"
+echo "  account:  ${SBATCH_ACCOUNT:-from the cell script directive}"
 echo "============================================"
 echo ""
 
@@ -88,7 +100,7 @@ bash internal/uwiki/launch_lr_range_test.sh
 echo ""
 echo "  Read the results with:"
 echo "    python internal/uwiki/analyze_lr_range_test.py --output-root \\"
-echo "      \"\${OUTPUT_ROOT:-\$HOME/pretrain-experiments/unlearning-pareto}\""
+echo "      \"\${OUTPUT_ROOT:-\${DATA:-\$HOME/pretrain-experiments}/unlearning-pareto}\""
 echo ""
 echo "  Two things come out of this, not one:"
 echo "    1. the usable LR window per method -> the pinned LRs in"
