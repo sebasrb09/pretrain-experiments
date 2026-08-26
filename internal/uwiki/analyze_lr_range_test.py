@@ -196,10 +196,17 @@ def main():
               f"{'retain delta':>13s}  verdict")
 
         moving = []
+        probe_rows = []
         for p in probes:
             v, why = verdict(p, args.move_eps, args.retain_max, args.forget_max)
             if v == "moving":
                 moving.append(p["lr"])
+            probe_rows.append({
+                "lr": p["lr"], "verdict": v, "why": why,
+                "steps": p["steps"], "forget_field": p["forget_field"],
+                "forget_first": p["forget_first"], "forget_last": p["forget_last"],
+                "forget_delta": p["forget_delta"], "retain_delta": p["retain_delta"],
+            })
             fwd = (f"{fmt(p['forget_first'])} -> {fmt(p['forget_last'])} "
                    f"({p['forget_delta']:+.3f})") if p["forget_delta"] is not None else "-"
             rd = f"{p['retain_delta']:+.3f}" if p["retain_delta"] is not None else "-"
@@ -211,7 +218,8 @@ def main():
             grid = log_grid(lo, hi, args.grid_points)
             print(f"\n  usable window: {lo:.1e} .. {hi:.1e}")
             print("  suggested grid: " + "  ".join(f"{g:.2e}" for g in grid))
-            summary[method] = {"window": [lo, hi], "suggested_grid": grid}
+            summary[method] = {"window": [lo, hi], "suggested_grid": grid,
+                               "forget_field": field, "probes": probe_rows}
         else:
             hint = ("every probe was flat -- extend LRS upward"
                     if not any(verdict(p, args.move_eps, args.retain_max,
@@ -219,7 +227,8 @@ def main():
                     else "every probe was flat or diverged -- the window is between "
                          "two rungs; refine LRS around the transition")
             print(f"\n  no usable window found: {hint}")
-            summary[method] = {"window": None, "suggested_grid": []}
+            summary[method] = {"window": None, "suggested_grid": [],
+                               "forget_field": field, "probes": probe_rows}
         print()
 
     with open(args.output_json, "w") as f:
