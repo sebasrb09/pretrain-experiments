@@ -239,6 +239,53 @@ def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_d
             add(name, metrics, err)
 
 
+
+# The headline view: the plot as a table. Every metric stays in the CSV; this
+# just picks the handful you actually stare at, anchors first so the cells have
+# something to be read against.
+PIVOT_AXES = [
+    ("fictional_knowledge", "probability",     "fk_prob",    11, "e", 2),
+    ("c4_perplexity",       "perplexity",      "c4_ppl",      9, "f", 2),
+    ("gaussian_watermark",  "mean_in",         "gw_mean_in", 12, "f", 2),
+    ("gaussian_watermark",  "sem_in",          "gw_sem",      8, "f", 2),
+    ("training",            "ce_forget_delta", "ce_delta",   10, "f", 3),
+]
+
+
+def print_pivot(rows):
+    from collections import defaultdict
+    d = defaultdict(dict)
+    for r in rows:
+        for ev, me, tag, _w, _p, _n in PIVOT_AXES:
+            if r["eval"] == ev and r["metric"] == me:
+                d[(r["point_type"], r["method"], r["knob"], r["value"])][tag] = r["score"]
+    if not d:
+        return
+
+    def cell(v, w, p, n):
+        return " " * (w - 1) + "-" if v is None else f"{v:>{w}.{n}{p}}"
+
+    hdr = f"  {'method':<17}{'knob':<7}{'value':<9}"
+    for _e, _m, tag, w, _p, _n in PIVOT_AXES:
+        hdr += f"{tag:>{w}}"
+    print("")
+    print("=" * len(hdr))
+    print("  THE PLOT  (x = fk_prob, lower = more forgotten; y = c4_ppl)")
+    print("=" * len(hdr))
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for kind in ("anchor", "cell"):
+        if kind == "cell":
+            print("")
+        for (t, m, k, v), x in sorted(d.items(), key=lambda kv: (kv[0][1], kv[0][3])):
+            if t != kind:
+                continue
+            name = m if t == "cell" else f"[{m}]"
+            line = f"  {name:<17}{k:<7}{v:<9}"
+            for _e, _m2, tag, w, pp, n in PIVOT_AXES:
+                line += cell(x.get(tag), w, pp, n)
+            print(line)
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -304,6 +351,8 @@ def main():
     print(f"\n{len(rows)} rows, {len(points)} points, {len(evals)} evals")
     print(f"  evals: {', '.join(evals)}")
     print(f"wrote {args.csv} and {args.json}")
+
+    print_pivot(rows)
 
     print("\nAvailable axes (eval / metric):")
     seen = sorted({(r["eval"], r["metric"]) for r in rows})
