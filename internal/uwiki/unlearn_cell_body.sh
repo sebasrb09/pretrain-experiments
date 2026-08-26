@@ -195,7 +195,12 @@ case "$METHOD" in
   rmu)
     # 1B has 16 layers; HYPER-PARAMS.md maps the 179M anchor l=5 (of 12) to l=7.
     MODULE="pretrain_experiments.rmu"; USES_RETAIN=1; KNOB="c"
-    METHOD_EPOCHS=1; METHOD_MAX_STEPS="${RMU_STEPS:-200}"
+    # RMU's paper budgets ~100-200 optimizer steps rather than epochs. Default
+    # to HARD_STEP_CAP rather than a literal 200 so every method on the plot
+    # gets the SAME step budget -- otherwise RMU's dots sit further along the
+    # forgetting axis partly just from training twice as long, which is a
+    # confound the Pareto comparison cannot separate. RMU_STEPS still overrides.
+    METHOD_EPOCHS=1; METHOD_MAX_STEPS="${RMU_STEPS:-$HARD_STEP_CAP}"
     METHOD_ARGS+=(--steering-coef "$VALUE" --target-layer "${RMU_LAYER:-7}"
                   --alpha "${RMU_ALPHA:-1200.0}" --n-layers-to-update 3
                   --learning-rate "${LR:-5e-5}" --frozen-dtype "$FROZEN_DTYPE")

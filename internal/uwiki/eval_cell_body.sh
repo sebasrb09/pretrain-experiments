@@ -144,9 +144,24 @@ fi
 
 if [ "${SKIP_GW:-0}" = "1" ]; then
   echo "  [gaussian_watermark] SKIP_GW=1, skipping"
-elif [ ! -d "$NOISE_DIR" ]; then
-  echo "  [gaussian_watermark] no NOISE_DIR at $NOISE_DIR -- skipping."
-  echo "     Warm it once with mia-data/build_noise_dir.py, then re-run."
+elif [ ! -d "$NOISE_DIR" ] || ! ls "$NOISE_DIR"/gaussian_poisoning_*.pkl >/dev/null 2>&1; then
+  # A present-but-empty dir is the common case (created by a previous skip), so
+  # check for the .pkl chunks rather than the directory.
+  echo "  [gaussian_watermark] no gaussian_poisoning_*.pkl in $NOISE_DIR -- skipping."
+  echo ""
+  echo "     For 1B this is EXPECTED. sbordt/OLMo-2-1B-Exp-NoiseVectors is not on"
+  echo "     the Hub: mia-data/build_noise_dir.py documents only the 179M and 546M"
+  echo "     datasets, internal/uwiki/archive/build_noise_dir.sh refuses anything"
+  echo "     else, and the 1B eval3 drivers simply assume the dir already exists."
+  echo "     CLAUDE.md lists a 1B set, but nothing in this repo can build one."
+  echo ""
+  echo "     The sweep does not depend on it. verbatim_memorization and"
+  echo "     fictional_knowledge both measure the forget set directly and are"
+  echo "     running; gaussian_watermark is a third, optional axis."
+  echo ""
+  echo "     If a 1B set does turn up, build it with:"
+  echo "       python mia-data/build_noise_dir.py --repo <the-1B-repo> --out $NOISE_DIR"
+  echo "     and re-run: the .done markers mean only GW recomputes."
 else
   run_eval gaussian_watermark \
     python "$TOAA_DIR/gaussian_watermark.py" \

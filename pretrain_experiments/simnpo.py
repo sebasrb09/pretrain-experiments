@@ -136,9 +136,9 @@ def main():
                              "Default: all experiments minus iid-replacements-*.")
 
     # Retain set
-    parser.add_argument("--olmo-config", type=str, required=True,
+    parser.add_argument("--olmo-config", type=str, default=None,
                         help="Path to the OLMo TrainConfig YAML used to build the retain stream.")
-    parser.add_argument("--retain-start-step", type=int, required=True)
+    parser.add_argument("--retain-start-step", type=int, default=None)
     parser.add_argument("--retain-seed-override", type=int, default=None)
 
     # SimNPO hyperparams
@@ -184,6 +184,16 @@ def main():
         raise SystemExit("--retain-loss-weight must be >= 0")
 
     use_retain = args.retain_loss_weight > 0
+    # These two are only needed when the retain stream is actually built. Keeping
+    # them argparse-optional (matching reweighted_ga.py) is what lets
+    # RETAIN_WEIGHT=0 run this method forget-only on a cluster with no OLMo
+    # memmap data -- with required=True, argparse rejected the call before
+    # use_retain was ever consulted.
+    if use_retain and (args.olmo_config is None or args.retain_start_step is None):
+        raise SystemExit(
+            "--retain-loss-weight > 0 requires both --olmo-config and "
+            "--retain-start-step (the retain stream cannot be built without them)."
+        )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
