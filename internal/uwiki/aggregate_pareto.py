@@ -133,11 +133,31 @@ def read_gw_signal(gw_dir):
 
 
 def read_training_signal(cell_dir):
-    """First and last ce_forget (or the method's equivalent) from metrics.jsonl."""
+    """First/last ce_forget from metrics.jsonl, AVERAGED over an accumulation cycle.
+
+    One row of metrics.jsonl is a single micro-batch -- 4 sequences. At batch 512
+    that is 1/128th of an optimizer step, and its CE varies by more than a nat
+    between rows. Taking vals[0] and vals[-1] therefore measured noise, not
+    learning: it reported ce_first=2.723 on a forget set whose true mean is 1.793,
+    and turned gradient ascent's real (positive) forgetting into a negative delta.
+
+    Average over `gradient_accumulation_steps` rows at each end instead, matching
+    what analyze_lr_range_test.py does.
+    """
     path = os.path.join(cell_dir, "metrics.jsonl")
     if not os.path.isfile(path):
         return {}
     fields = ("ce_forget", "nll_avg_mean", "nll_theta_mean", "loss_forget")
+
+    accum = 1
+    for cfg_path in glob.glob(os.path.join(cell_dir, "*_config.json")):
+        try:
+            with open(cfg_path) as f:
+                accum = int(json.load(f).get("gradient_accumulation_steps") or 1)
+        except Exception:
+            pass
+        break
+
     rows = []
     with open(path) as f:
         for line in f:
@@ -157,11 +177,18 @@ def read_training_signal(cell_dir):
     vals = [v for v in vals if v is not None]
     if not vals:
         return {}
+
+    # Never let the two windows overlap, or first and last become the same mean.
+    win = max(1, min(accum, len(vals) // 4 or 1))
+    first = sum(vals[:win]) / win
+    last = sum(vals[-win:]) / win
     out = {
-        f"{field}_first": vals[0],
-        f"{field}_last": vals[-1],
-        f"{field}_delta": vals[-1] - vals[0],
+        f"{field}_first": first,
+        f"{field}_last": last,
+        f"{field}_delta": last - first,
+        f"{field}_window": float(win),
         "optimizer_steps": float(max((r.get("optimizer_step", 0) for r in rows), default=0)),
+        "n_micro_batches": float(len(vals)),
     }
     return out
 
