@@ -206,8 +206,17 @@ else:
 PYEOF
 
 step "6. Retain-stream check"
-# Decides whether five of the eight methods can run here: the retain loader
-# needs the OLMo-2 stage1 memmap DATA, not just the fork.
+# Reports whether the FULL OLMo-2 stage1 memmap stream resolves here. It usually
+# does not, and that is no longer fatal:
+#
+#   gradient-ascent, ce-u, wga    import no olmo at all
+#   npo, simnpo, satimp           run forget-only at RETAIN_WEIGHT=0 (their
+#                                 drivers guard the loader behind weight > 0)
+#   grad-diff, rmu                genuinely need retain data -- but only a
+#                                 sliver of it. Materialize one with
+#                                 internal/uwiki/build_retain_slice.py, which
+#                                 fetches ~2 GB by random access instead of
+#                                 requiring the whole corpus.
 python - <<'PYEOF' || true
 import os
 try:
@@ -222,10 +231,13 @@ try:
     from pretrain_experiments.unlearning_utils import build_olmo_retain_dataset
     ds, info = build_olmo_retain_dataset(cfg, start_step=100000, max_seq_len=1024)
     print(f"  OK: {info['n_unseen_sequences']:,} unseen sequences, first {tuple(ds[0].shape)}")
-    print("  -> grad-diff / npo / simnpo / rmu / satimp can run here.")
+    print("  -> all eight methods can run here, retain terms included.")
 except Exception as e:
-    print(f"  RETAIN STREAM UNAVAILABLE: {type(e).__name__}: {e}")
-    print("  -> those five are blocked; gradient-ascent, ce-u and wga are not.")
+    print(f"  FULL RETAIN STREAM UNAVAILABLE: {type(e).__name__}: {e}")
+    print("  -> gradient-ascent / ce-u / wga: unaffected, run now.")
+    print("  -> npo / simnpo / satimp: run forget-only with RETAIN_WEIGHT=0.")
+    print("  -> grad-diff / rmu: need a materialized slice --")
+    print("       python internal/uwiki/build_retain_slice.py --dry-run")
 PYEOF
 
 if [ "$RUN_MEASURE" = "1" ]; then
@@ -241,3 +253,4 @@ say ""
 say "Next:"
 say "  python tests/smoke_unlearning_drivers.py    # all 8 drivers, seconds"
 say "  bash internal/uwiki/lr_range.sh             # 18 jobs, no OLMo needed"
+say "  GROUP=forgetonly bash internal/uwiki/lr_range.sh   # npo/simnpo/satimp"

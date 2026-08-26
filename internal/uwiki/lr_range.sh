@@ -16,13 +16,22 @@
 # Usage:
 #   DRY_RUN=1 bash internal/uwiki/lr_range.sh          # always look first
 #   bash internal/uwiki/lr_range.sh                    # the 3 no-OLMo methods
+#   GROUP=forgetonly bash internal/uwiki/lr_range.sh   # npo/simnpo/satimp, no OLMo
 #   GROUP=olmo bash internal/uwiki/lr_range.sh         # the 5 retain-set methods
 #   GROUP=all  bash internal/uwiki/lr_range.sh         # all eight
 #
 #   python internal/uwiki/analyze_lr_range_test.py     # read it
 #
 # Env vars:
-#   GROUP     nolmo | olmo | all      (default: nolmo)
+#   GROUP     nolmo | forgetonly | olmo | all   (default: nolmo)
+#               nolmo       gradient-ascent, ce-u, wga -- import no olmo
+#               forgetonly  npo, simnpo, satimp at RETAIN_WEIGHT=0. Their
+#                           drivers guard the retain loader behind
+#                           `weight > 0`, so these run WITHOUT the OLMo
+#                           memmap data. For NPO this is the paper's base
+#                           method; for the other two, a forget-only ablation.
+#               olmo        all five retain-set methods, needs the memmap data
+#               all         everything
 #   LRS       LR ladder               (default: 3e-7 .. 1e-4, centred on the
 #                                      known-live 1e-6 rather than the original
 #                                      1e-8 start, which wasted three rungs)
@@ -49,10 +58,11 @@ GROUP="${GROUP:-nolmo}"
 # needs the OLMo-2 stage1 memmap DATA on this cluster -- not just the fork.
 # Step 5 of internal/uwiki/setup_env.sh reports whether that works here.
 case "$GROUP" in
-  nolmo) DEFAULT_METHODS="gradient-ascent ce-u wga" ;;
-  olmo)  DEFAULT_METHODS="grad-diff npo simnpo rmu satimp" ;;
-  all)   DEFAULT_METHODS="gradient-ascent ce-u wga grad-diff npo simnpo rmu satimp" ;;
-  *)     echo "ERROR: GROUP must be nolmo | olmo | all (got '$GROUP')" >&2; exit 1 ;;
+  nolmo)      DEFAULT_METHODS="gradient-ascent ce-u wga" ;;
+  forgetonly) DEFAULT_METHODS="npo simnpo satimp"; export RETAIN_WEIGHT=0 ;;
+  olmo)       DEFAULT_METHODS="grad-diff npo simnpo rmu satimp" ;;
+  all)        DEFAULT_METHODS="gradient-ascent ce-u wga grad-diff npo simnpo rmu satimp" ;;
+  *) echo "ERROR: GROUP must be nolmo | forgetonly | olmo | all (got '$GROUP')" >&2; exit 1 ;;
 esac
 
 export METHODS="${METHODS:-$DEFAULT_METHODS}"

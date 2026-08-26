@@ -173,7 +173,7 @@ case "$METHOD" in
     MODULE="pretrain_experiments.reweighted_ga"; USES_RETAIN=1; KNOB="beta1"
     METHOD_EPOCHS=5
     METHOD_ARGS+=(--method-label satimp --beta1 "$VALUE" --beta2 1.0
-                  --retain-loss-weight 1.0 --learning-rate "${LR:-1e-6}")
+                  --retain-loss-weight "${RETAIN_WEIGHT:-1.0}" --learning-rate "${LR:-1e-6}")
     ;;
   grad-diff)
     MODULE="pretrain_experiments.grad_diff"; USES_RETAIN=1; KNOB="lambda"
@@ -183,13 +183,13 @@ case "$METHOD" in
   npo)
     MODULE="pretrain_experiments.npo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
-    METHOD_ARGS+=(--beta "$VALUE" --retain-loss-weight 1.0
+    METHOD_ARGS+=(--beta "$VALUE" --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
                   --learning-rate "${LR:-1e-5}" --frozen-dtype "$FROZEN_DTYPE")
     ;;
   simnpo)
     MODULE="pretrain_experiments.simnpo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
-    METHOD_ARGS+=(--beta "$VALUE" --gamma 0.0 --retain-loss-weight 1.0
+    METHOD_ARGS+=(--beta "$VALUE" --gamma 0.0 --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
                   --learning-rate "${LR:-1e-5}")
     ;;
   rmu)
@@ -258,6 +258,36 @@ if [ "$METHOD" = "ce-u" ]; then
 else
   COMMON_ARGS+=(--forget-batch-size "$MICRO_BATCH")
 fi
+
+# RETAIN_WEIGHT=0 turns npo / simnpo / satimp into their forget-only variants.
+# This matters a lot on a cluster without the OLMo-2 stage1 memmap data: those
+# three drivers guard the retain loader behind `use_retain = weight > 0`, so at
+# 0 they never touch it and become runnable. For NPO that IS the paper's base
+# method (the retain variant is NPO-RT); for SimNPO and SatImp it is a
+# documented forget-only ablation, so label the runs accordingly.
+#
+# The other two are NOT separable and must not pretend to be:
+#   grad-diff  the retain weight is its curve knob -- at 0 it IS plain
+#              gradient ascent, so the method disappears
+#   rmu        builds the retain stream unconditionally (rmu.py:285), no guard
+case "${RETAIN_WEIGHT:-}" in
+  0|0.0)
+    case "$METHOD" in
+      npo|simnpo|satimp)
+        USES_RETAIN=0
+        echo "  NOTE: RETAIN_WEIGHT=0 -> forget-only $METHOD, no OLMo retain stream"
+        ;;
+      grad-diff)
+        echo "ERROR: RETAIN_WEIGHT=0 reduces grad-diff to plain gradient ascent." >&2
+        echo "       Its retain weight is the curve knob; sweep VALUE instead." >&2
+        exit 1 ;;
+      rmu)
+        echo "ERROR: rmu builds the retain stream unconditionally (rmu.py:285)." >&2
+        echo "       It cannot run without the OLMo-2 stage1 memmap data." >&2
+        exit 1 ;;
+    esac
+    ;;
+esac
 
 if [ "$USES_RETAIN" -eq 1 ]; then
   COMMON_ARGS+=(--retain-batch-size "$MICRO_BATCH"
