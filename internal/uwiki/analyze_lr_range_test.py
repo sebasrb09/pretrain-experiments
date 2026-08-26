@@ -121,6 +121,17 @@ def load_probe(run_dir):
 
 
 def verdict(p, move_eps, retain_max, forget_max):
+    """Classify a probe by the RELATIVE change in its forget signal.
+
+    Relative, not absolute, because the forget signal is not on one scale across
+    methods. ce_forget and nll_avg_mean are per-token nats starting near 1.8, but
+    npo's nll_theta_mean is a SUMMED per-sequence NLL starting near 476. Absolute
+    nat thresholds flagged every single npo probe as "diverged" on units alone,
+    hiding a window identical to simnpo's.
+
+    Dividing by the starting value reproduces every verdict the absolute test got
+    right on the per-token methods, and fixes npo.
+    """
     if p["nonfinite"]:
         return "diverged", "non-finite loss"
     rd = p["retain_delta"]
@@ -129,9 +140,13 @@ def verdict(p, move_eps, retain_max, forget_max):
     fd = p["forget_delta"]
     if fd is None:
         return "no data", "no forget signal"
-    if abs(fd) > forget_max:
-        return "diverged", f"forget {fd:+.1f} in {p['steps']} steps"
-    if abs(fd) < move_eps:
+    first = p.get("forget_first")
+    if not first:
+        return "no data", "no baseline to normalize against"
+    rel = abs(fd) / abs(first)
+    if rel > forget_max:
+        return "diverged", f"forget {rel * 100:.0f}% in {p['steps']} steps"
+    if rel < move_eps:
         return "flat", ""
     return "moving", ""
 
@@ -155,12 +170,14 @@ def main():
     parser.add_argument("--output-root", type=str,
                         default=os.path.expanduser("~/pretrain-experiments/unlearning-pareto"))
     parser.add_argument("--run-tag-base", type=str, default="lr-range")
-    parser.add_argument("--move-eps", type=float, default=0.05,
-                        help="Forget-signal delta below which a probe counts as flat (nats).")
+    parser.add_argument("--move-eps", type=float, default=0.03,
+                        help="RELATIVE forget-signal change below which a probe counts as "
+                             "flat (0.03 = 3%% of its starting value).")
     parser.add_argument("--retain-max", type=float, default=0.5,
                         help="Retain-signal rise above which a probe counts as diverged (nats).")
-    parser.add_argument("--forget-max", type=float, default=5.0,
-                        help="Forget-signal delta above which a probe counts as diverged (nats).")
+    parser.add_argument("--forget-max", type=float, default=2.8,
+                        help="RELATIVE forget-signal change above which a probe counts as "
+                             "diverged (2.8 = 280%% of its starting value).")
     parser.add_argument("--grid-points", type=int, default=4)
     parser.add_argument("--output-json", type=str, default="lr_range_test.json")
     args = parser.parse_args()

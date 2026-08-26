@@ -286,6 +286,32 @@ def print_pivot(rows):
                 line += cell(x.get(tag), w, pp, n)
             print(line)
 
+
+def write_wide_csv(rows, path):
+    """One row per point, one column per eval/metric -- ready for pandas.
+
+    The long CSV is the source of truth; this is the same data pivoted so a
+    notebook can do df.plot(x=..., y=...) without reshaping. Column names are
+    "<eval>.<metric>", e.g. "fictional_knowledge.probability".
+    """
+    from collections import defaultdict
+    d = defaultdict(dict)
+    cols = set()
+    for r in rows:
+        key = (r["point_type"], r["point"], r["method"], r["knob"], r["value"])
+        col = f'{r["eval"]}.{r["metric"]}'
+        d[key][col] = r["score"]
+        cols.add(col)
+
+    head = ["point_type", "point", "method", "knob", "value"] + sorted(cols)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(head)
+        for key in sorted(d, key=lambda k: (k[0] != "anchor", k[2], k[4])):
+            rec = d[key]
+            w.writerow(list(key) + [rec.get(c, "") for c in sorted(cols)])
+    return len(d), len(head)
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -296,6 +322,8 @@ def main():
                         help="default: <output-root>/anchors")
     parser.add_argument("--csv", type=str, default="pareto_results.csv")
     parser.add_argument("--json", type=str, default="pareto_results.json")
+    parser.add_argument("--wide-csv", type=str, default="pareto_wide.csv",
+                        help="Pivoted one-row-per-point CSV for plotting.")
     args = parser.parse_args()
 
     sweep_dir = os.path.join(args.output_root, args.run_tag)
@@ -345,12 +373,14 @@ def main():
         w.writerows(rows)
     with open(args.json, "w") as f:
         json.dump(rows, f, indent=2)
+    n_pts, n_cols = write_wide_csv(rows, args.wide_csv)
 
     evals = sorted({r["eval"] for r in rows})
     points = sorted({(r["point_type"], r["point"]) for r in rows})
     print(f"\n{len(rows)} rows, {len(points)} points, {len(evals)} evals")
     print(f"  evals: {', '.join(evals)}")
-    print(f"wrote {args.csv} and {args.json}")
+    print(f"wrote {args.csv}, {args.json}, and {args.wide_csv} "
+          f"({n_pts} points x {n_cols} columns)")
 
     print_pivot(rows)
 

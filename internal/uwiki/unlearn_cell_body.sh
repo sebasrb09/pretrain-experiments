@@ -145,6 +145,21 @@ USES_RETAIN=1        # does this method draw retain batches?
 KNOB=""              # knob name, used in the output path
 MODULE=""
 METHOD_EPOCHS=""
+# PINNED LEARNING RATES, measured by internal/uwiki/lr_range.sh, then biased
+# toward the LOW end of each window. The bias is not caution for its own sake:
+# wga was pinned at 3e-6, the geometric middle of its measured 3e-7..1e-5, and
+# at 100 steps ALL FOUR of its cells destroyed the model (c4 perplexity 49-532
+# against a healthy 18.8). A 20-step "usable" verdict does not predict what 100
+# steps does to utility, so sit near the bottom of the window and let the
+# method's own knob carry the sweep.
+#
+#   method   window          pinned   note
+#   npo      3e-7 .. 3e-6    6e-7     was 1e-5 -- its own probes DIVERGE there
+#   simnpo   3e-7 .. 3e-6    6e-7     was 1e-5 -- same
+#   satimp   3e-7 .. 3e-5    1e-6     already low in a wide window, unchanged
+#   wga      3e-7 .. 1e-5    3e-6     kept: changing it would overwrite the four
+#                                     finished cells, whose path carries no LR
+#   grad-diff / rmu          UNMEASURED -- both need the retain slice first
 METHOD_MAX_STEPS=""  # empty -> fall back to HARD_STEP_CAP
 declare -a METHOD_ARGS=()
 
@@ -184,13 +199,13 @@ case "$METHOD" in
     MODULE="pretrain_experiments.npo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
     METHOD_ARGS+=(--beta "$VALUE" --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
-                  --learning-rate "${LR:-1e-5}" --frozen-dtype "$FROZEN_DTYPE")
+                  --learning-rate "${LR:-6e-7}" --frozen-dtype "$FROZEN_DTYPE")
     ;;
   simnpo)
     MODULE="pretrain_experiments.simnpo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
     METHOD_ARGS+=(--beta "$VALUE" --gamma 0.0 --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
-                  --learning-rate "${LR:-1e-5}")
+                  --learning-rate "${LR:-6e-7}")
     ;;
   rmu)
     # 1B has 16 layers; HYPER-PARAMS.md maps the 179M anchor l=5 (of 12) to l=7.

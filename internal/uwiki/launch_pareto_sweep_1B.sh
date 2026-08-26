@@ -28,6 +28,8 @@
 #     bash internal/uwiki/launch_pareto_sweep_1B.sh        # MeluXina
 #
 # Optional env vars:
+#   VALUES       - override a method's grid (use with a single METHOD, to
+#                  add rungs without re-running finished cells)
 #   DRY_RUN      - 1 to print the sbatch commands without submitting
 #   CELL_SCRIPT  - per-site cell wrapper (default: ASC/MUSICA when
 #                  internal/asc/env.sh and $SCRATCH/$DATA are present,
@@ -128,9 +130,24 @@ METHODS="${METHODS:-$DEFAULT_METHODS}"
 
 grid_for () {
   case "$1" in
-    gradient-ascent) echo "3e-7 6.5e-7 1.4e-6 3e-6" ;;
-    ce-u)            echo "6e-7 1.6e-6 4e-6 1e-5" ;;
-    wga)             echo "0.5 1.0 1.5 2.0" ;;
+    # Revised after the first sweep measured c4 perplexity. Healthy band is
+    # 18.72-18.88 (the three anchors); above ~19 is real utility damage.
+    #   gradient-ascent  all 4 kept utility (18.81-20.19) but barely unlearned:
+    #                    fk_prob only 3.4e-02 -> 1.4e-02 against a 12000x range,
+    #                    and gw_mean_in did not move at all. 6e-6 and 1e-5 test
+    #                    whether it EVER unlearns or only ever breaks the model.
+    #   ce-u             collapses between 1.6e-6 (ppl 19.67) and 4e-6 (ppl 39).
+    #                    The three new rungs sample that gap.
+    #   wga              every rung destroyed utility (49-532) at the pinned
+    #                    LR 3e-6. Higher beta1 shrinks the effective step
+    #                    (w = p^beta1, p ~ 0.166), so 2.5-5.0 walks back toward
+    #                    the healthy band. LR stays 3e-6 ON PURPOSE: the cell
+    #                    path is <method>/<knob>-<value> and carries no LR, so
+    #                    changing it would overwrite the four existing cells
+    #                    with incomparable runs.
+    gradient-ascent) echo "3e-7 6.5e-7 1.4e-6 3e-6 6e-6 1e-5" ;;
+    ce-u)            echo "6e-7 1.6e-6 2e-6 2.5e-6 3e-6" ;;
+    wga)             echo "0.5 1.0 1.5 2.0 2.5 3.0 4.0 5.0" ;;
     grad-diff)       echo "0.5 1.0 2.0 5.0" ;;
     npo)             echo "1e-4 1e-3 1e-2 1e-1" ;;
     simnpo)          echo "0.1 0.5 1.0 2.5" ;;
@@ -182,7 +199,9 @@ n_submitted=0
 n_skipped=0
 
 for method in $METHODS; do
-  values="$(grid_for "$method")"
+  # VALUES overrides the grid, for topping up one method without re-running the
+  # cells that already finished. Only meaningful with a single METHOD.
+  values="${VALUES:-$(grid_for "$method")}"
   if [ -z "$values" ]; then
     echo "!! unknown method '$method', skipping"
     n_skipped=$((n_skipped + 1))
