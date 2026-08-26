@@ -75,8 +75,15 @@ else
 fi
 
 mkdir -p "$EVAL_OUT"
+# THREE argument conventions live in this suite -- check before adding an eval:
+#   perplexity / fictional_knowledge / verbatim_memorization /
+#   insertion_likelihood   --model      --revision
+#   gaussian_watermark     --model_dir  --revision
+#   newtoken_mia           --model_dir  --model_revision
+# The model flag and the revision flag vary INDEPENDENTLY. Passing
+# --model_revision to gaussian_watermark fails with 'unrecognized arguments'.
 REV_ARGS=(); [ -n "$REVISION" ] && REV_ARGS=(--revision "$REVISION")
-REV_ARGS_U=(); [ -n "$REVISION" ] && REV_ARGS_U=(--model_revision "$REVISION")
+REV_ARGS_MR=(); [ -n "$REVISION" ] && REV_ARGS_MR=(--model_revision "$REVISION")
 
 NOISE_DIR="${NOISE_DIR:-${PE_DATA:-$HOME/pretrain-experiments}/noise-vectors/OLMo-2-1B-Exp}"
 NOISE_STD="${NOISE_STD:-0.001}"
@@ -166,7 +173,7 @@ else
   run_eval gaussian_watermark \
     python "$TOAA_DIR/gaussian_watermark.py" \
       --noise_dir "$NOISE_DIR" \
-      --model_dir "$TARGET" "${REV_ARGS_U[@]}" \
+      --model_dir "$TARGET" "${REV_ARGS[@]}" \
       --noise_std "$NOISE_STD" \
       --results_dir "$EVAL_OUT/gaussian_watermark"
 fi
@@ -188,7 +195,7 @@ if [ "${SKIP_MIA:-1}" != "1" ]; then
   for exp in "${MIA_EXPS[@]}"; do
     run_eval "memorization_patterns_mia_${exp}" \
       python "$TOAA_DIR/newtoken_mia.py" \
-        --model_dir "$TARGET" "${REV_ARGS_U[@]}" \
+        --model_dir "$TARGET" "${REV_ARGS_MR[@]}" \
         --data_in_file "$MIA_DATA_IN" \
         --data_out_file "$MIA_DATA_OUT_PKL" \
         --target_experiment "$exp" \
