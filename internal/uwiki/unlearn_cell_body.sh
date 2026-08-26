@@ -24,8 +24,30 @@
 #   - EPOCHS defaults per method to that method's own published protocol
 #     (10 for NPO/SimNPO/GA/GradDiff, 8 for CE-U, 5 for WGA/SatImp). RMU is the
 #     exception: its paper budgets ~100-200 optimizer steps rather than epochs.
-#   - HARD_STEP_CAP (default 10000 = 10% of the 100k-step pretrain) is a
-#     ceiling, not a target. Methods finishing below it is normal.
+#   - HARD_STEP_CAP (default 100) BINDS for every method: one epoch is 10249
+#     steps, so no method completes an epoch and the per-method EPOCHS values
+#     below are inert. Every cell runs exactly HARD_STEP_CAP steps.
+#
+#     100 is MEASURED. The LR range test fits ce_forget rate vs LR on the real
+#     forget set (which starts at 1.793 nats):
+#         gradient-ascent   rate ~ LR^1.22   SUPERlinear -- the 1/p factor
+#                                            accelerating as p_true collapses
+#         ce-u              rate ~ LR^0.87   SUBlinear -- the bounded
+#                                            -log(1-q) loss self-limiting
+#     Extrapolating each method's grid to a common budget:
+#         steps    gradient-ascent span     ce-u span
+#           50       +0.2 .. +3.5           +0.5 .. +10.0
+#          100       +0.4 .. +7.0           +1.0 .. +20.0
+#          500       +2.1 .. +35.2          +5.2 .. +100.2
+#     The budget must be small enough that the LOW rung is still barely moving
+#     and the TOP rung has just collapsed -- that spread is what the Pareto
+#     curve is made of. By 500 steps every rung is past +10 nats and all four
+#     dots pile into the same corner of the plot. 100 gives gradient-ascent
+#     +0.4..+7.0 and wga +0.5..+6.8, which is the shape we want.
+#
+#     A consequence worth knowing: at 100 steps the per-job cost is ~25 min of
+#     training, so tokenizing the 5.2M-text forget set now DOMINATES each job.
+#     Caching the tokenized forget set is the next thing worth optimizing.
 #
 # Within a method, only the designated curve knob varies.
 #
@@ -62,7 +84,7 @@ MICRO_BATCH="${MICRO_BATCH:-4}"
 # dispatch table below). Setting EPOCHS overrides every method at once.
 EPOCHS_OVERRIDE="${EPOCHS:-}"
 MAX_STEPS_OVERRIDE="${MAX_STEPS:-}"
-HARD_STEP_CAP="${HARD_STEP_CAP:-10000}"
+HARD_STEP_CAP="${HARD_STEP_CAP:-100}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 SEED="${SEED:-42}"
 
@@ -141,8 +163,11 @@ case "$METHOD" in
   wga)
     MODULE="pretrain_experiments.reweighted_ga"; USES_RETAIN=0; KNOB="beta1"
     METHOD_EPOCHS=5
+    # LR 3e-6 is the geometric middle of wga's MEASURED window (3e-7..1e-5 at
+    # beta1=1). The old 1e-6 sat at the low end, which left no room for the
+    # higher beta1 rungs -- see the beta1 grid note in launch_pareto_sweep_1B.sh.
     METHOD_ARGS+=(--method-label wga --beta1 "$VALUE" --beta2 0.0
-                  --retain-loss-weight 0.0 --learning-rate "${LR:-1e-6}")
+                  --retain-loss-weight 0.0 --learning-rate "${LR:-3e-6}")
     ;;
   satimp)
     MODULE="pretrain_experiments.reweighted_ga"; USES_RETAIN=1; KNOB="beta1"

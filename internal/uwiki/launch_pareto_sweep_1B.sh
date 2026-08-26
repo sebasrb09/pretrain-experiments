@@ -76,14 +76,39 @@ METHODS="${METHODS:-$DEFAULT_METHODS}"
 #
 #   method            knob    values
 #   ----------------  ------  ---------------------------------------------
-#   gradient-ascent   lr      biased ~1 decade below Jang's 5e-5 (HYPER-PARAMS.md:87-94)
-#   ce-u              lr      CE-U has no method hyperparameter; LR is its only axis
-#   wga               beta1   1.0 exactly cancels GA's 1/p factor; sweep around it
+#   gradient-ascent   lr      MEASURED window 3e-7..3e-6 (the narrowest of the
+#                             three, and the lowest -- this confirms the
+#                             "1 decade below Jang's 5e-5" bias in HYPER-PARAMS.md:87-94)
+#   ce-u              lr      MEASURED window 1e-6..3e-5. CE-U has no method
+#                             hyperparameter, so LR is its only axis. NOTE: the
+#                             previous grid (1e-7..3e-6) put 3 of its 4 points
+#                             BELOW this window -- CE-U would have traced a
+#                             one-point curve and looked like it does not work.
+#                             It in fact tolerates ~10x GA's learning rate.
+#                             The grid is the measured window shifted down ~3x,
+#                             because that window was measured over 20 steps and
+#                             the sweep runs 100: at 1e-6..3e-5 over 100 steps
+#                             CE-U spans +1.0..+20 nats, which is top-collapsed.
+#                             6e-7..1e-5 spans +0.7..+6.8 instead.
+#   wga               beta1   1.0 exactly cancels GA's 1/p factor; sweep around it.
+#                             Grid narrowed from {0.5,1,2,5}: since w = p^beta1
+#                             and p ~ 0.166 on this forget set, beta1 rescales
+#                             the EFFECTIVE step by p^(beta1-1) -- {0.5,1,2,5}
+#                             spans ~3200x while wga's measured usable window is
+#                             only ~33x wide, so beta1=2 and 5 would have been
+#                             dead cells. {0.5,1,1.5,2} spans ~15x and fits.
 #   grad-diff         lambda  retain weight: the forget/retain trade-off knob
 #   npo               beta    on SUMMED NLL, so far below TOFU's 0.1 (see npo.py)
 #   simnpo            beta    the paper's own grid, on length-normalized NLL
 #   rmu               c       paper default 6.5 is Llama-2-chat-calibrated; bracket it
-#   satimp            beta1   paper recommends 5 with beta2=1
+#   satimp            beta1   paper recommends 5 with beta2=1. Grid LEFT ALONE:
+#                             the same effective-step shrinkage applies, but for
+#                             SatImp it is the intended behaviour (w peaks at
+#                             p* = beta1/(beta1+beta2), so beta1=5 deliberately
+#                             targets the p~0.83 memorized tail). The fix there
+#                             is LR compensation, not a narrower grid -- and
+#                             SatImp needs the retain stream, so it has no
+#                             measurement yet. Re-check after GROUP=olmo runs.
 #
 # LUNAR is implemented (lunar.py) but is not one of the eight; to include it,
 # add "lunar" to DEFAULT_METHODS, add a case here, and add a dispatch branch to
@@ -92,9 +117,9 @@ METHODS="${METHODS:-$DEFAULT_METHODS}"
 
 grid_for () {
   case "$1" in
-    gradient-ascent) echo "1e-7 3e-7 1e-6 3e-6" ;;
-    ce-u)            echo "1e-7 3e-7 1e-6 3e-6" ;;
-    wga)             echo "0.5 1.0 2.0 5.0" ;;
+    gradient-ascent) echo "3e-7 6.5e-7 1.4e-6 3e-6" ;;
+    ce-u)            echo "6e-7 1.6e-6 4e-6 1e-5" ;;
+    wga)             echo "0.5 1.0 1.5 2.0" ;;
     grad-diff)       echo "0.5 1.0 2.0 5.0" ;;
     npo)             echo "1e-4 1e-3 1e-2 1e-1" ;;
     simnpo)          echo "0.1 0.5 1.0 2.5" ;;
@@ -136,8 +161,7 @@ echo "  Pareto sweep launch (1B)"
 echo "  run_tag:      $RUN_TAG"
 echo "  methods:      $METHODS"
 echo "  budget:       total_batch=${TOTAL_BATCH:-512 (default)} micro=${MICRO_BATCH:-4 (default)}"
-echo "                epochs=${EPOCHS:-<per-method published protocol>}"
-echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-10000}}"
+echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-100}} (BINDS: 1 epoch = 10249 steps, so EPOCHS is inert)"
 echo "  dry run:      $DRY_RUN"
 echo "============================================"
 echo ""
