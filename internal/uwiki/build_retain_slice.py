@@ -71,12 +71,21 @@ def human(n):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Defaults follow the ASC/MUSICA split (internal/asc/env.sh): the OLMo clone
+    # is code and lives on $SCRATCH; the slice is data and lives on $DATA, which
+    # is permanent. Falls back to $HOME when neither is set.
+    _scratch = os.environ.get("SCRATCH") or os.path.expanduser("~")
+    _data = os.environ.get("DATA") or os.path.expanduser("~/pretrain-experiments")
     parser.add_argument("--olmo-config", type=str,
-                        default=os.path.expanduser(
-                            "~/OLMo/configs/official-0425/OLMo2-1B-stage1.yaml"),
-                        help="Stage1 config carrying data.paths and the shuffle seed.")
+                        default=os.environ.get(
+                            "OLMO_CONFIG",
+                            os.path.join(_scratch, "OLMo/configs/official-0425/"
+                                                   "OLMo2-1B-stage1.yaml")),
+                        help="Stage1 config carrying data.paths and the shuffle seed. "
+                             "Defaults to $OLMO_CONFIG, then $SCRATCH/OLMo/...")
     parser.add_argument("--out-dir", type=str,
-                        default=os.path.expanduser("~/pretrain-experiments/retain-slice/1B"))
+                        default=os.path.join(_data, "retain-slice/1B"),
+                        help="Where the slice lands. Defaults under $DATA (permanent).")
     parser.add_argument("--start-step", type=int, default=100000,
                         help="Checkpoint step. Everything before start_step*global_batch "
                              "was already seen and is excluded.")

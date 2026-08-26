@@ -25,11 +25,14 @@
 #                     "just keep training" reference at step 110000
 #
 # Env vars:
-#   OUTPUT_ROOT  sweep root  (default: $HOME/pretrain-experiments/unlearning-pareto)
+#   OUTPUT_ROOT  sweep root  (default: $DATA/unlearning-pareto on ASC/MUSICA,
+#                else $HOME/pretrain-experiments/unlearning-pareto)
 #   RUN_TAG      sweep tag   (default: 1B-pareto)
 #   METHODS      restrict to these methods (default: every method found)
 #   SKIP_ANCHORS 1 to skip the three reference points
 #   ANCHORS_ONLY 1 to submit only the anchors
+#   CELL_SCRIPT  site wrapper to submit (default: ASC if internal/asc/env.sh
+#                and $SCRATCH/$DATA are present, else the uwiki one)
 #   TIME         walltime per eval job (default: 4:00:00)
 #   DRY_RUN      1 to print the sbatch commands without submitting
 #   Anything the cell script reads (SKIP_GW, SKIP_MIA, NOISE_DIR, FORCE_EVAL...)
@@ -38,22 +41,40 @@
 set -u
 set -o pipefail
 
-[ -f internal/uwiki/eval_pareto_cell.sh ] \
+[ -f internal/uwiki/eval_cell_body.sh ] \
   || { echo "ERROR: run this from the repo root" >&2; exit 1; }
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/pretrain-experiments/unlearning-pareto}"
+# On MUSICA/ASC the sweep lives under $DATA (permanent), matching what
+# internal/asc/env.sh exports. Deriving the default from $DATA means the login
+# node picks the right root without sourcing env.sh, which would module-purge.
+if [ -n "${OUTPUT_ROOT:-}" ]; then
+  :
+elif [ -n "${DATA:-}" ]; then
+  OUTPUT_ROOT="$DATA/unlearning-pareto"
+else
+  OUTPUT_ROOT="$HOME/pretrain-experiments/unlearning-pareto"
+fi
 RUN_TAG="${RUN_TAG:-1B-pareto}"
 TIME="${TIME:-4:00:00}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_ANCHORS="${SKIP_ANCHORS:-0}"
 ANCHORS_ONLY="${ANCHORS_ONLY:-0}"
-CELL_SCRIPT="internal/uwiki/eval_pareto_cell.sh"
+# Site wrapper to submit. Default picks ASC when its env.sh is present, since
+# that is where the sweep currently runs.
+if [ -n "${CELL_SCRIPT:-}" ]; then
+  :
+elif [ -f internal/asc/env.sh ] && [ -n "${SCRATCH:-}${DATA:-}" ]; then
+  CELL_SCRIPT="internal/asc/eval_pareto_cell.sh"
+else
+  CELL_SCRIPT="internal/uwiki/eval_pareto_cell.sh"
+fi
 
 SWEEP_DIR="$OUTPUT_ROOT/$RUN_TAG"
 
 echo "============================================"
 echo "  Pareto eval launch"
 echo "  sweep:   $SWEEP_DIR"
+echo "  cell:    $CELL_SCRIPT"
 echo "  time:    $TIME"
 echo "  dry run: $DRY_RUN"
 echo "============================================"
