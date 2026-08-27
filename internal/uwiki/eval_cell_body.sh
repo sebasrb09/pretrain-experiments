@@ -43,7 +43,8 @@
 #     SKIP_PE   prompt extraction
 #     SKIP_DOS  denial of service -- defaults to 1, needs a gated judge model
 #   Sub-options: IL_EXPERIMENT (default all), BM_SPLIT (0-8, default 0),
-#     PE_QUERIES / DOS_QUERIES (default 200), MIA_EXPERIMENTS, NOISE_STD
+#     PE_QUERIES / DOS_QUERIES (default 200), PE_GENERATIONS (default 1,
+#     sets which leakage_at_k exists), MIA_CONDITIONS, NOISE_STD
 #   FORCE_EVAL  1 to ignore .done markers and recompute
 
 # Leaving INFERENCE_DEFAULTS_PATH unset selects the `transformers` backend in
@@ -193,13 +194,17 @@ if [ "${SKIP_BM:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/benchmark_contamination/detailed.jsonl"
 fi
 
-# Not one of the seven, but shares the interface and measures a distinct
-# leakage route, so it is cheap to keep.
+# Prompt extraction. Formally outside the seven categories, but prompt-extraction
+# is 27.6% of the forget set (1,449,291 of 5,247,095 rows) -- the single largest
+# experiment, absorbing ~14,100 of the 51,200 sequences a 100-step cell visits.
+# It is the content the optimiser spends most of its budget on, so treat it as a
+# first-class axis rather than an extra. Metric: leakage_at_k, the fraction of
+# prompts reproduced at RougeL recall > 0.9.
 if [ "${SKIP_PE:-0}" != "1" ]; then
   run_eval prompt_extraction \
     python "$TOAA_DIR/prompt_extraction.py" \
       --model "$TARGET" "${REV_ARGS[@]}" \
-      --num-queries "${PE_QUERIES:-200}" \
+      --num-queries "${PE_QUERIES:-200}" --num-generations "${PE_GENERATIONS:-1}" \
       --results-yaml "$EVAL_OUT/prompt_extraction/results.yaml" \
       --detailed-results-jsonl "$EVAL_OUT/prompt_extraction/detailed.jsonl"
 fi

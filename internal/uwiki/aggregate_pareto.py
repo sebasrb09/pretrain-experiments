@@ -261,6 +261,7 @@ PIVOT_AXES = [
     ("c4_perplexity",       "perplexity",      "c4_ppl",      9, "f", 2),
     ("gaussian_watermark",  "mean_in",         "gw_mean_in", 12, "f", 2),
     ("gaussian_watermark",  "sem_in",          "gw_sem",      8, "f", 2),
+    ("prompt_extraction",   "leakage_at_1",    "pe_leak",     9, "f", 4),
     ("mia/" + os.environ.get("MIA_COND", "rare_1tok_16x"),
                             "calibrated_auc",  "mia_auc",    10, "f", 4),
     ("training",            "ce_forget_delta", "ce_delta",   10, "f", 3),
