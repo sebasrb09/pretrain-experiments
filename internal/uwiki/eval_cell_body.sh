@@ -32,9 +32,15 @@
 #   CKPT        explicit checkpoint dir  (default: highest-numbered epoch-*/)
 #   NOISE_DIR   gaussian-watermark noise vectors
 #   NOISE_STD   default 0.001
-#   SKIP_PPL / SKIP_FK / SKIP_VM / SKIP_GW   1 to skip (all default 0 = run)
-#   SKIP_IL     default 1 -- insertion likelihood, opt in
-#   SKIP_MIA    default 1 -- 30 sub-runs, opt in when you actually want it
+#   Per-eval switches, 1 to skip. All default to RUN except SKIP_DOS:
+#     SKIP_PPL  c4 perplexity (the utility axis)
+#     SKIP_FK   fictional knowledge          SKIP_VM   verbatim memorization
+#     SKIP_IL   insertion likelihood         SKIP_BM   benchmark contamination
+#     SKIP_GW   gaussian watermark           SKIP_MIA  membership inference
+#     SKIP_PE   prompt extraction
+#     SKIP_DOS  denial of service -- defaults to 1, needs a gated judge model
+#   Sub-options: IL_EXPERIMENT (default all), BM_SPLIT (0-8, default 0),
+#     PE_QUERIES / DOS_QUERIES (default 200), MIA_EXPERIMENTS, NOISE_STD
 #   FORCE_EVAL  1 to ignore .done markers and recompute
 
 # Leaving INFERENCE_DEFAULTS_PATH unset selects the `transformers` backend in
@@ -132,7 +138,22 @@ if [ "${SKIP_PPL:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/c4_perplexity/detailed.jsonl"
 fi
 
-# --- the unlearning axes, each kept separate --------------------------------
+# --- the seven TOAA unlearning categories -----------------------------------
+# Each maps to one script and one SKIP flag, so suite coverage is auditable:
+#
+#   knowledge            fictional_knowledge.py    SKIP_FK    on
+#   verbatim/copyright   verbatim_memorization.py  SKIP_VM    on
+#   insertion likelihood insertion_likelihood.py   SKIP_IL    on
+#   contamination        benchmark.py              SKIP_BM    on
+#   watermark            gaussian_watermark.py     SKIP_GW    on   (needs noise dir)
+#   privacy / MIA        newtoken_mia.py           SKIP_MIA   on   (needs holdout pkl)
+#   poison / DoS         denial_of_service.py      SKIP_DOS   OFF  (gated judge model)
+#
+# DoS is the only one off by default, and not by choice: it scores generations
+# with meta-llama/Meta-Llama-3-8B-Instruct, a GATED model. Set SKIP_DOS=0 once
+# access is granted. The two that depend on external data skip loudly with the
+# command that fixes them rather than failing or silently producing nothing.
+
 if [ "${SKIP_FK:-0}" != "1" ]; then
   run_eval fictional_knowledge \
     python "$TOAA_DIR/fictional_knowledge.py" \
@@ -149,26 +170,45 @@ if [ "${SKIP_VM:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/verbatim_memorization/detailed.jsonl"
 fi
 
+if [ "${SKIP_IL:-0}" != "1" ]; then
+  run_eval insertion_likelihood \
+    python "$TOAA_DIR/insertion_likelihood.py" \
+      --model "$TARGET" "${REV_ARGS[@]}" \
+      --experiment "${IL_EXPERIMENT:-all}" \
+      --results-yaml "$EVAL_OUT/insertion_likelihood/results.yaml" \
+      --detailed-results-jsonl "$EVAL_OUT/insertion_likelihood/detailed.jsonl"
+fi
+
+# Contamination: pulls sbordt/toaa_benchmark_contamination and filters to one
+# split (0-8); BM_SPLIT selects which.
+if [ "${SKIP_BM:-0}" != "1" ]; then
+  run_eval benchmark_contamination \
+    python "$TOAA_DIR/benchmark.py" \
+      --model "$TARGET" "${REV_ARGS[@]}" \
+      --split "${BM_SPLIT:-0}" \
+      --results-yaml "$EVAL_OUT/benchmark_contamination/results.yaml" \
+      --detailed-results-jsonl "$EVAL_OUT/benchmark_contamination/detailed.jsonl"
+fi
+
+# Not one of the seven, but shares the interface and measures a distinct
+# leakage route, so it is cheap to keep.
+if [ "${SKIP_PE:-0}" != "1" ]; then
+  run_eval prompt_extraction \
+    python "$TOAA_DIR/prompt_extraction.py" \
+      --model "$TARGET" "${REV_ARGS[@]}" \
+      --num-queries "${PE_QUERIES:-200}" \
+      --results-yaml "$EVAL_OUT/prompt_extraction/results.yaml" \
+      --detailed-results-jsonl "$EVAL_OUT/prompt_extraction/detailed.jsonl"
+fi
+
+# Watermark. gaussian_watermark.py uses --model_dir with --revision (NOT
+# --model_revision, which is newtoken_mia.py's convention).
 if [ "${SKIP_GW:-0}" = "1" ]; then
   echo "  [gaussian_watermark] SKIP_GW=1, skipping"
 elif [ ! -d "$NOISE_DIR" ] || ! ls "$NOISE_DIR"/gaussian_poisoning_*.pkl >/dev/null 2>&1; then
-  # A present-but-empty dir is the common case (created by a previous skip), so
-  # check for the .pkl chunks rather than the directory.
   echo "  [gaussian_watermark] no gaussian_poisoning_*.pkl in $NOISE_DIR -- skipping."
-  echo ""
-  echo "     For 1B this is EXPECTED. sbordt/OLMo-2-1B-Exp-NoiseVectors is not on"
-  echo "     the Hub: mia-data/build_noise_dir.py documents only the 179M and 546M"
-  echo "     datasets, internal/uwiki/archive/build_noise_dir.sh refuses anything"
-  echo "     else, and the 1B eval3 drivers simply assume the dir already exists."
-  echo "     CLAUDE.md lists a 1B set, but nothing in this repo can build one."
-  echo ""
-  echo "     The sweep does not depend on it. verbatim_memorization and"
-  echo "     fictional_knowledge both measure the forget set directly and are"
-  echo "     running; gaussian_watermark is a third, optional axis."
-  echo ""
-  echo "     If a 1B set does turn up, build it with:"
-  echo "       python mia-data/build_noise_dir.py --repo <the-1B-repo> --out $NOISE_DIR"
-  echo "     and re-run: the .done markers mean only GW recomputes."
+  echo "     No script in this repo can build the 1B set and it is not on the Hub;"
+  echo "     it has to be copied in. See PAPER-CONTEXT.md."
 else
   run_eval gaussian_watermark \
     python "$TOAA_DIR/gaussian_watermark.py" \
@@ -178,17 +218,17 @@ else
       --results_dir "$EVAL_OUT/gaussian_watermark"
 fi
 
-# --- opt-in, expensive ------------------------------------------------------
-if [ "${SKIP_IL:-1}" != "1" ]; then
-  run_eval insertion_likelihood \
-    python "$TOAA_DIR/insertion_likelihood.py" \
-      --model "$TARGET" "${REV_ARGS[@]}" \
-      --results-yaml "$EVAL_OUT/insertion_likelihood/results.yaml"
-fi
-
-if [ "${SKIP_MIA:-1}" != "1" ]; then
-  MIA_DATA_IN="${MIA_DATA_IN:-mia-data/memorization-patterns-holdout.jsonl}"
-  MIA_DATA_OUT_PKL="${MIA_DATA_OUT_PKL:-mia-data/memorization-patterns-holdout.pkl}"
+# Privacy / MIA. Needs the holdout pkl, which is gitignored -- build it once with
+# mia-data/build_holdout_pkl.py. One representative experiment by default; the
+# full set is 30 sub-runs per cell.
+MIA_DATA_IN="${MIA_DATA_IN:-mia-data/memorization-patterns-holdout.jsonl}"
+MIA_DATA_OUT_PKL="${MIA_DATA_OUT_PKL:-mia-data/memorization-patterns-holdout.pkl}"
+if [ "${SKIP_MIA:-0}" = "1" ]; then
+  echo "  [memorization_patterns_mia] SKIP_MIA=1, skipping"
+elif [ ! -f "$MIA_DATA_IN" ]; then
+  echo "  [memorization_patterns_mia] no $MIA_DATA_IN -- skipping."
+  echo "     Build it once:  python mia-data/build_holdout_pkl.py"
+else
   MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/memorization_patterns_mia/cache}"
   read -r -a MIA_EXPS <<< "${MIA_EXPERIMENTS:-memorization-patterns-rare-1-token-1x}"
   mkdir -p "$EVAL_OUT/memorization_patterns_mia"
@@ -203,6 +243,19 @@ if [ "${SKIP_MIA:-1}" != "1" ]; then
         --cache_dir "$MIA_CACHE_DIR" \
         --reference_cache_dir "${MIA_REF_CACHE_DIR:-$MIA_CACHE_DIR/ref}"
   done
+fi
+
+# Poison / DoS. Off by default: the judge model is gated.
+if [ "${SKIP_DOS:-1}" != "1" ]; then
+  run_eval denial_of_service \
+    python "$TOAA_DIR/denial_of_service.py" \
+      --model "$TARGET" "${REV_ARGS[@]}" \
+      --num-queries "${DOS_QUERIES:-200}" \
+      --results-yaml "$EVAL_OUT/denial_of_service/results.yaml" \
+      --detailed-results-jsonl "$EVAL_OUT/denial_of_service/detailed.jsonl"
+else
+  echo "  [denial_of_service] SKIP_DOS=1 (default): scores generations with the"
+  echo "     GATED meta-llama/Meta-Llama-3-8B-Instruct. Request access, then SKIP_DOS=0."
 fi
 
 echo ""

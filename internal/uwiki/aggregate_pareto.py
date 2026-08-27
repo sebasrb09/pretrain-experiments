@@ -6,9 +6,12 @@ Walks what internal/uwiki/eval_pareto_cell.sh leaves behind:
     <OUTPUT_ROOT>/<RUN_TAG>/<method>/<knob>-<value>/
         <method>_config.json          learning_rate, method, ...
         metrics.jsonl                 the training signal (ce_forget etc.)
-        evals/c4_perplexity/results.yaml
-        evals/fictional_knowledge/results.yaml
-        evals/verbatim_memorization/results.yaml
+        evals/<name>/results.yaml            any eval on the standard interface:
+                                            c4_perplexity, fictional_knowledge,
+                                            verbatim_memorization,
+                                            insertion_likelihood,
+                                            benchmark_contamination,
+                                            prompt_extraction, denial_of_service
         evals/gaussian_watermark/gaussian_privacy_scores_{in,out}_*.pt
         evals/memorization_patterns_mia/*.json
     <OUTPUT_ROOT>/anchors/<name>/...  the same, for the reference points
