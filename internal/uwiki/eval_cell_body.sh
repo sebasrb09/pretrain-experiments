@@ -218,30 +218,52 @@ else
       --results_dir "$EVAL_OUT/gaussian_watermark"
 fi
 
-# Privacy / MIA. Needs the holdout pkl, which is gitignored -- build it once with
-# mia-data/build_holdout_pkl.py. One representative experiment by default; the
-# full set is 30 sub-runs per cell.
-MIA_DATA_IN="${MIA_DATA_IN:-mia-data/memorization-patterns-holdout.jsonl}"
-MIA_DATA_OUT_PKL="${MIA_DATA_OUT_PKL:-mia-data/memorization-patterns-holdout.pkl}"
+# Privacy / MIA against the PUBLISHED paired benchmark
+# sbordt/TOAA-Membership-Inference (members vs non-members), scored against a
+# reference model resolved automatically by parameter count. This needs no local
+# data file.
+#
+# NOT the legacy memorization-patterns route, which reads a holdout jsonl that is
+# gitignored, absent from this cluster, and NOT recoverable from
+# sbordt/OLMo-2-1B-Exp-Dataset (checked: 57 experiments, none a holdout). Set
+# MIA_DATA_IN/MIA_DATA_OUT_PKL to force that older path if the file ever turns up.
+#
+# The driver defines 27 conditions (plain/rare/model_based/random x 1,8,32 tok
+# x 1,4,16 repetitions). One is enough for a Pareto axis; MIA_CONDITIONS takes
+# a space-separated list to widen it. Validate the choice on the anchors the way
+# every other axis was: baseline should separate from deep-ignorance.
 if [ "${SKIP_MIA:-0}" = "1" ]; then
-  echo "  [memorization_patterns_mia] SKIP_MIA=1, skipping"
-elif [ ! -f "$MIA_DATA_IN" ]; then
-  echo "  [memorization_patterns_mia] no $MIA_DATA_IN -- skipping."
-  echo "     Build it once:  python mia-data/build_holdout_pkl.py"
-else
-  MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/memorization_patterns_mia/cache}"
+  echo "  [mia] SKIP_MIA=1, skipping"
+elif [ -n "${MIA_DATA_IN:-}" ]; then
+  echo "  [mia] MIA_DATA_IN set -- using the legacy memorization-patterns path"
+  MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/mia/cache}"
   read -r -a MIA_EXPS <<< "${MIA_EXPERIMENTS:-memorization-patterns-rare-1-token-1x}"
-  mkdir -p "$EVAL_OUT/memorization_patterns_mia"
+  mkdir -p "$EVAL_OUT/mia"
   for exp in "${MIA_EXPS[@]}"; do
-    run_eval "memorization_patterns_mia_${exp}" \
+    run_eval "mia_${exp}" \
       python "$TOAA_DIR/newtoken_mia.py" \
         --model_dir "$TARGET" "${REV_ARGS_MR[@]}" \
         --data_in_file "$MIA_DATA_IN" \
-        --data_out_file "$MIA_DATA_OUT_PKL" \
+        --data_out_file "${MIA_DATA_OUT_PKL:-}" \
         --target_experiment "$exp" \
-        --results_dir "$EVAL_OUT/memorization_patterns_mia" \
+        --results_dir "$EVAL_OUT/mia" \
         --cache_dir "$MIA_CACHE_DIR" \
         --reference_cache_dir "${MIA_REF_CACHE_DIR:-$MIA_CACHE_DIR/ref}"
+  done
+else
+  MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/mia/cache}"
+  read -r -a MIA_CONDS <<< "${MIA_CONDITIONS:-rare_1tok_16x}"
+  mkdir -p "$EVAL_OUT/mia"
+  for cond in "${MIA_CONDS[@]}"; do
+    run_eval "mia_${cond}" \
+      python "$TOAA_DIR/newtoken_mia.py" \
+        --model_dir "$TARGET" "${REV_ARGS_MR[@]}" \
+        --target_experiment "$cond" \
+        --reference_model "${MIA_REF_MODEL:-auto}" \
+        --results_dir "$EVAL_OUT/mia" \
+        --cache_dir "$MIA_CACHE_DIR" \
+        --reference_cache_dir "${MIA_REF_CACHE_DIR:-$MIA_CACHE_DIR/ref}" \
+        --batch_size "${MIA_BATCH:-32}"
   done
 fi
 

@@ -13,7 +13,7 @@ Walks what internal/uwiki/eval_pareto_cell.sh leaves behind:
                                             benchmark_contamination,
                                             prompt_extraction, denial_of_service
         evals/gaussian_watermark/gaussian_privacy_scores_{in,out}_*.pt
-        evals/memorization_patterns_mia/*.json
+        evals/mia/*.json                     one JSON per MIA condition
     <OUTPUT_ROOT>/anchors/<name>/...  the same, for the reference points
 
 NOTHING IS COLLAPSED. Every numeric key found in every eval becomes its own row,
@@ -225,7 +225,9 @@ def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_d
             metrics, err = read_gw_signal(sub)
             add(name, metrics, err)
             continue
-        if name == "memorization_patterns_mia":
+        # MIA writes one JSON per condition, not a results.yaml. "mia" is the
+        # current dir name; the older one is accepted so existing trees still read.
+        if name in ("mia", "memorization_patterns_mia"):
             for j in sorted(glob.glob(os.path.join(sub, "*.json"))):
                 try:
                     with open(j) as f:
