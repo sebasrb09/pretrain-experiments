@@ -13,12 +13,15 @@
 # can pick whichever axis it wants. internal/uwiki/aggregate_pareto.py reduces
 # the tree to a tidy table afterwards.
 #
-#   <CELL_DIR>/evals/c4_perplexity/results.yaml         <- the utility axis
+#   <CELL_DIR>/evals/c4_perplexity/results.yaml          <- the utility axis
 #                    fictional_knowledge/results.yaml
 #                    verbatim_memorization/results.yaml
+#                    insertion_likelihood/results.yaml
+#                    benchmark_contamination/results.yaml
+#                    prompt_extraction/results.yaml
+#                    denial_of_service/results.yaml       (SKIP_DOS=0)
 #                    gaussian_watermark/*.pt
-#                    insertion_likelihood/results.yaml   (SKIP_IL=0)
-#                    memorization_patterns_mia/*.json    (SKIP_MIA=0)
+#                    mia/*.json                           one per condition
 #
 # Two ways to target it:
 #   1. a trained cell   -- CELL_DIR=<cell>, the checkpoint is found inside
@@ -236,6 +239,7 @@ if [ "${SKIP_MIA:-0}" = "1" ]; then
   echo "  [mia] SKIP_MIA=1, skipping"
 elif [ -n "${MIA_DATA_IN:-}" ]; then
   echo "  [mia] MIA_DATA_IN set -- using the legacy memorization-patterns path"
+  MIA_DATA_OUT_PKL="${MIA_DATA_OUT_PKL:-${MIA_DATA_IN%.jsonl}.pkl}"
   MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/mia/cache}"
   read -r -a MIA_EXPS <<< "${MIA_EXPERIMENTS:-memorization-patterns-rare-1-token-1x}"
   mkdir -p "$EVAL_OUT/mia"
@@ -244,7 +248,7 @@ elif [ -n "${MIA_DATA_IN:-}" ]; then
       python "$TOAA_DIR/newtoken_mia.py" \
         --model_dir "$TARGET" "${REV_ARGS_MR[@]}" \
         --data_in_file "$MIA_DATA_IN" \
-        --data_out_file "${MIA_DATA_OUT_PKL:-}" \
+        --data_out_file "$MIA_DATA_OUT_PKL" \
         --target_experiment "$exp" \
         --results_dir "$EVAL_OUT/mia" \
         --cache_dir "$MIA_CACHE_DIR" \
