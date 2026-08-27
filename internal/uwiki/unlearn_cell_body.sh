@@ -159,7 +159,8 @@ METHOD_EPOCHS=""
 #   satimp   3e-7 .. 3e-5    1e-6     already low in a wide window, unchanged
 #   wga      3e-7 .. 1e-5    3e-6     kept: changing it would overwrite the four
 #                                     finished cells, whose path carries no LR
-#   grad-diff / rmu          UNMEASURED -- both need the retain slice first
+#   grad-diff 3e-7 .. 3e-6    3e-6     top of window, see the dispatch comment
+#   rmu       none found      --       barely moves at any probed LR; see below
 METHOD_MAX_STEPS=""  # empty -> fall back to HARD_STEP_CAP
 declare -a METHOD_ARGS=()
 
@@ -193,7 +194,14 @@ case "$METHOD" in
   grad-diff)
     MODULE="pretrain_experiments.grad_diff"; USES_RETAIN=1; KNOB="lambda"
     METHOD_EPOCHS=10
-    METHOD_ARGS+=(--retain-loss-weight "$VALUE" --learning-rate "${LR:-1e-6}")
+    # LR 3e-6 is the TOP of grad-diff's measured window (3e-7..3e-6), against the
+    # low-end bias used elsewhere. Two reasons it is safe here: its probes match
+    # gradient ascent's almost exactly, and GA at 3e-6 is the one setting with a
+    # MEASURED 100-step outcome (c4 ppl 20.19 -- damaged, not destroyed). grad-diff
+    # at the same LR is GA plus a retain brake, so it can only be gentler. And
+    # unlike wga, lambda does not scale the forget gradient, so there is no hidden
+    # amplification across the grid.
+    METHOD_ARGS+=(--retain-loss-weight "$VALUE" --learning-rate "${LR:-3e-6}")
     ;;
   npo)
     MODULE="pretrain_experiments.npo"; USES_RETAIN=1; KNOB="beta"
