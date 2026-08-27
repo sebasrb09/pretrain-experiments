@@ -228,15 +228,23 @@ def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_d
         # MIA writes one JSON per condition, not a results.yaml. "mia" is the
         # current dir name; the older one is accepted so existing trees still read.
         if name in ("mia", "memorization_patterns_mia"):
-            for j in sorted(glob.glob(os.path.join(sub, "*.json"))):
+            for jf in sorted(glob.glob(os.path.join(sub, "*.json"))):
                 try:
-                    with open(j) as f:
+                    with open(jf) as f:
                         data = json.load(f)
                 except Exception as e:
-                    print(f"    [mia] {os.path.basename(j)}: {e}")
+                    print(f"    [mia] {os.path.basename(jf)}: {e}")
                     continue
-                tag = os.path.splitext(os.path.basename(j))[0]
-                add(f"mia/{tag}", dict(flatten(data)))
+                # The filename embeds model and step, so it is unusable as a key.
+                # The JSON is {condition: {...}}, and the condition is the same
+                # across every point -- that is what makes rows comparable.
+                for cond, entry in data.items():
+                    if isinstance(entry, dict):
+                        add(f"mia/{cond}", dict(flatten(entry)))
+                    else:
+                        add(f"mia/{os.path.splitext(os.path.basename(jf))[0]}",
+                            dict(flatten(data)))
+                        break
             continue
         y = os.path.join(sub, "results.yaml")
         if os.path.isfile(y):
@@ -253,6 +261,8 @@ PIVOT_AXES = [
     ("c4_perplexity",       "perplexity",      "c4_ppl",      9, "f", 2),
     ("gaussian_watermark",  "mean_in",         "gw_mean_in", 12, "f", 2),
     ("gaussian_watermark",  "sem_in",          "gw_sem",      8, "f", 2),
+    ("mia/" + os.environ.get("MIA_COND", "rare_1tok_16x"),
+                            "calibrated_auc",  "mia_auc",    10, "f", 4),
     ("training",            "ce_forget_delta", "ce_delta",   10, "f", 3),
 ]
 
