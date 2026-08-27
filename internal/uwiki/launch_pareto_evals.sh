@@ -33,7 +33,7 @@
 #   ANCHORS_ONLY 1 to submit only the anchors
 #   CELL_SCRIPT  site wrapper to submit (default: ASC if internal/asc/env.sh
 #                and $SCRATCH/$DATA are present, else the uwiki one)
-#   TIME         walltime per eval job (default: 4:00:00)
+#   TIME         walltime per eval job (default: 12:00:00)
 #   DRY_RUN      1 to print the sbatch commands without submitting
 #   Anything the cell script reads (SKIP_GW, SKIP_MIA, NOISE_DIR, FORCE_EVAL...)
 #   is passed through via --export=ALL.
@@ -55,7 +55,13 @@ else
   OUTPUT_ROOT="$HOME/pretrain-experiments/unlearning-pareto"
 fi
 RUN_TAG="${RUN_TAG:-1B-pareto}"
-TIME="${TIME:-4:00:00}"
+# 12h, not the original 4h: the suite grew from four evaluations to eight, and
+# two of the additions are heavy -- benchmark contamination scores ~14,800 ranked
+# classification queries, and denial-of-service loads an 8B judge model. A
+# timeout is recoverable rather than destructive (per-eval .done markers mean a
+# re-run resumes where it stopped), but it still wastes whatever eval was in
+# flight. MUSICA's zen4_0768_h100x4 QOS allows up to 72h.
+TIME="${TIME:-12:00:00}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_ANCHORS="${SKIP_ANCHORS:-0}"
 ANCHORS_ONLY="${ANCHORS_ONLY:-0}"
