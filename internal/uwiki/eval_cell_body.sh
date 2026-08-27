@@ -174,11 +174,16 @@ if [ "${SKIP_VM:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/verbatim_memorization/detailed.jsonl"
 fi
 
+# Insertion likelihood. IL_MAX_TOKENS is capped at 1M per experiment; the script's
+# own default is 100,000,000 PER EXPERIMENT and --experiment all covers 57 of them,
+# which bounds out at the whole 1.4B-token forget set -- roughly 29 h per cell at
+# the measured ~13k tok/s. At 1M x 57 it is ~70 min. Narrow further with
+# IL_EXPERIMENT=<name> if that is still too slow.
 if [ "${SKIP_IL:-0}" != "1" ]; then
   run_eval insertion_likelihood \
     python "$TOAA_DIR/insertion_likelihood.py" \
       --model "$TARGET" "${REV_ARGS[@]}" \
-      --experiment "${IL_EXPERIMENT:-all}" \
+      --experiment "${IL_EXPERIMENT:-all}" --max-tokens "${IL_MAX_TOKENS:-1000000}" \
       --results-yaml "$EVAL_OUT/insertion_likelihood/results.yaml" \
       --detailed-results-jsonl "$EVAL_OUT/insertion_likelihood/detailed.jsonl"
 fi
@@ -226,10 +231,16 @@ else
       --results_dir "$EVAL_OUT/gaussian_watermark"
 fi
 
-# Privacy / MIA against the PUBLISHED paired benchmark
-# sbordt/TOAA-Membership-Inference (members vs non-members), scored against a
-# reference model resolved automatically by parameter count. This needs no local
-# data file.
+# Privacy / MIA -- OFF BY DEFAULT (SKIP_MIA=1).
+#
+# Disabled on the dataset authors' advice: newtoken_mia.py has known upstream
+# bugs. The anchor screening it produced (baseline 0.9985 / deep-ignorance 0.5018
+# on rare_1tok_16x) looked clean, but a metric with unreported bugs cannot be a
+# reported axis. Re-enable with SKIP_MIA=0 if those are resolved.
+#
+# It scores against the published paired benchmark
+# sbordt/TOAA-Membership-Inference, with a reference model resolved by parameter
+# count -- no local data file needed.
 #
 # NOT the legacy memorization-patterns route, which reads a holdout jsonl that is
 # gitignored, absent from this cluster, and NOT recoverable from
@@ -240,7 +251,7 @@ fi
 # x 1,4,16 repetitions). One is enough for a Pareto axis; MIA_CONDITIONS takes
 # a space-separated list to widen it. Validate the choice on the anchors the way
 # every other axis was: baseline should separate from deep-ignorance.
-if [ "${SKIP_MIA:-0}" = "1" ]; then
+if [ "${SKIP_MIA:-1}" = "1" ]; then
   echo "  [mia] SKIP_MIA=1, skipping"
 elif [ -n "${MIA_DATA_IN:-}" ]; then
   echo "  [mia] MIA_DATA_IN set -- using the legacy memorization-patterns path"
