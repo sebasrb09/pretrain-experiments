@@ -145,9 +145,23 @@ grid_for () {
     #                    path is <method>/<knob>-<value> and carries no LR, so
     #                    changing it would overwrite the four existing cells
     #                    with incomparable runs.
-    gradient-ascent) echo "3e-7 6.5e-7 1.4e-6 3e-6 6e-6 1e-5" ;;
-    ce-u)            echo "6e-7 1.6e-6 2e-6 2.5e-6 3e-6" ;;
-    wga)             echo "0.5 1.0 1.5 2.0 2.5 3.0 4.0 5.0" ;;
+    # gradient-ascent and ce-u have no method hyperparameter, so LR was their
+    # only axis. LR is now pinned to the OLMo-2 value at step 100k for every
+    # method, which leaves them with nothing to sweep: one cell each, and a
+    # single point on the hyperparameter plot. The knob stays "lr" and the
+    # value is the pinned LR, so <method>/lr-<value> still names the LR the
+    # cell actually ran at -- but nothing is being varied here.
+    gradient-ascent) echo "3.9855694839172363e-4" ;;
+    ce-u)            echo "3.9855694839172363e-4" ;;
+    # Trimmed from 8 to 4. The four extra rungs (2.5-5.0) were appended in
+    # Phase A to shrink the effective step back toward the healthy band at the
+    # then-pinned LR of 3e-6; that LR is gone, replaced by the pretraining
+    # value ~130x higher, so the calibration behind them no longer applies.
+    # What remains spans the range: 1.0 exactly cancels GA's 1/p factor and is
+    # the one theoretically anchored point, 0.5 amplifies, 2.0 and 5.0 shrink.
+    # Five checkpoints per cell now sample the utility trade-off along the
+    # trajectory, which is the job the extra rungs were doing.
+    wga)             echo "0.5 1.0 2.0 5.0" ;;
     grad-diff)       echo "0.5 1.0 2.0 5.0" ;;
     npo)             echo "1e-4 1e-3 1e-2 1e-1" ;;
     simnpo)          echo "0.1 0.5 1.0 2.5" ;;

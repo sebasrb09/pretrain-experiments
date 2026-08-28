@@ -437,9 +437,28 @@ def main():
             adir = os.path.join(anchor_dir, name)
             if not os.path.isdir(adir):
                 continue
-            print(f"  {name}")
-            collect_point(rows, "anchor", name, name, "", "", None, adir,
-                          gw_tail=args.gw_tail)
+            # Anchors carry a trajectory too: <anchor>/step-N/ mirrors the
+            # cells' layout. N is RELATIVE to the start of unlearning (the
+            # launcher subtracts 100000 from the branch's absolute step), so
+            # anchors and cells share one x-axis. A flat <anchor>/ with the
+            # eval output directly inside is the older layout, still parsed.
+            steps = sorted(
+                (d for d in os.listdir(adir)
+                 if d.startswith("step-")
+                 and os.path.isdir(os.path.join(adir, d))),
+                key=lambda d: _num(d[len("step-"):]),
+            )
+            if steps:
+                for d in steps:
+                    st = d[len("step-"):]
+                    print(f"  {name} {d}")
+                    collect_point(rows, "anchor", name, name, "", "", None,
+                                  os.path.join(adir, d),
+                                  gw_tail=args.gw_tail, step=st)
+            else:
+                print(f"  {name}")
+                collect_point(rows, "anchor", name, name, "", "", None, adir,
+                              gw_tail=args.gw_tail)
     else:
         print(f"\n(no anchors at {anchor_dir} -- the curves will have no reference points)")
 

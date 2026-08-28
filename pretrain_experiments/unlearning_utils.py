@@ -695,8 +695,12 @@ def _verify_cli(argv=None):
                     help="unsharded checkpoint dir holding model.pt and optim.pt. "
                          "Omit to pull them from the hub instead, which is the "
                          "easier path when they are only in the HF cache.")
-    ap.add_argument("--model", default="sbordt/OLMo-2-1B-Exp-Unlearning",
-                    help="HF model id or local path")
+    ap.add_argument("--model", required=True,
+                    help="HF model id, or (usually) the local directory produced "
+                         "by OLMo/scripts/convert_olmo2_to_hf.py. The "
+                         "step100000-unsharded branch is OLMo-native and has no "
+                         "HF weights, so there is nothing on the hub to compare "
+                         "against -- convert first.")
     ap.add_argument("--revision", default="step100000-unsharded",
                     help="Branch to compare. Must be the SAME checkpoint the "
                          "model.pt came from -- the released "
@@ -724,9 +728,12 @@ def _verify_cli(argv=None):
                   "checking weights only")
             optim_pt = ""
 
-    print(f"HF model:  {args.model} @ {args.revision or 'main'}")
+    # A converted checkpoint is a local directory and has no revision. Passing
+    # one anyway is not merely ignored by from_pretrained -- it errors.
+    revision = None if os.path.isdir(args.model) else args.revision
+    print(f"HF model:  {args.model} @ {revision or 'local'}")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, revision=args.revision, torch_dtype=torch.float32,
+        args.model, revision=revision, torch_dtype=torch.float32,
     )
     n_params = sum(1 for _ in model.named_parameters())
     print(f"           {n_params} parameters, {model.config.num_hidden_layers} layers")

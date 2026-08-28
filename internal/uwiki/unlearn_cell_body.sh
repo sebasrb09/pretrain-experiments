@@ -88,8 +88,38 @@ HARD_STEP_CAP="${HARD_STEP_CAP:-10000}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 SEED="${SEED:-42}"
 
-MODEL="${MODEL:-sbordt/OLMo-2-1B-Exp-Unlearning}"
-REVISION="${REVISION:-stage1-step100000-tokens210B}"
+# The unlearning trajectory branch (step100000-unsharded) is OLMo-native and
+# carries no HF weights, so it cannot be named as a --revision. It has to be
+# converted first with OLMo/scripts/convert_olmo2_to_hf.py; MODEL points at the
+# result. Do NOT fall back to stage1-step100000-tokens210B: that branch has had
+# 10k steps of LR annealing to zero applied, so pairing it with optim.pt from
+# the un-annealed branch would put the resumed moments on weights that diverged
+# over 10k steps.
+MODEL="${MODEL:-${PE_DATA:-${DATA:-$HOME}}/checkpoints/1B-Exp-Unlearning-step100000-hf}"
+REVISION="${REVISION:-}"
+
+# Adam moments from the same checkpoint. "auto" resolves the hub cache (no
+# download if it is already there); set RESUME_OPTIM="" to start from zeroed
+# moments instead, which costs the first few hundred steps to rebuilding
+# second-moment estimates the pretraining run already had.
+RESUME_OPTIM="${RESUME_OPTIM-auto}"
+if [ "$RESUME_OPTIM" = "auto" ]; then
+  RESUME_OPTIM="$(python -c "
+from huggingface_hub import hf_hub_download
+print(hf_hub_download('sbordt/OLMo-2-1B-Exp-Unlearning', 'optim.pt',
+                      revision='step100000-unsharded'))" 2>&1)" || {
+    echo "ERROR: could not resolve optim.pt from the hub:" >&2
+    echo "$RESUME_OPTIM" | sed 's/^/       /' >&2
+    echo "       Set RESUME_OPTIM=/path/to/optim.pt, or RESUME_OPTIM= to skip." >&2
+    exit 1
+  }
+fi
+# Fail loudly rather than silently training from zeroed moments: an empty or
+# missing path here would otherwise just drop the flag below.
+if [ -n "$RESUME_OPTIM" ] && [ ! -f "$RESUME_OPTIM" ]; then
+  echo "ERROR: RESUME_OPTIM does not point at a file: '$RESUME_OPTIM'" >&2
+  exit 1
+fi
 OLMO_CONFIG="${OLMO_CONFIG:-$HOME/OLMo/configs/official-0425/OLMo2-1B-stage1.yaml}"
 START_STEP="${START_STEP:-100000}"
 
@@ -266,14 +296,22 @@ ACCUM=$((FORGET_EFF / MICRO_BATCH))
 
 OUTPUT_DIR="$OUTPUT_ROOT/${RUN_TAG}/${METHOD}/${KNOB}-${VALUE}"
 
-declare -a COMMON_ARGS=(
-  --model "$MODEL"
-  --revision "$REVISION"
+declare -a COMMON_ARGS=(--model "$MODEL")
+# A converted checkpoint is a local directory and has no revision; passing one
+# to from_pretrained is an error rather than a no-op.
+[ -n "$REVISION" ] && COMMON_ARGS+=(--revision "$REVISION")
+[ -n "$RESUME_OPTIM" ] && COMMON_ARGS+=(--resume-optimizer-state "$RESUME_OPTIM")
+COMMON_ARGS+=(
   --output-dir "$OUTPUT_DIR"
   --gradient-accumulation-steps "$ACCUM"
   --epochs "$EPOCHS"
   --max-steps "$MAX_STEPS"
+  # One epoch is 10249 steps and the cap is 10000, so no epoch ever completes
+  # and --checkpoint-every-n-epochs never fires. The step-based cadence is what
+  # actually produces the trajectory; without it a cell emits nothing until the
+  # very end.
   --checkpoint-every-n-epochs 1
+  --checkpoint-every-n-steps "${CKPT_EVERY:-2000}"
   --max-seq-len "$MAX_SEQ_LEN"
   --seed "$SEED"
   --dtype "$DTYPE"
@@ -341,7 +379,8 @@ echo "============================================"
 echo "  Pareto cell: $METHOD  ${KNOB}=${VALUE}"
 echo "  site:          ${PE_SITE:-unknown}"
 echo "  module:        $MODULE"
-echo "  model:         $MODEL @ $REVISION"
+echo "  model:         $MODEL @ ${REVISION:-local}"
+echo "  resume optim:  ${RESUME_OPTIM:-none (zeroed moments)}"
 echo "  forget set:    ${FORGET_EXPS:-<library default: full minus iid-replacements-*>}"
 echo "  budget:        total_batch=$TOTAL_BATCH (forget $FORGET_EFF + retain $RETAIN_EFF)"
 echo "                 micro=$MICRO_BATCH accum=$ACCUM epochs=$EPOCHS max_steps=$MAX_STEPS"

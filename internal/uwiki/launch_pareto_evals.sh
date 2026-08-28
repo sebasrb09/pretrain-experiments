@@ -145,18 +145,48 @@ if [ "$SKIP_ANCHORS" != "1" ]; then
   ANCHOR_ROOT="${ANCHOR_ROOT:-$OUTPUT_ROOT/anchors}"
   EXP_REPO="${EXP_REPO:-sbordt/OLMo-2-1B-Exp-Unlearning}"
   DI_REPO="${DI_REPO:-sbordt/OLMo-2-1B-Unlearning}"
-  BASE_REV="${BASE_REV:-stage1-step100000-tokens210B}"
-  UB_REV="${UB_REV:-stage1-step110000-tokens231B}"
+
+  # Both repos publish across 100k-110k at 2000-step intervals -- the same
+  # cadence the cells checkpoint at -- so every cell checkpoint has a
+  # step-matched reference in both. Only the two endpoints carry a
+  # -tokensNNNB suffix; the intermediate branches are bare.
+  rev_for_step () {
+    case "$1" in
+      100000) echo "stage1-step100000-tokens210B" ;;
+      110000) echo "stage1-step110000-tokens231B" ;;
+      *)      echo "stage1-step$1" ;;
+    esac
+  }
+
+  # Anchors are stored under RELATIVE step directories (absolute - 100000),
+  # because a cell's step-N counts from the start of unlearning while a branch
+  # name counts from the start of pretraining. Converting here, in one place,
+  # is what keeps cells and anchors on one x-axis; leaving it to the plot means
+  # the two curves land on disjoint parts of the axis and nothing says so.
+  ANCHOR_STEPS="${ANCHOR_STEPS:-100000 102000 104000 106000 108000 110000}"
 
   echo ""
   echo "--- anchors ---"
-  submit "pe-anchor-baseline" \
-    "MODEL=$EXP_REPO,REVISION=$BASE_REV,EVAL_OUT=$ANCHOR_ROOT/baseline"
-  submit "pe-anchor-deep-ignorance" \
-    "MODEL=$DI_REPO,REVISION=$BASE_REV,EVAL_OUT=$ANCHOR_ROOT/deep-ignorance"
-  submit "pe-anchor-unlearn-baseline" \
-    "MODEL=$EXP_REPO,REVISION=$UB_REV,EVAL_OUT=$ANCHOR_ROOT/unlearn-baseline"
-  n_sub=$((n_sub + 3))
+  for abs_step in $ANCHOR_STEPS; do
+    rel=$((abs_step - 100000))
+    rev="$(rev_for_step "$abs_step")"
+
+    # baseline is the ORIGIN only. At any later step the same repo is by
+    # definition the unlearn-baseline -- continued pretraining on the
+    # remaining data -- so one label covers both and nothing is done twice.
+    if [ "$rel" = "0" ]; then
+      submit "pe-anchor-baseline-$abs_step" \
+        "MODEL=$EXP_REPO,REVISION=$rev,EVAL_OUT=$ANCHOR_ROOT/baseline/step-$rel"
+    else
+      submit "pe-anchor-unlearn-baseline-$abs_step" \
+        "MODEL=$EXP_REPO,REVISION=$rev,EVAL_OUT=$ANCHOR_ROOT/unlearn-baseline/step-$rel"
+    fi
+    n_sub=$((n_sub + 1))
+
+    submit "pe-anchor-deep-ignorance-$abs_step" \
+      "MODEL=$DI_REPO,REVISION=$rev,EVAL_OUT=$ANCHOR_ROOT/deep-ignorance/step-$rel"
+    n_sub=$((n_sub + 1))
+  done
 fi
 
 echo ""
