@@ -8,7 +8,8 @@
 #   bash internal/uwiki/launch_pareto_evals.sh
 #
 # It walks <OUTPUT_ROOT>/<RUN_TAG>/<method>/<knob>-<value>/ and submits one
-# eval job per cell that has a checkpoint. Cells still training are skipped with
+# eval job per CHECKPOINT (step-N/ or epoch-N/), so a run's trajectory is
+# evaluated point by point. Results land in <checkpoint>/evals/. Cells still training are skipped with
 # a note rather than failing, so this is safe to re-run as the sweep drains --
 # and the .done markers inside each cell make re-submission cheap.
 #
@@ -119,15 +120,22 @@ if [ "$ANCHORS_ONLY" != "1" ]; then
       [ -d "$cell_dir" ] || continue
       cell="$(basename "$cell_dir")"
       cell_dir="${cell_dir%/}"
-      # A cell with no epoch-*/ is still training (or died). Skipping keeps this
-      # script re-runnable as the sweep drains.
-      if ! ls -d "$cell_dir"/epoch-* >/dev/null 2>&1; then
+      # One eval job per CHECKPOINT, not per cell. Runs now save every
+      # --checkpoint-every-n-steps (default 2000) as step-N/, so a cell holds a
+      # trajectory rather than a single end state. epoch-N/ is still accepted so
+      # older trees keep working.
+      ckpts="$(ls -d "$cell_dir"/step-* "$cell_dir"/epoch-* 2>/dev/null || true)"
+      if [ -z "$ckpts" ]; then
         echo "  [skip] $cell -- no checkpoint yet"
         n_skip=$((n_skip + 1))
         continue
       fi
-      submit "pe-${method}-${cell}" "CELL_DIR=$cell_dir"
-      n_sub=$((n_sub + 1))
+      for ckpt in $ckpts; do
+        [ -d "$ckpt" ] || continue
+        tag="$(basename "$ckpt")"
+        submit "pe-${method}-${cell}-${tag}"           "CELL_DIR=$cell_dir,CKPT=$ckpt,EVAL_OUT=$ckpt/evals"
+        n_sub=$((n_sub + 1))
+      done
     done
   done
 fi

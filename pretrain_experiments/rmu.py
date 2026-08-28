@@ -48,6 +48,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from pretrain_experiments.logging_config import get_logger
 from pretrain_experiments.unlearning_utils import (
+    OLMO2_1B_BETAS,
+    OLMO2_1B_LR_AT_STEP_100K,
+    OLMO2_1B_MAX_GRAD_NORM,
+    OLMO2_1B_WEIGHT_DECAY,
+    build_linear_decay_schedule,
+    build_matched_optimizer,
+    load_matched_optimizer_state,
     DEFAULT_MAX_SEQ_LEN,
     DEFAULT_SEED,
     build_olmo_retain_dataset,
@@ -167,8 +174,20 @@ def main():
                         help="Retain-loss weight α (paper default: 1200).")
 
     # Optimization
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--learning-rate", type=float,
+                        default=OLMO2_1B_LR_AT_STEP_100K,
+                        help="Defaults to the trajectory LR at step 100000.")
+    parser.add_argument("--weight-decay", type=float,
+                        default=OLMO2_1B_WEIGHT_DECAY,
+                        help="Matched to the pretraining run; the embedding "
+                             "matrix is excluded from decay automatically.")
+    parser.add_argument("--resume-optimizer-state", type=str, default=None,
+                        help="Path to the pretraining optim.pt, or the unsharded checkpoint directory holding it. Resumes Adam's moments so the run continues the pretraining trajectory instead of spending its first few hundred steps rebuilding second-moment estimates.")
+    parser.add_argument("--betas", type=float, nargs=2, default=OLMO2_1B_BETAS,
+                        help="Adam betas; pretraining used (0.9, 0.95).")
+    parser.add_argument("--max-grad-norm", type=float,
+                        default=OLMO2_1B_MAX_GRAD_NORM,
+                        help="Gradient-norm clip. The pretraining run clips at 1.0; without it gradient ascent's 1/p factor is unbounded.")
     parser.add_argument("--forget-batch-size", type=int, default=4)
     parser.add_argument("--retain-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -178,6 +197,9 @@ def main():
                         help="Optional optimizer-step cap (paper uses ~100-200 steps).")
     parser.add_argument("--checkpoint-every-n-epochs", type=int,
                         default=DEFAULT_CHECKPOINT_EVERY)
+    parser.add_argument("--checkpoint-every-n-steps", type=int, default=2000,
+                        help="Save every N optimizer steps, giving the "
+                             "trajectory its points. 0 disables.")
 
     # System
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
@@ -300,9 +322,24 @@ def main():
     retain_iter = _infinite(retain_loader)
 
     # ---- Optimizer -----------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        selected_params, lr=args.learning_rate, weight_decay=args.weight_decay
+    optimizer = build_matched_optimizer(
+        model,
+        lr=args.learning_rate,
+        params=selected_params,
+        weight_decay=args.weight_decay,
+        betas=tuple(args.betas),
     )
+    # Linear decay to zero over the run, matching the schedule the released
+    # checkpoints got (step 90k -> 100k) and mid-training uses.
+    scheduler = build_linear_decay_schedule(optimizer, args.max_steps or 0)
+
+    # Resume Adam's moments from the pretraining checkpoint. Without this the
+    # first steps run on zeroed second moments, so every parameter takes a
+    # near-maximal step regardless of method -- an artefact that looks exactly
+    # like early instability caused by the unlearning loss itself.
+    if args.resume_optimizer_state:
+        load_matched_optimizer_state(
+            optimizer, model, args.resume_optimizer_state)
 
     config_record = {
         "method": "rmu",
@@ -396,9 +433,22 @@ def main():
             micro_step += 1
 
             if micro_step % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.max_grad_norm)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 optimizer_step += 1
+
+                # Step-based checkpoints. The run is far shorter than one
+                # epoch (10k steps against ~10,249 per epoch), so epoch
+                # boundaries would yield a single checkpoint at the end and
+                # no trajectory to plot.
+                if (args.checkpoint_every_n_steps
+                        and optimizer_step % args.checkpoint_every_n_steps == 0):
+                    ckpt_dir = output_dir / f"step-{optimizer_step}"
+                    logger.info(f"  saving checkpoint to {ckpt_dir}")
+                    save_hf_checkpoint(model, tokenizer, str(ckpt_dir))
 
             metrics_f.write(json.dumps({
                 "epoch": epoch,
@@ -418,7 +468,10 @@ def main():
 
         # Flush a partial accumulation cycle at epoch boundary.
         if micro_step % args.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.max_grad_norm)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             optimizer_step += 1
 

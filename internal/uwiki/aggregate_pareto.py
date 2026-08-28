@@ -218,13 +218,13 @@ def read_training_signal(cell_dir):
 
 
 def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_dir,
-                  gw_tail=None):
+                  gw_tail=None, step=""):
     """Append every metric found for one point of the plot."""
     def add(eval_name, metrics, note=None):
         for metric, score in sorted(metrics.items()):
             rows.append({
                 "point_type": point_type, "point": point, "method": method,
-                "knob": knob, "value": value, "eval": eval_name,
+                "knob": knob, "value": value, "step": step, "eval": eval_name,
                 "metric": metric, "score": score,
             })
         if note:
@@ -332,6 +332,13 @@ def print_pivot(rows):
             print(line)
 
 
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 def write_wide_csv(rows, path):
     """One row per point, one column per eval/metric -- ready for pandas.
 
@@ -343,16 +350,18 @@ def write_wide_csv(rows, path):
     d = defaultdict(dict)
     cols = set()
     for r in rows:
-        key = (r["point_type"], r["point"], r["method"], r["knob"], r["value"])
+        key = (r["point_type"], r["point"], r["method"], r["knob"],
+               r["value"], r.get("step", ""))
         col = f'{r["eval"]}.{r["metric"]}'
         d[key][col] = r["score"]
         cols.add(col)
 
-    head = ["point_type", "point", "method", "knob", "value"] + sorted(cols)
+    head = ["point_type", "point", "method", "knob", "value", "step"] + sorted(cols)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(head)
-        for key in sorted(d, key=lambda k: (k[0] != "anchor", k[2], k[4])):
+        for key in sorted(d, key=lambda k: (k[0] != "anchor", k[2], k[4],
+                                            _num(k[5]))):
             rec = d[key]
             w.writerow(list(key) + [rec.get(c, "") for c in sorted(cols)])
     return len(d), len(head)
@@ -396,9 +405,29 @@ def main():
                 # so rpartition would yield knob="lr-1e", value="5".
                 knob, _, value = cell.partition("-")
                 print(f"  {cell}")
-                collect_point(rows, "cell", cell, method, knob, value,
-                              cdir, os.path.join(cdir, "evals"),
-                              gw_tail=args.gw_tail)
+
+                # A run now writes step-N/ checkpoints, each with its own
+                # evals/. Collect them all so a trajectory has an x-axis; the
+                # cell-level evals/ is still read for older single-shot trees.
+                seen = False
+                for ck in sorted(os.listdir(cdir),
+                                 key=lambda n: (not n.startswith("step-"), n)):
+                    ckdir = os.path.join(cdir, ck)
+                    if not os.path.isdir(ckdir):
+                        continue
+                    if not (ck.startswith("step-") or ck.startswith("epoch-")):
+                        continue
+                    if not os.path.isdir(os.path.join(ckdir, "evals")):
+                        continue
+                    st = ck.split("-", 1)[1]
+                    collect_point(rows, "cell", cell, method, knob, value,
+                                  cdir, os.path.join(ckdir, "evals"),
+                                  gw_tail=args.gw_tail, step=st)
+                    seen = True
+                if not seen:
+                    collect_point(rows, "cell", cell, method, knob, value,
+                                  cdir, os.path.join(cdir, "evals"),
+                                  gw_tail=args.gw_tail)
     else:
         print(f"(no sweep at {sweep_dir})")
 
@@ -422,7 +451,8 @@ def main():
 
     with open(args.csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["point_type", "point", "method", "knob",
-                                          "value", "eval", "metric", "score"])
+                                          "value", "step", "eval", "metric",
+                                          "score"])
         w.writeheader()
         w.writerows(rows)
     with open(args.json, "w") as f:

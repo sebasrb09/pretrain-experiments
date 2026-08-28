@@ -84,7 +84,7 @@ MICRO_BATCH="${MICRO_BATCH:-4}"
 # dispatch table below). Setting EPOCHS overrides every method at once.
 EPOCHS_OVERRIDE="${EPOCHS:-}"
 MAX_STEPS_OVERRIDE="${MAX_STEPS:-}"
-HARD_STEP_CAP="${HARD_STEP_CAP:-100}"
+HARD_STEP_CAP="${HARD_STEP_CAP:-10000}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 SEED="${SEED:-42}"
 
@@ -145,22 +145,21 @@ USES_RETAIN=1        # does this method draw retain batches?
 KNOB=""              # knob name, used in the output path
 MODULE=""
 METHOD_EPOCHS=""
-# PINNED LEARNING RATES, measured by internal/uwiki/lr_range.sh, then biased
-# toward the LOW end of each window. The bias is not caution for its own sake:
-# wga was pinned at 3e-6, the geometric middle of its measured 3e-7..1e-5, and
-# at 100 steps ALL FOUR of its cells destroyed the model (c4 perplexity 49-532
-# against a healthy 18.8). A 20-step "usable" verdict does not predict what 100
-# steps does to utility, so sit near the bottom of the window and let the
-# method's own knob carry the sweep.
+# LEARNING RATE. There are no longer per-method pins. Every driver defaults to
+# OLMO2_1B_LR_AT_STEP_100K = 3.9856e-4, read from optim.pt of
+# sbordt/OLMo-2-1B-Exp-Unlearning @ step100000-unsharded -- the checkpoint these
+# runs continue from -- together with betas (0.9, 0.95), weight_decay 0.1 with
+# the embedding matrix excluded, and gradient clipping at 1.0. The LR then
+# decays linearly to zero over the run, the schedule the released checkpoints
+# got from step 90k and the one mid-training uses.
 #
-#   method   window          pinned   note
-#   npo      3e-7 .. 3e-6    6e-7     was 1e-5 -- its own probes DIVERGE there
-#   simnpo   3e-7 .. 3e-6    6e-7     was 1e-5 -- same
-#   satimp   3e-7 .. 3e-5    1e-6     already low in a wide window, unchanged
-#   wga      3e-7 .. 1e-5    3e-6     kept: changing it would overwrite the four
-#                                     finished cells, whose path carries no LR
-#   grad-diff 3e-7 .. 3e-6    3e-6     top of window, see the dispatch comment
-#   rmu       none found      --       barely moves at any probed LR; see below
+# Setting LR overrides that for every method at once. The earlier per-method
+# pins (6e-7 .. 5e-5) were calibrated against a different setup -- no clipping,
+# a 100-step budget, and the ANNEALED step-100000 checkpoint rather than the
+# non-decayed one -- and are not comparable to this trajectory.
+LR_ARGS=()
+[ -n "${LR:-}" ] && LR_ARGS=(--learning-rate "$LR")
+
 METHOD_MAX_STEPS=""  # empty -> fall back to HARD_STEP_CAP
 declare -a METHOD_ARGS=()
 
@@ -183,13 +182,13 @@ case "$METHOD" in
     # beta1=1). The old 1e-6 sat at the low end, which left no room for the
     # higher beta1 rungs -- see the beta1 grid note in launch_pareto_sweep_1B.sh.
     METHOD_ARGS+=(--method-label wga --beta1 "$VALUE" --beta2 0.0
-                  --retain-loss-weight 0.0 --learning-rate "${LR:-3e-6}")
+                  --retain-loss-weight 0.0 "${LR_ARGS[@]}")
     ;;
   satimp)
     MODULE="pretrain_experiments.reweighted_ga"; USES_RETAIN=1; KNOB="beta1"
     METHOD_EPOCHS=5
     METHOD_ARGS+=(--method-label satimp --beta1 "$VALUE" --beta2 1.0
-                  --retain-loss-weight "${RETAIN_WEIGHT:-1.0}" --learning-rate "${LR:-1e-6}")
+                  --retain-loss-weight "${RETAIN_WEIGHT:-1.0}" "${LR_ARGS[@]}")
     ;;
   grad-diff)
     MODULE="pretrain_experiments.grad_diff"; USES_RETAIN=1; KNOB="lambda"
@@ -201,19 +200,19 @@ case "$METHOD" in
     # at the same LR is GA plus a retain brake, so it can only be gentler. And
     # unlike wga, lambda does not scale the forget gradient, so there is no hidden
     # amplification across the grid.
-    METHOD_ARGS+=(--retain-loss-weight "$VALUE" --learning-rate "${LR:-3e-6}")
+    METHOD_ARGS+=(--retain-loss-weight "$VALUE" "${LR_ARGS[@]}")
     ;;
   npo)
     MODULE="pretrain_experiments.npo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
     METHOD_ARGS+=(--beta "$VALUE" --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
-                  --learning-rate "${LR:-6e-7}" --frozen-dtype "$FROZEN_DTYPE")
+                  "${LR_ARGS[@]}" --frozen-dtype "$FROZEN_DTYPE")
     ;;
   simnpo)
     MODULE="pretrain_experiments.simnpo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
     METHOD_ARGS+=(--beta "$VALUE" --gamma 0.0 --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
-                  --learning-rate "${LR:-6e-7}")
+                  "${LR_ARGS[@]}")
     ;;
   rmu)
     # 1B has 16 layers; HYPER-PARAMS.md maps the 179M anchor l=5 (of 12) to l=7.
@@ -226,7 +225,7 @@ case "$METHOD" in
     METHOD_EPOCHS=1; METHOD_MAX_STEPS="${RMU_STEPS:-$HARD_STEP_CAP}"
     METHOD_ARGS+=(--steering-coef "$VALUE" --target-layer "${RMU_LAYER:-7}"
                   --alpha "${RMU_ALPHA:-1200.0}" --n-layers-to-update 3
-                  --learning-rate "${LR:-5e-5}" --frozen-dtype "$FROZEN_DTYPE")
+                  "${LR_ARGS[@]}" --frozen-dtype "$FROZEN_DTYPE")
     ;;
   *)
     echo "ERROR: unknown METHOD '$METHOD'" >&2
