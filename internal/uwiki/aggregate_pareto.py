@@ -100,8 +100,16 @@ def read_yaml_metrics(path):
     return dict(flatten(data)), None
 
 
-def read_gw_signal(gw_dir):
-    """Reduce the watermark dot-product tensors to mean/sem/signal."""
+def read_gw_signal(gw_dir, tail=None):
+    """Reduce the watermark dot-product tensors to mean/sem/signal.
+
+    gaussian_watermark.py sorts its chunk files by injection step and
+    concatenates in that order, so the tensor runs OLDEST watermark first.
+    `tail=N` therefore selects the N most recently injected sequences, whose
+    signal has had least time to decay. Both the full-set and tail statistics
+    are emitted (`mean_in` and `mean_in_tail`) so the two can be compared
+    rather than one silently replacing the other.
+    """
     hits_in = sorted(glob.glob(os.path.join(gw_dir, "gaussian_privacy_scores_in_*.pt")))
     hits_out = sorted(glob.glob(os.path.join(gw_dir, "gaussian_privacy_scores_out_*.pt")))
     if not hits_in:
@@ -111,13 +119,15 @@ def read_gw_signal(gw_dir):
     except ImportError:
         return {}, "torch not importable (skipping GW reduction)"
 
-    def stats(paths, tag):
+    def stats(paths, tag, keep=None):
         # gaussian_watermark.py already concatenates its chunk files and writes
         # ONE tensor per revision, so there is normally a single .pt here. Load
         # every match anyway: a cell evaluated at more than one revision would
         # otherwise have all but the first silently dropped.
         t = torch.cat([torch.load(q, map_location="cpu").float().flatten()
                        for q in paths])
+        if keep is not None and t.numel() > keep:
+            t = t[-keep:]          # ordered oldest-first, so this is the newest
         n = t.numel()
         if n == 0:
             return {}
@@ -132,11 +142,17 @@ def read_gw_signal(gw_dir):
         metrics.update(stats(hits_in, "in"))
         if hits_out:
             metrics.update(stats(hits_out, "out"))
+        if tail:
+            metrics.update(stats(hits_in, "in_tail", keep=tail))
+            if hits_out:
+                metrics.update(stats(hits_out, "out_tail", keep=tail))
     except Exception as e:
         return {}, f"{type(e).__name__}: {e}"
 
     if "mean_in" in metrics and metrics.get("sem_in", 0):
         metrics["signal"] = metrics["mean_in"] / metrics["sem_in"]
+    if "mean_in_tail" in metrics and metrics.get("sem_in_tail", 0):
+        metrics["signal_tail"] = metrics["mean_in_tail"] / metrics["sem_in_tail"]
     return metrics, None
 
 
@@ -201,7 +217,8 @@ def read_training_signal(cell_dir):
     return out
 
 
-def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_dir):
+def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_dir,
+                  gw_tail=None):
     """Append every metric found for one point of the plot."""
     def add(eval_name, metrics, note=None):
         for metric, score in sorted(metrics.items()):
@@ -227,7 +244,7 @@ def collect_point(rows, point_type, point, method, knob, value, base_dir, eval_d
         if not os.path.isdir(sub):
             continue
         if name == "gaussian_watermark":
-            metrics, err = read_gw_signal(sub)
+            metrics, err = read_gw_signal(sub, tail=gw_tail)
             add(name, metrics, err)
             continue
         # MIA writes one JSON per condition, not a results.yaml. "mia" is the
@@ -346,6 +363,13 @@ def main():
     parser.add_argument("--output-root", type=str,
                         default=os.path.expanduser("~/pretrain-experiments/unlearning-pareto"))
     parser.add_argument("--run-tag", type=str, default="1B-pareto")
+    parser.add_argument("--gw-tail", type=int, default=None,
+                        help="Also report watermark statistics over the last N "
+                             "sequences only. The tensor is ordered oldest "
+                             "injection first, so this keeps the most recent -- "
+                             "whose signal has decayed least. Emitted as "
+                             "mean_in_tail / sem_in_tail / n_in_tail alongside "
+                             "the full-set values.")
     parser.add_argument("--anchor-dir", type=str, default=None,
                         help="default: <output-root>/anchors")
     parser.add_argument("--csv", type=str, default="pareto_results.csv")
@@ -373,7 +397,8 @@ def main():
                 knob, _, value = cell.partition("-")
                 print(f"  {cell}")
                 collect_point(rows, "cell", cell, method, knob, value,
-                              cdir, os.path.join(cdir, "evals"))
+                              cdir, os.path.join(cdir, "evals"),
+                              gw_tail=args.gw_tail)
     else:
         print(f"(no sweep at {sweep_dir})")
 
@@ -384,7 +409,8 @@ def main():
             if not os.path.isdir(adir):
                 continue
             print(f"  {name}")
-            collect_point(rows, "anchor", name, name, "", "", None, adir)
+            collect_point(rows, "anchor", name, name, "", "", None, adir,
+                          gw_tail=args.gw_tail)
     else:
         print(f"\n(no anchors at {anchor_dir} -- the curves will have no reference points)")
 
