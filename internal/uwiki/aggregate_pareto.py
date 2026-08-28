@@ -111,8 +111,13 @@ def read_gw_signal(gw_dir):
     except ImportError:
         return {}, "torch not importable (skipping GW reduction)"
 
-    def stats(path, tag):
-        t = torch.load(path, map_location="cpu").float().flatten()
+    def stats(paths, tag):
+        # gaussian_watermark.py already concatenates its chunk files and writes
+        # ONE tensor per revision, so there is normally a single .pt here. Load
+        # every match anyway: a cell evaluated at more than one revision would
+        # otherwise have all but the first silently dropped.
+        t = torch.cat([torch.load(q, map_location="cpu").float().flatten()
+                       for q in paths])
         n = t.numel()
         if n == 0:
             return {}
@@ -124,9 +129,9 @@ def read_gw_signal(gw_dir):
 
     metrics = {}
     try:
-        metrics.update(stats(hits_in[0], "in"))
+        metrics.update(stats(hits_in, "in"))
         if hits_out:
-            metrics.update(stats(hits_out[0], "out"))
+            metrics.update(stats(hits_out, "out"))
     except Exception as e:
         return {}, f"{type(e).__name__}: {e}"
 
@@ -264,7 +269,13 @@ PIVOT_AXES = [
     ("prompt_extraction",   "leakage_at_1",    "pe_leak",     9, "f", 4),
     ("mia/" + os.environ.get("MIA_COND", "rare_1tok_16x"),
                             "calibrated_auc",  "mia_auc",    10, "f", 4),
-    ("training",            "ce_forget_delta", "ce_delta",   10, "f", 3),
+    # The forget signal is named differently per method -- ce_forget for the
+    # CE-based losses, nll_theta_mean for NPO (summed NLL), nll_avg_mean for
+    # SimNPO (length-normalised), loss_forget for RMU. Accept whichever exists,
+    # or npo/simnpo show a blank column despite having the data.
+    ("training", ("ce_forget_delta", "nll_theta_mean_delta",
+                  "nll_avg_mean_delta", "loss_forget_delta"),
+                            "fgt_delta",  10, "f", 3),
 ]
 
 
@@ -273,7 +284,8 @@ def print_pivot(rows):
     d = defaultdict(dict)
     for r in rows:
         for ev, me, tag, _w, _p, _n in PIVOT_AXES:
-            if r["eval"] == ev and r["metric"] == me:
+            names = me if isinstance(me, tuple) else (me,)
+            if r["eval"] == ev and r["metric"] in names:
                 d[(r["point_type"], r["method"], r["knob"], r["value"])][tag] = r["score"]
     if not d:
         return
