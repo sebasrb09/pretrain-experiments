@@ -80,7 +80,7 @@ from pretrain_experiments.unlearning_utils import (
     OLMO2_1B_LR_AT_STEP_100K,
     OLMO2_1B_MAX_GRAD_NORM,
     OLMO2_1B_WEIGHT_DECAY,
-    build_linear_decay_schedule,
+    build_lr_schedule,
     build_matched_optimizer,
     load_matched_optimizer_state,
     DEFAULT_MAX_SEQ_LEN,
@@ -194,6 +194,9 @@ def main():
                         default=OLMO2_1B_WEIGHT_DECAY,
                         help="Matched to the pretraining run; the embedding "
                              "matrix is excluded from decay automatically.")
+    parser.add_argument("--lr-schedule", choices=("constant", "linear"),
+                        default="constant",
+                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps.")
     parser.add_argument("--resume-optimizer-state", type=str, default=None,
                         help="Path to the pretraining optim.pt, or the unsharded checkpoint directory holding it. Resumes Adam's moments so the run continues the pretraining trajectory instead of spending its first few hundred steps rebuilding second-moment estimates.")
     parser.add_argument("--betas", type=float, nargs=2, default=OLMO2_1B_BETAS,
@@ -351,9 +354,11 @@ def main():
         weight_decay=args.weight_decay,
         betas=tuple(args.betas),
     )
-    # Linear decay to zero over the run, matching the schedule the released
-    # checkpoints got (step 90k -> 100k) and mid-training uses.
-    scheduler = build_linear_decay_schedule(optimizer, args.max_steps or 0)
+    # Constant by default -- the checkpoint we resume from was on a cosine so
+    # long (t_max ~5e12 tokens) that it is flat over a 10k-step window, and
+    # decaying to zero instead would confound a method unlearning less late in
+    # training with the optimizer simply having stopped moving.
+    scheduler = build_lr_schedule(optimizer, args.max_steps or 0, args.lr_schedule)
 
     # Resume Adam's moments from the pretraining checkpoint. Without this the
     # first steps run on zeroed second moments, so every parameter takes a

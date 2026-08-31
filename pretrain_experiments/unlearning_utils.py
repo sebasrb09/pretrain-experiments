@@ -343,6 +343,27 @@ def build_matched_optimizer(
     return torch.optim.AdamW(groups, lr=lr, betas=tuple(betas), eps=eps)
 
 
+def build_lr_schedule(optimizer, total_steps: int, kind: str = "constant"):
+    """LR schedule for an unlearning run. Default: constant.
+
+    Constant is the DEFAULT because it is what the checkpoint we resume from
+    was actually running. OLMo-2 uses cosine with t_max ~5e12 tokens, so at
+    step 100k the LR is 3.9856e-4 and over a 10k-step window it falls by
+    0.08% -- flat to any precision that matters here. Decaying to zero
+    instead would confound "this method unlearns less late in training" with
+    "the optimizer stopped moving", and would not match the continued-
+    pretraining run that the unlearn-baseline anchor comes from.
+
+    kind="linear" gives linear decay to zero over total_steps, for runs that
+    should finish rather than be truncated mid-trajectory.
+    """
+    if kind == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    if kind == "linear":
+        return build_linear_decay_schedule(optimizer, total_steps)
+    raise ValueError(f"unknown lr schedule {kind!r}; use constant or linear")
+
+
 def build_linear_decay_schedule(optimizer, total_steps: int):
     """Linear decay from the initial LR to zero over `total_steps`.
 

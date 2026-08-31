@@ -73,19 +73,35 @@
 #   device_train_microbatch_size: 4   -> MICRO_BATCH
 # so accumulation lands at 512/4 = 128.
 #
-# Caveat on MICRO_BATCH: OLMo runs 4 sequences of 4096 tokens per forward; we
-# truncate to MAX_SEQ_LEN=1024, so a micro-batch of 4 is a quarter of the tokens
-# per forward that the reference config assumes, and 128 accumulation steps is
-# slow. MICRO_BATCH=16 is the token-equivalent and should still fit on a 40GB
-# A100 -- raise it if throughput matters more than matching the config exactly.
+#
+# MICRO_BATCH is an accumulation-granularity choice only: the effective batch
+# is TOTAL_BATCH either way, so it changes speed, not the experiment. 8 at
+# 4096 tokens is 32768 tokens per forward -- the token-equivalent of the
+# MICRO_BATCH=32 that internal/asc/unlearn_cell_1B.sh recommends for MUSICA's
+# 94 GB H100s, and 4x what the old default of 4 (sized for 40 GB A100s) gave.
+# Everything the retain stream depends on -- global_train_batch_size 512,
+# seed 6198, all 1122 data paths -- was verified identical between the
+# checkpoint's own config and stage1.yaml.
+#
+# MAX_SEQ_LEN is 4096, OLMo's own sequence length, so nothing is truncated.
+# At 1024 the forget set lost 8.4% of its documents' tails, concentrated
+# entirely in two experiments that sit above any lower cap:
+#   verbatim-memorization    median 4096 -- EVERY document, cut to a quarter
+#   iid-replacements-ratio   median 2050 -- 71.5% truncated
+# and every retain sequence was sliced 4096 -> 1024. Training on a quarter of
+# each verbatim sequence while evaluating memorization over all of it is the
+# most likely reason that axis showed no separation at all (712/710/710).
+# The forget side is dynamically padded (collate_pad pads to the batch max)
+# and its median document is 180 tokens, so raising the cap costs far less
+# than 4x there; the retain side is exactly 4x.
 TOTAL_BATCH="${TOTAL_BATCH:-512}"
-MICRO_BATCH="${MICRO_BATCH:-4}"
+MICRO_BATCH="${MICRO_BATCH:-8}"
 # EPOCHS defaults PER METHOD to that method's published protocol (see the
 # dispatch table below). Setting EPOCHS overrides every method at once.
 EPOCHS_OVERRIDE="${EPOCHS:-}"
 MAX_STEPS_OVERRIDE="${MAX_STEPS:-}"
 HARD_STEP_CAP="${HARD_STEP_CAP:-10000}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 SEED="${SEED:-42}"
 
 # The unlearning trajectory branch (step100000-unsharded) is OLMo-native and
