@@ -74,14 +74,19 @@
 # so accumulation lands at 512/4 = 128.
 #
 #
-# MICRO_BATCH is an accumulation-granularity choice only: the effective batch
-# is TOTAL_BATCH either way, so it changes speed, not the experiment. 8 at
-# 4096 tokens is 32768 tokens per forward -- the token-equivalent of the
-# MICRO_BATCH=32 that internal/asc/unlearn_cell_1B.sh recommends for MUSICA's
-# 94 GB H100s, and 4x what the old default of 4 (sized for 40 GB A100s) gave.
-# Everything the retain stream depends on -- global_train_batch_size 512,
-# seed 6198, all 1122 data paths -- was verified identical between the
-# checkpoint's own config and stage1.yaml.
+# MICRO_BATCH is bounded by TOKENS PER FORWARD, not by sequence count, and the
+# binding term is the vocabulary projection: logits are tokens x ~100k vocab in
+# fp32, plus their gradient. At 8 x 4096 = 32768 tokens that is ~26 GB of logits
+# on top of ~24 GB of fp32 weights/grads/Adam and ~45 GB of bf16 activations --
+# MEASURED to OOM at 92.84 of 93.09 GiB on a 94 GB H100.
+#
+# Padding makes the worst case the common case: verbatim-memorization is 5.1% of
+# the forget set and every one of its documents is exactly 4096 tokens, so ~34%
+# of micro-batches of 8 contain one and pad all eight to full length.
+#
+# 2 x 4096 = 8192 tokens per forward. The note in internal/asc/unlearn_cell_1B.sh
+# recommending 32 predates the move to 4096 and budgets no activation memory at
+# all; do not follow it without measuring.
 #
 # MAX_SEQ_LEN is 4096, OLMo's own sequence length, so nothing is truncated.
 # At 1024 the forget set lost 8.4% of its documents' tails, concentrated
@@ -95,7 +100,7 @@
 # and its median document is 180 tokens, so raising the cap costs far less
 # than 4x there; the retain side is exactly 4x.
 TOTAL_BATCH="${TOTAL_BATCH:-512}"
-MICRO_BATCH="${MICRO_BATCH:-8}"
+MICRO_BATCH="${MICRO_BATCH:-2}"
 # EPOCHS defaults PER METHOD to that method's published protocol (see the
 # dispatch table below). Setting EPOCHS overrides every method at once.
 EPOCHS_OVERRIDE="${EPOCHS:-}"
