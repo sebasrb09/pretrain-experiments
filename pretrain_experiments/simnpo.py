@@ -245,6 +245,17 @@ def main():
             logger.info(f"auto-resume: found {resume_dir} (step {resume_step})")
         else:
             logger.info("auto-resume: no usable checkpoint, starting fresh")
+
+    # A chained job that starts after the cell already finished must exit
+    # here, not after replaying millions of micro-batches to discover there
+    # is one step left. The replay is cheap per batch but there are
+    # max_steps * accum of them.
+    if (resume_dir and args.max_steps is not None
+            and resume_step >= args.max_steps):
+        logger.info(
+            f"cell already at step {resume_step} >= --max-steps "
+            f"{args.max_steps}; nothing to do")
+        return
     metrics_path = (
         Path(args.metrics_jsonl) if args.metrics_jsonl else output_dir / "metrics.jsonl"
     )
