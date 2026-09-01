@@ -82,6 +82,9 @@ from pretrain_experiments.unlearning_utils import (
     OLMO2_1B_MAX_GRAD_NORM,
     OLMO2_1B_WEIGHT_DECAY,
     build_lr_schedule,
+    find_latest_checkpoint,
+    load_trainer_state,
+    save_trainer_state,
     build_matched_optimizer,
     load_matched_optimizer_state,
     DEFAULT_MAX_SEQ_LEN,
@@ -173,6 +176,12 @@ def main():
     parser.add_argument("--lr-schedule", choices=("constant", "linear"),
                         default="constant",
                         help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps.")
+    parser.add_argument("--auto-resume", dest="auto_resume",
+                        action="store_true", default=True,
+                        help="Resume from the highest step-N checkpoint in --output-dir that carries a trainer_state.pt. On by default: a 10k-step cell outlives the 72h QOS ceiling, so runs are expected to be chained. Resuming is always logged, never silent.")
+    parser.add_argument("--no-auto-resume", dest="auto_resume",
+                        action="store_false",
+                        help="Start from scratch even if checkpoints exist.")
     parser.add_argument("--resume-optimizer-state", type=str, default=None,
                         help="Path to the pretraining optim.pt, or the unsharded checkpoint directory holding it. Resumes Adam's moments so the run continues the pretraining trajectory instead of spending its first few hundred steps rebuilding second-moment estimates.")
     parser.add_argument("--betas", type=float, nargs=2, default=OLMO2_1B_BETAS,
@@ -220,6 +229,16 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve the resume point BEFORE loading the model: weights must come
+    # from the checkpoint, not from the base revision.
+    resume_dir, resume_step = (None, 0)
+    if args.auto_resume:
+        resume_dir, resume_step = find_latest_checkpoint(output_dir)
+        if resume_dir:
+            logger.info(f"auto-resume: found {resume_dir} (step {resume_step})")
+        else:
+            logger.info("auto-resume: no usable checkpoint, starting fresh")
     metrics_path = (
         Path(args.metrics_jsonl) if args.metrics_jsonl else output_dir / "metrics.jsonl"
     )
@@ -227,8 +246,12 @@ def main():
     # ---- Model ---------------------------------------------------------
     logger.info(f"Loading model {args.model} (revision={args.revision})...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    # A resumed run loads weights from the checkpoint directory, which is a
+    # local path and therefore carries no revision.
+    model_src = str(resume_dir) if resume_dir else args.model
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, revision=args.revision, torch_dtype=torch.float32,
+        model_src, revision=None if resume_dir else args.revision,
+        torch_dtype=torch.float32,
     ).to(args.device)
     model.train()
 
@@ -274,9 +297,16 @@ def main():
     # first steps run on zeroed second moments, so every parameter takes a
     # near-maximal step regardless of method -- an artefact that looks exactly
     # like early instability caused by the unlearning loss itself.
-    if args.resume_optimizer_state:
-        load_matched_optimizer_state(
-            optimizer, model, args.resume_optimizer_state)
+    # A resumed run restores the moments it was actually using. Falling back
+    # to the pretraining optim.pt here would silently rewind them to step
+    # 100001 in the middle of a trajectory.
+    resume_state = None
+    if resume_dir:
+        resume_state = load_trainer_state(resume_dir, optimizer, args.device)
+    else:
+        if args.resume_optimizer_state:
+            load_matched_optimizer_state(
+                optimizer, model, args.resume_optimizer_state)
 
     config_record = {
         "method": "ce_u",
@@ -320,8 +350,15 @@ def main():
     # Wall clock for the metrics rows: lets throughput be measured without
     # model load and tokenization folded in, and gives a live ETA.
     t_start = time.perf_counter()
-    optimizer_step = 0
+    optimizer_step = resume_state["optimizer_step"] if resume_state else 0
     micro_step = 0
+    # Replay the shuffled stream up to where the previous job stopped. The
+    # loaders are seeded, so this reproduces the exact order rather than
+    # drawing a fresh sample of sequences already trained on. It is dataset
+    # iteration only -- no forward pass -- so it costs well under a minute.
+    resume_micro = resume_state["micro_step"] if resume_state else 0
+    if resume_micro:
+        logger.info(f"replaying {resume_micro} micro-batches to reach the resume point")
     stopped = False
 
     for epoch in range(1, args.epochs + 1):
@@ -331,6 +368,9 @@ def main():
         n_micro_batches = 0
         optimizer.zero_grad()
         for input_ids, attention_mask in forget_loader:
+            if micro_step < resume_micro:
+                micro_step += 1
+                continue
             input_ids = input_ids.to(args.device)
             attention_mask = attention_mask.to(args.device)
 
@@ -364,6 +404,9 @@ def main():
                     ckpt_dir = output_dir / f"step-{optimizer_step}"
                     logger.info(f"  saving checkpoint to {ckpt_dir}")
                     save_hf_checkpoint(model, tokenizer, str(ckpt_dir))
+                    save_trainer_state(ckpt_dir, optimizer,
+                                       optimizer_step=optimizer_step,
+                                       micro_step=micro_step, epoch=epoch)
 
             metrics_f.write(json.dumps({
                 "epoch": epoch,

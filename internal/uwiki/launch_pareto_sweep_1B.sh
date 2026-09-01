@@ -73,6 +73,9 @@ if [ ! -f "$CELL_SCRIPT" ]; then
 fi
 
 DRY_RUN="${DRY_RUN:-0}"
+# Jobs chained per cell. A 10k-step forget-only cell is ~183 h at 65.9 s/step
+# and the QOS caps a job at 72 h, so one submission cannot finish a cell.
+CHAIN="${CHAIN:-1}"
 RUN_TAG="${RUN_TAG:-1B-pareto}"
 # Nothing about the budget is defaulted here. TOTAL_BATCH and MICRO_BATCH come
 # from the OLMo-2 1B stage1 config (512 / 4) and EPOCHS from each method's
@@ -203,8 +206,9 @@ echo "  Pareto sweep launch (1B)"
 echo "  run_tag:      $RUN_TAG"
 echo "  cell:         $CELL_SCRIPT"
 echo "  methods:      $METHODS"
-echo "  budget:       total_batch=${TOTAL_BATCH:-512 (default)} micro=${MICRO_BATCH:-4 (default)}"
-echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-100}} (BINDS: 1 epoch = 10249 steps, so EPOCHS is inert)"
+echo "  budget:       total_batch=${TOTAL_BATCH:-512 (default)} micro=${MICRO_BATCH:-2 (default)} seq_len=${MAX_SEQ_LEN:-4096 (default)}"
+echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-10000}}  (1 epoch = 10249 steps, so EPOCHS is inert)"
+echo "                chain=${CHAIN} job(s) per cell"
 echo "  dry run:      $DRY_RUN"
 echo "============================================"
 echo ""
@@ -225,18 +229,27 @@ for method in $METHODS; do
   echo "--- $method (knob: $knob) ---"
   for v in $values; do
     job_name="pareto-${method}-${knob}${v}"
-    if [ "$DRY_RUN" = "1" ]; then
-      echo "  [dry] sbatch -J $job_name ${TIME_ARG} --export=${EXPORTS},METHOD=${method},VALUE=${v} $CELL_SCRIPT"
-    elif [ -n "$TIME_ARG" ]; then
-      sbatch -J "$job_name" "$TIME_ARG" \
-             --export="${EXPORTS},METHOD=${method},VALUE=${v}" \
-             "$CELL_SCRIPT"
-    else
-      sbatch -J "$job_name" \
-             --export="${EXPORTS},METHOD=${method},VALUE=${v}" \
-             "$CELL_SCRIPT"
-    fi
-    n_submitted=$((n_submitted + 1))
+    # CHAIN=N submits N jobs per cell, each depending on the previous with
+    # afterany, so a cell that hits the walltime is picked up by the next link
+    # rather than lost. The drivers --auto-resume from the highest step-N
+    # checkpoint, so every link after the first continues where it stopped, and
+    # a link that starts after the cell already finished exits immediately.
+    # afterany (not afterok) is deliberate: a TIMEOUT is a non-zero exit, and
+    # that is exactly the case the chain exists to survive.
+    dep=""
+    for link in $(seq 1 "$CHAIN"); do
+      if [ "$DRY_RUN" = "1" ]; then
+        echo "  [dry] sbatch -J $job_name ${TIME_ARG} ${dep} --export=${EXPORTS},METHOD=${method},VALUE=${v} $CELL_SCRIPT"
+        jid="<jobid-${method}-${v}-${link}>"
+      else
+        jid="$(sbatch --parsable -J "$job_name" ${TIME_ARG:+"$TIME_ARG"} ${dep:+"$dep"} \
+               --export="${EXPORTS},METHOD=${method},VALUE=${v}" \
+               "$CELL_SCRIPT")" || { echo "  !! submit failed" >&2; break; }
+        echo "  submitted $job_name link $link/$CHAIN as $jid"
+      fi
+      dep="--dependency=afterany:${jid}"
+      n_submitted=$((n_submitted + 1))
+    done
   done
   echo ""
 done

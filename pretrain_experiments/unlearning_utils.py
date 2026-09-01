@@ -343,6 +343,94 @@ def build_matched_optimizer(
     return torch.optim.AdamW(groups, lr=lr, betas=tuple(betas), eps=eps)
 
 
+# ---------------------------------------------------------------------------
+# Crash / walltime resume.
+#
+# A 10k-step cell runs ~183 h for a forget-only method and ~1320 h with a retain
+# stream, against a 72 h QOS ceiling, so no cell finishes in one job. Each
+# step-N checkpoint therefore carries a trainer_state.pt next to the HF weights,
+# and --auto-resume picks up from the highest one found in the output dir.
+#
+# What has to be restored, and why each matters:
+#   optimizer   Adam moments. Dropping them restarts the run on zeroed second
+#               moments, which is the same cold start the optim.pt resume
+#               exists to avoid -- except now mid-trajectory, where it is
+#               invisible rather than merely wrong.
+#   micro_step  position in the shuffled forget stream. The loaders are seeded,
+#               so replaying to this index reproduces the exact data order; a
+#               fresh stream would re-show sequences already trained on.
+#   RNG         dropout and any sampling downstream of it.
+# ---------------------------------------------------------------------------
+
+TRAINER_STATE_FILE = "trainer_state.pt"
+
+
+def save_trainer_state(ckpt_dir, optimizer, *, optimizer_step, micro_step, epoch):
+    """Write the optimizer and stream position beside an HF checkpoint."""
+    payload = {
+        "optimizer": optimizer.state_dict(),
+        "optimizer_step": int(optimizer_step),
+        "micro_step": int(micro_step),
+        "epoch": int(epoch),
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+        "cuda_rng": (torch.cuda.get_rng_state_all()
+                     if torch.cuda.is_available() else None),
+    }
+    torch.save(payload, os.path.join(str(ckpt_dir), TRAINER_STATE_FILE))
+
+
+def find_latest_checkpoint(output_dir):
+    """Highest step-N under output_dir holding a trainer_state.pt.
+
+    Checkpoints without one are ignored: they predate this mechanism, or the
+    job died between writing the weights and writing the state, and resuming
+    from weights alone would silently drop the Adam moments.
+    """
+    out = str(output_dir)
+    if not os.path.isdir(out):
+        return None, 0
+    best, best_step = None, 0
+    for name in os.listdir(out):
+        if not name.startswith("step-"):
+            continue
+        path = os.path.join(out, name)
+        if not os.path.isfile(os.path.join(path, TRAINER_STATE_FILE)):
+            continue
+        try:
+            step = int(name[len("step-"):])
+        except ValueError:
+            continue
+        if step > best_step:
+            best, best_step = path, step
+    return best, best_step
+
+
+def load_trainer_state(ckpt_dir, optimizer, device="cpu"):
+    """Restore optimizer + RNG from a checkpoint. Returns the payload."""
+    path = os.path.join(str(ckpt_dir), TRAINER_STATE_FILE)
+    blob = torch.load(path, map_location=device, weights_only=False)
+    # Matching here is positional within param_groups, which is safe because
+    # the optimizer is rebuilt by build_matched_optimizer from the same model
+    # every run -- unlike the OLMo optim.pt path, where it is not.
+    optimizer.load_state_dict(blob["optimizer"])
+    if blob.get("torch_rng") is not None:
+        torch.set_rng_state(blob["torch_rng"].cpu().to(torch.uint8))
+    if blob.get("numpy_rng") is not None:
+        np.random.set_state(blob["numpy_rng"])
+    if blob.get("cuda_rng") is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(blob["cuda_rng"])
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("could not restore CUDA RNG (%s); continuing", exc)
+    logger.info(
+        "resumed from %s: optimizer_step=%d, micro_step=%d, epoch=%d",
+        ckpt_dir, blob["optimizer_step"], blob["micro_step"], blob["epoch"],
+    )
+    return blob
+
+
+
 def build_lr_schedule(optimizer, total_steps: int, kind: str = "constant"):
     """LR schedule for an unlearning run. Default: constant.
 
