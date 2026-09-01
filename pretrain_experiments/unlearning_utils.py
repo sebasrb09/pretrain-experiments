@@ -19,6 +19,8 @@ Used by `gradient_ascent.py`, `rmu.py`, `lunar.py`.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from typing import Iterable, Optional, Sequence, Tuple
 
@@ -50,16 +52,38 @@ DEFAULT_EXCLUDED_EXPERIMENTS: Tuple[str, ...] = (
 
 
 class ForgetDataset(Dataset):
-    """Variable-length list of token-id sequences, truncated to `max_seq_len`."""
+    """Variable-length token-id sequences, truncated to `max_seq_len`.
 
-    def __init__(self, sequences: Sequence[Sequence[int]], max_seq_len: int):
-        self.sequences = [list(s)[:max_seq_len] for s in sequences]
+    Two backing stores. The list form is what tokenization produces. The flat
+    form -- one int32 array plus offsets, usually memory-mapped from the cache
+    -- exists because the list form is 5.25M Python lists for this forget set,
+    which is ~20 GB of interpreter objects; the flat array is ~10 GB and pages
+    in lazily.
+    """
+
+    def __init__(self, sequences=None, max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+                 *, flat=None, offsets=None):
+        self._max_seq_len = max_seq_len
+        self._flat = flat
+        self._offsets = offsets
+        if flat is None:
+            if sequences is None:
+                raise ValueError("ForgetDataset needs sequences or flat/offsets")
+            self.sequences = [list(s)[:max_seq_len] for s in sequences]
+        else:
+            self.sequences = None
 
     def __len__(self) -> int:
-        return len(self.sequences)
+        if self._flat is None:
+            return len(self.sequences)
+        return len(self._offsets) - 1
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        return torch.tensor(self.sequences[idx], dtype=torch.long)
+        if self._flat is None:
+            return torch.tensor(self.sequences[idx], dtype=torch.long)
+        start = int(self._offsets[idx])
+        end = min(int(self._offsets[idx + 1]), start + self._max_seq_len)
+        return torch.from_numpy(self._flat[start:end].astype(np.int64))
 
 
 def collate_pad(batch, pad_id: int):
@@ -105,12 +129,122 @@ def tokenize_and_strip(texts: Iterable[str], tokenizer,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Tokenized forget-set cache.
+#
+# Tokenizing the 5.25M-row forget set takes ~21 min and load_forget_set runs at
+# the start of EVERY job. Across a grid of cells, each chained into several
+# walltime-limited links, that is tens of GPU-hours spent re-deriving the same
+# array. The cache turns it into a one-time cost.
+#
+# Stored as a flat int32 token array plus int64 offsets, memory-mapped on load,
+# so a hit costs no tokenization and no 20 GB of Python list objects.
+#
+# The key deliberately EXCLUDES max_seq_len: truncation happens in
+# ForgetDataset, not in tokenization, so one cache serves every sequence length.
+# It includes the raw row count, which catches a dataset revision bump, and a
+# probe encoding, which catches a different tokenizer.
+# ---------------------------------------------------------------------------
+
+FORGET_CACHE_ENV = "FORGET_CACHE_DIR"
+
+
+def _forget_cache_dir(explicit=None):
+    if explicit:
+        return explicit
+    env = os.environ.get(FORGET_CACHE_ENV)
+    if env:
+        return env
+    data = os.environ.get("PE_DATA") or os.environ.get("DATA")
+    if data:
+        return os.path.join(data, "forget-cache")
+    return os.path.join(os.path.expanduser("~"), ".cache",
+                        "pretrain-experiments", "forget")
+
+
+def _forget_cache_key(tokenizer, *, experiments, exclude_experiments, n_rows):
+    try:
+        probe = list(tokenizer("the quick brown fox jumps")["input_ids"])
+    except Exception:
+        probe = []
+    payload = json.dumps({
+        "repo": DATASET_REPO,
+        "split": DATASET_SPLIT,
+        "experiments": sorted(experiments) if experiments else None,
+        "exclude": sorted(exclude_experiments) if exclude_experiments else [],
+        "n_rows": int(n_rows),
+        "vocab_size": int(getattr(tokenizer, "vocab_size", -1) or -1),
+        "probe": probe,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _forget_cache_paths(cache_dir, key):
+    base = os.path.join(cache_dir, f"forget-{key}")
+    return base + ".tokens.npy", base + ".offsets.npy", base + ".info.json"
+
+
+def load_forget_cache(cache_dir, key, max_seq_len):
+    """Return (ForgetDataset, info) if a complete cache exists, else None."""
+    tokens_p, offsets_p, info_p = _forget_cache_paths(cache_dir, key)
+    if not all(os.path.isfile(f) for f in (tokens_p, offsets_p, info_p)):
+        return None
+    try:
+        flat = np.load(tokens_p, mmap_mode="r")
+        offsets = np.load(offsets_p)
+        with open(info_p, encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning("forget cache at %s unreadable (%s); re-tokenizing",
+                       cache_dir, exc)
+        return None
+    info = dict(info)
+    info["max_seq_len_truncation"] = max_seq_len
+    info["from_cache"] = tokens_p
+    logger.info("forget cache HIT: %s (%d sequences, %d tokens)",
+                tokens_p, len(offsets) - 1, int(offsets[-1]))
+    return ForgetDataset(max_seq_len=max_seq_len, flat=flat, offsets=offsets), info
+
+
+def save_forget_cache(cache_dir, key, sequences, info):
+    """Write the cache atomically. Failures are logged, never fatal."""
+    tokens_p, offsets_p, info_p = _forget_cache_paths(cache_dir, key)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        offsets = np.zeros(len(sequences) + 1, dtype=np.int64)
+        for i, s in enumerate(sequences):
+            offsets[i + 1] = offsets[i] + len(s)
+        flat = np.empty(int(offsets[-1]), dtype=np.int32)
+        for i, s in enumerate(sequences):
+            flat[offsets[i]:offsets[i + 1]] = s
+        # Write beside the target and rename, so a job killed mid-write leaves
+        # no half-file for the next job to load as if it were complete.
+        for path, arr in ((tokens_p, flat), (offsets_p, offsets)):
+            tmp = path + ".tmp"
+            # Write through a handle: np.save(str) would append a second .npy.
+            with open(tmp, "wb") as fh:
+                np.save(fh, arr, allow_pickle=False)
+            os.replace(tmp, path)
+        tmp = info_p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+        os.replace(tmp, info_p)
+        logger.info("forget cache WRITTEN: %s (%.1f GB)",
+                    tokens_p, flat.nbytes / 2**30)
+    except OSError as exc:
+        logger.warning("could not write forget cache to %s (%s); continuing",
+                       cache_dir, exc)
+
+
+
 def load_forget_set(
     tokenizer,
     *,
     experiments: Optional[Sequence[str]] = None,
     exclude_experiments: Sequence[str] = DEFAULT_EXCLUDED_EXPERIMENTS,
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+    cache_dir: Optional[str] = None,
+    use_cache: bool = True,
 ) -> Tuple[ForgetDataset, dict]:
     """Load the OLMo-2-1B-Exp-Dataset forget set.
 
@@ -124,6 +258,21 @@ def load_forget_set(
 
     logger.info(f"Loading {DATASET_REPO}...")
     ds = datasets.load_dataset(DATASET_REPO, split=DATASET_SPLIT)
+
+    # Check the cache before touching any column. Reading ds["experiment"] and
+    # ds["text"] materialises 5.5M strings each, so a hit has to short-circuit
+    # ahead of them, not just ahead of tokenization. len(ds) is free.
+    cache_dir = _forget_cache_dir(cache_dir)
+    key = _forget_cache_key(tokenizer, experiments=experiments,
+                            exclude_experiments=exclude_experiments,
+                            n_rows=len(ds))
+    if use_cache:
+        hit = load_forget_cache(cache_dir, key, max_seq_len)
+        if hit is not None:
+            return hit
+        logger.info("forget cache MISS (%s/forget-%s); tokenizing once",
+                    cache_dir, key)
+
     available = sorted(set(ds["experiment"]))
     logger.info(f"  {len(available)} experiments available, {len(ds)} rows")
 
@@ -157,6 +306,8 @@ def load_forget_set(
         f"  tokenized: {info['n_sequences']} non-empty sequences, "
         f"{info['n_total_tokens']} tokens, observed max_len={info['max_seq_len_observed']}"
     )
+    if use_cache:
+        save_forget_cache(cache_dir, key, sequences, info)
     return ForgetDataset(sequences, max_seq_len), info
 
 
