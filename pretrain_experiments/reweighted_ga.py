@@ -137,15 +137,21 @@ def _weighted_ascent_loss(model, input_ids, attention_mask, beta1, beta2,
         use_cache=False,
     )
     logits = outputs.logits  # (B, T, V)
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = input_ids[..., 1:].contiguous()
-    shift_mask = attention_mask[..., 1:].contiguous().to(shift_logits.dtype)
-
+    # Shift the LABELS, not the logits. `logits` is contiguous, so
+    # reshape(-1, V) is a view, whereas slicing it along the sequence dim
+    # first forces a full (B, T-1, V) copy -- 1.6 GB in bf16 at B=2, T=4096,
+    # V=100352, allocated and written on every forward. CE is evaluated at
+    # all T positions and the last column dropped, which costs one extra
+    # position per sequence and saves the copy.
+    shift_labels = torch.empty_like(input_ids)
+    shift_labels[:, :-1] = input_ids[:, 1:]
+    shift_labels[:, -1] = 0  # never scored: dropped with the last column
+    shift_mask = attention_mask[..., 1:].to(logits.dtype)
     ce = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.size(-1)),
+        logits.reshape(-1, logits.size(-1)),
         shift_labels.reshape(-1),
         reduction="none",
-    ).view(shift_labels.shape)  # (B, T-1), = -log p_i
+    ).view(input_ids.shape)[:, :-1]  # (B, T-1), = -log p_i
 
     p_true = torch.exp(-ce)
     if detach_weight:
@@ -175,14 +181,21 @@ def _avg_ce(model, input_ids, attention_mask):
         use_cache=False,
     )
     logits = outputs.logits
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = input_ids[..., 1:].contiguous()
-    shift_mask = attention_mask[..., 1:].contiguous().to(shift_logits.dtype)
+    # Shift the LABELS, not the logits. `logits` is contiguous, so
+    # reshape(-1, V) is a view, whereas slicing it along the sequence dim
+    # first forces a full (B, T-1, V) copy -- 1.6 GB in bf16 at B=2, T=4096,
+    # V=100352, allocated and written on every forward. CE is evaluated at
+    # all T positions and the last column dropped, which costs one extra
+    # position per sequence and saves the copy.
+    shift_labels = torch.empty_like(input_ids)
+    shift_labels[:, :-1] = input_ids[:, 1:]
+    shift_labels[:, -1] = 0  # never scored: dropped with the last column
+    shift_mask = attention_mask[..., 1:].to(logits.dtype)
     ce = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.size(-1)),
+        logits.reshape(-1, logits.size(-1)),
         shift_labels.reshape(-1),
         reduction="none",
-    ).view(shift_labels.shape)
+    ).view(input_ids.shape)[:, :-1]
     return (ce * shift_mask).sum() / shift_mask.sum().clamp_min(1.0)
 
 
@@ -560,7 +573,12 @@ def main():
                     (loss_forget + args.retain_loss_weight * loss_retain).detach().item()
                 ),
             }) + "\n")
-            metrics_f.flush()
+            # Flush once per optimizer step, not once per micro-batch: at
+            # accum 256 that is 2.56M fsyncs onto $DATA over a 10k-step
+            # cell. A kill still loses under one step of rows, and
+            # metrics_f.close() below flushes the tail on a clean exit.
+            if micro_step % args.gradient_accumulation_steps == 0:
+                metrics_f.flush()
 
             if args.max_steps is not None and optimizer_step >= args.max_steps:
                 logger.info(f"Reached --max-steps {args.max_steps}; stopping early.")

@@ -519,7 +519,12 @@ def main():
                 "loss_retain": float(loss_retain.detach().item()),
                 "loss_total": float((loss_forget + args.alpha * loss_retain).detach().item()),
             }) + "\n")
-            metrics_f.flush()
+            # Flush once per optimizer step, not once per micro-batch: at
+            # accum 256 that is 2.56M fsyncs onto $DATA over a 10k-step
+            # cell. A kill still loses under one step of rows, and
+            # metrics_f.close() below flushes the tail on a clean exit.
+            if micro_step % args.gradient_accumulation_steps == 0:
+                metrics_f.flush()
 
             if args.max_steps is not None and optimizer_step >= args.max_steps:
                 logger.info(f"Reached --max-steps {args.max_steps}; stopping early.")

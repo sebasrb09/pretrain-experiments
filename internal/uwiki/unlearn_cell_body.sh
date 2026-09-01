@@ -100,7 +100,7 @@
 # and its median document is 180 tokens, so raising the cap costs far less
 # than 4x there; the retain side is exactly 4x.
 TOTAL_BATCH="${TOTAL_BATCH:-512}"
-MICRO_BATCH="${MICRO_BATCH:-2}"
+MICRO_BATCH="${MICRO_BATCH:-}"   # resolved by method below
 # EPOCHS defaults PER METHOD to that method's published protocol (see the
 # dispatch table below). Setting EPOCHS overrides every method at once.
 EPOCHS_OVERRIDE="${EPOCHS:-}"
@@ -284,6 +284,49 @@ case "$METHOD" in
     ;;
 esac
 
+# RETAIN_WEIGHT=0 turns npo / simnpo / satimp into their forget-only variants.
+# This matters a lot on a cluster without the OLMo-2 stage1 memmap data: those
+# three drivers guard the retain loader behind `use_retain = weight > 0`, so at
+# 0 they never touch it and become runnable. For NPO that IS the paper's base
+# method (the retain variant is NPO-RT); for SimNPO and SatImp it is a
+# documented forget-only ablation, so label the runs accordingly.
+#
+# The other two are NOT separable and must not pretend to be:
+#   grad-diff  the retain weight is its curve knob -- at 0 it IS plain
+#              gradient ascent, so the method disappears
+#   rmu        builds the retain stream unconditionally (rmu.py:285), no guard
+case "${RETAIN_WEIGHT:-}" in
+  0|0.0)
+    case "$METHOD" in
+      npo|simnpo|satimp)
+        USES_RETAIN=0
+        echo "  NOTE: RETAIN_WEIGHT=0 -> forget-only $METHOD, no OLMo retain stream"
+        ;;
+      grad-diff)
+        echo "ERROR: RETAIN_WEIGHT=0 reduces grad-diff to plain gradient ascent." >&2
+        echo "       Its retain weight is the curve knob; sweep VALUE instead." >&2
+        exit 1 ;;
+      rmu)
+        echo "ERROR: rmu builds the retain stream unconditionally (rmu.py:285)." >&2
+        echo "       It cannot run without the OLMo-2 stage1 memmap data." >&2
+        exit 1 ;;
+    esac
+    ;;
+esac
+
+# MICRO_BATCH defaults BY METHOD, once USES_RETAIN is final (the
+# RETAIN_WEIGHT=0 block above can still flip it). It is an accumulation-
+# granularity choice -- the effective batch is TOTAL_BATCH either way -- so
+# this changes speed, not the experiment.
+#
+# MEASURED on a 94 GB H100 at 4096 tokens: peak is 22 GB fixed plus ~3.4 MB
+# per token, so 2 seqs -> 48.9 GB, 4 -> 78.8 GB, 8 -> OOM. Retain-using
+# methods carry a second batch, and npo/rmu/satimp a frozen fp32 reference
+# (+5.5 GB), so 4 leaves them no headroom; forget-only methods have room.
+if [ -z "${MICRO_BATCH:-}" ]; then
+  if [ "$USES_RETAIN" -eq 1 ]; then MICRO_BATCH=2; else MICRO_BATCH=4; fi
+fi
+
 # Resolve the budget: explicit env override > method protocol > hard cap.
 EPOCHS="${EPOCHS_OVERRIDE:-$METHOD_EPOCHS}"
 if [ -n "$MAX_STEPS_OVERRIDE" ]; then
@@ -344,36 +387,6 @@ if [ "$METHOD" = "ce-u" ]; then
 else
   COMMON_ARGS+=(--forget-batch-size "$MICRO_BATCH")
 fi
-
-# RETAIN_WEIGHT=0 turns npo / simnpo / satimp into their forget-only variants.
-# This matters a lot on a cluster without the OLMo-2 stage1 memmap data: those
-# three drivers guard the retain loader behind `use_retain = weight > 0`, so at
-# 0 they never touch it and become runnable. For NPO that IS the paper's base
-# method (the retain variant is NPO-RT); for SimNPO and SatImp it is a
-# documented forget-only ablation, so label the runs accordingly.
-#
-# The other two are NOT separable and must not pretend to be:
-#   grad-diff  the retain weight is its curve knob -- at 0 it IS plain
-#              gradient ascent, so the method disappears
-#   rmu        builds the retain stream unconditionally (rmu.py:285), no guard
-case "${RETAIN_WEIGHT:-}" in
-  0|0.0)
-    case "$METHOD" in
-      npo|simnpo|satimp)
-        USES_RETAIN=0
-        echo "  NOTE: RETAIN_WEIGHT=0 -> forget-only $METHOD, no OLMo retain stream"
-        ;;
-      grad-diff)
-        echo "ERROR: RETAIN_WEIGHT=0 reduces grad-diff to plain gradient ascent." >&2
-        echo "       Its retain weight is the curve knob; sweep VALUE instead." >&2
-        exit 1 ;;
-      rmu)
-        echo "ERROR: rmu builds the retain stream unconditionally (rmu.py:285)." >&2
-        echo "       It cannot run without the OLMo-2 stage1 memmap data." >&2
-        exit 1 ;;
-    esac
-    ;;
-esac
 
 if [ "$USES_RETAIN" -eq 1 ]; then
   COMMON_ARGS+=(--retain-batch-size "$MICRO_BATCH"
