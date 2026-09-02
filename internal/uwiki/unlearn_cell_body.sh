@@ -193,6 +193,7 @@ set -o pipefail
 # ---------------------------------------------------------------------------
 
 USES_RETAIN=1        # does this method draw retain batches?
+HAS_FROZEN=0        # does this method keep a second, frozen model resident?
 KNOB=""              # knob name, used in the output path
 MODULE=""
 METHOD_EPOCHS=""
@@ -254,7 +255,7 @@ case "$METHOD" in
     METHOD_ARGS+=(--retain-loss-weight "$VALUE" "${LR_ARGS[@]}")
     ;;
   npo)
-    MODULE="pretrain_experiments.npo"; USES_RETAIN=1; KNOB="beta"
+    MODULE="pretrain_experiments.npo"; USES_RETAIN=1; KNOB="beta" HAS_FROZEN=1
     METHOD_EPOCHS=10
     METHOD_ARGS+=(--beta "$VALUE" --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
                   "${LR_ARGS[@]}" --frozen-dtype "$FROZEN_DTYPE")
@@ -267,7 +268,7 @@ case "$METHOD" in
     ;;
   rmu)
     # 1B has 16 layers; HYPER-PARAMS.md maps the 179M anchor l=5 (of 12) to l=7.
-    MODULE="pretrain_experiments.rmu"; USES_RETAIN=1; KNOB="c"
+    MODULE="pretrain_experiments.rmu"; USES_RETAIN=1; KNOB="c" HAS_FROZEN=1
     # RMU's paper budgets ~100-200 optimizer steps rather than epochs. Default
     # to HARD_STEP_CAP rather than a literal 200 so every method on the plot
     # gets the SAME step budget -- otherwise RMU's dots sit further along the
@@ -314,17 +315,20 @@ case "${RETAIN_WEIGHT:-}" in
     ;;
 esac
 
-# MICRO_BATCH defaults BY METHOD, once USES_RETAIN is final (the
-# RETAIN_WEIGHT=0 block above can still flip it). It is an accumulation-
-# granularity choice -- the effective batch is TOTAL_BATCH either way -- so
-# this changes speed, not the experiment.
+# MICRO_BATCH defaults BY METHOD. It is an accumulation-granularity choice --
+# the effective batch is TOTAL_BATCH either way -- so this changes speed, not
+# the experiment.
 #
-# MEASURED on a 94 GB H100 at 4096 tokens: peak is 22 GB fixed plus ~3.4 MB
-# per token, so 2 seqs -> 48.9 GB, 4 -> 78.8 GB, 8 -> OOM. Retain-using
-# methods carry a second batch, and npo/rmu/satimp a frozen fp32 reference
-# (+5.5 GB), so 4 leaves them no headroom; forget-only methods have room.
+# MEASURED on a 94 GB H100 at 4096 tokens: 22 GB fixed (fp32 weights, grads,
+# Adam) plus ~3.4 MB per token, so 2 seqs -> 48.9 GB, 4 -> 78.8 GB, 8 -> OOM.
+#
+# Two things force 2. A retain stream doubles the batches per step. A FROZEN
+# REFERENCE MODEL (npo, rmu) adds ~5.5 GB resident plus its own forward, and
+# it is loaded independently of RETAIN_WEIGHT -- npo at RETAIN_WEIGHT=0 is
+# still two models on the card. Keying this on USES_RETAIN alone sent npo to
+# MICRO_BATCH=4 and it OOMed at 89.8 of 93.1 GB.
 if [ -z "${MICRO_BATCH:-}" ]; then
-  if [ "$USES_RETAIN" -eq 1 ]; then MICRO_BATCH=2; else MICRO_BATCH=4; fi
+  if [ "$USES_RETAIN" -eq 1 ] || [ "$HAS_FROZEN" -eq 1 ]; then MICRO_BATCH=2; else MICRO_BATCH=4; fi
 fi
 
 # Resolve the budget: explicit env override > method protocol > hard cap.
