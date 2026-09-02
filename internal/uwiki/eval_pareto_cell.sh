@@ -52,7 +52,7 @@
 #   EVAL_OUT    where results go         (default: $CELL_DIR/evals)
 #   CKPT        explicit checkpoint dir  (default: highest-numbered epoch-*/)
 #   NOISE_DIR   gaussian-watermark noise vectors
-#   NOISE_STD   default 0.001
+#   NOISE_STD   default 0.075
 #   SKIP_PPL / SKIP_FK / SKIP_VM / SKIP_GW   1 to skip (all default 0 = run)
 #   SKIP_IL     default 1 -- insertion likelihood, opt in
 #   SKIP_MIA    default 1 -- 30 sub-runs, opt in when you actually want it

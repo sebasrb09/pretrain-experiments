@@ -34,7 +34,7 @@
 #   EVAL_OUT    where results go         (default: $CELL_DIR/evals)
 #   CKPT        explicit checkpoint dir  (default: highest-numbered epoch-*/)
 #   NOISE_DIR   gaussian-watermark noise vectors
-#   NOISE_STD   default 0.001
+#   NOISE_STD   default 0.075 (the value the watermarks were injected at)
 #   Per-eval switches, 1 to skip. All default to RUN except SKIP_DOS:
 #     SKIP_PPL  c4 perplexity (the utility axis)
 #     SKIP_FK   fictional knowledge          SKIP_VM   verbatim memorization
@@ -96,7 +96,14 @@ REV_ARGS=(); [ -n "$REVISION" ] && REV_ARGS=(--revision "$REVISION")
 REV_ARGS_MR=(); [ -n "$REVISION" ] && REV_ARGS_MR=(--model_revision "$REVISION")
 
 NOISE_DIR="${NOISE_DIR:-${PE_DATA:-$HOME/pretrain-experiments}/noise-vectors/OLMo-2-1B-Exp}"
-NOISE_STD="${NOISE_STD:-0.001}"
+# 0.075, matching gaussian_watermark.py's own default and every other driver
+# in the repo. This was 0.001, which is not a value the watermarks were ever
+# injected at: mean_in scales as 1/noise_std, so every number measured under
+# it came out 75x too large. mean_out does NOT scale (the fresh noise is drawn
+# at noise_std and then divided by it), which is what made the error hard to
+# see -- the control looked negligible at ~0.1% of mean_in when it is really
+# ~8%. Any results/*.pt produced before this fix are on the wrong scale.
+NOISE_STD="${NOISE_STD:-0.075}"
 
 echo "============================================"
 echo "  Pareto eval: $LABEL"
