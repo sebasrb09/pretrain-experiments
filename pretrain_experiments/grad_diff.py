@@ -503,6 +503,12 @@ def main():
             ckpt_dir = output_dir / f"epoch-{epoch}"
             logger.info(f"  saving checkpoint to {ckpt_dir}")
             save_hf_checkpoint(model, tokenizer, str(ckpt_dir))
+            # Epoch checkpoints record their optimizer step too. Without it the
+            # aggregator can only read the directory name, and 'epoch-1' parsed
+            # as step 1 puts an end-of-run model at the START of the trajectory.
+            save_trainer_state(ckpt_dir, optimizer,
+                               optimizer_step=optimizer_step,
+                               micro_step=micro_step, epoch=epoch)
 
     metrics_f.close()
     logger.info("Done.")

@@ -332,6 +332,34 @@ def print_pivot(rows):
             print(line)
 
 
+def checkpoint_step(ckpt_dir, name):
+    """Optimizer step for a checkpoint directory, or None if unknowable.
+
+    The directory name is NOT authoritative. `epoch-N` counts epochs, so
+    parsing the suffix turned a cell's end-of-run epoch-1 into "step 1" -- a
+    point that looked like one optimizer step when it was in fact the last one,
+    thousands of steps in. That fabricated an early datapoint on every
+    trajectory that finished an epoch.
+
+    trainer_state.pt records the real optimizer_step and is preferred wherever
+    it exists. Failing that, only `step-N` may be trusted, because that N IS
+    the optimizer step. An epoch checkpoint without state gets None: it still
+    contributes its metrics, it just does not claim a position on the x-axis.
+    """
+    state = os.path.join(ckpt_dir, "trainer_state.pt")
+    if os.path.isfile(state):
+        try:
+            import torch
+            blob = torch.load(state, map_location="cpu", weights_only=False)
+            return str(int(blob["optimizer_step"]))
+        except Exception as exc:
+            print(f"  ! {state} unreadable ({exc}); falling back to the name")
+    if name.startswith("step-"):
+        return name[len("step-"):]
+    return None
+
+
+
 def _num(v):
     try:
         return float(v)
@@ -419,7 +447,7 @@ def main():
                         continue
                     if not os.path.isdir(os.path.join(ckdir, "evals")):
                         continue
-                    st = ck.split("-", 1)[1]
+                    st = checkpoint_step(ckdir, ck)
                     collect_point(rows, "cell", cell, method, knob, value,
                                   cdir, os.path.join(ckdir, "evals"),
                                   gw_tail=args.gw_tail, step=st)
@@ -450,7 +478,7 @@ def main():
             )
             if steps:
                 for d in steps:
-                    st = d[len("step-"):]
+                    st = checkpoint_step(os.path.join(adir, d), d)
                     print(f"  {name} {d}")
                     collect_point(rows, "anchor", name, name, "", "", None,
                                   os.path.join(adir, d),
