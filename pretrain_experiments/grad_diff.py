@@ -69,6 +69,8 @@ from pretrain_experiments.unlearning_utils import (
     OLMO2_1B_MAX_GRAD_NORM,
     OLMO2_1B_WEIGHT_DECAY,
     build_lr_schedule,
+    parse_checkpoint_steps,
+    should_checkpoint,
     find_latest_checkpoint,
     load_trainer_state,
     save_trainer_state,
@@ -184,6 +186,8 @@ def main():
                         help="Optional optimizer-step cap.")
     parser.add_argument("--checkpoint-every-n-epochs", type=int,
                         default=DEFAULT_CHECKPOINT_EVERY)
+    parser.add_argument("--checkpoint-steps", type=str, default=None,
+                        help="Explicit optimizer steps to checkpoint at, comma or space separated (e.g. \"1,2,3,5,8,13\"). Overrides --checkpoint-every-n-steps. Use when the interesting range is logarithmic rather than evenly spaced.")
     parser.add_argument("--checkpoint-every-n-steps", type=int, default=2000,
                         help="Save every N optimizer steps, giving the "
                              "trajectory its points. 0 disables.")
@@ -232,6 +236,7 @@ def main():
 
     # Resolve the resume point BEFORE loading the model: weights must come
     # from the checkpoint, not from the base revision.
+    ckpt_steps = parse_checkpoint_steps(args.checkpoint_steps)
     resume_dir, resume_step = (None, 0)
     if args.auto_resume:
         resume_dir, resume_step = find_latest_checkpoint(output_dir)
@@ -451,8 +456,8 @@ def main():
                 # epoch (10k steps against ~10,249 per epoch), so epoch
                 # boundaries would yield a single checkpoint at the end and
                 # no trajectory to plot.
-                if (args.checkpoint_every_n_steps
-                        and optimizer_step % args.checkpoint_every_n_steps == 0):
+                if should_checkpoint(optimizer_step, ckpt_steps,
+                                     args.checkpoint_every_n_steps):
                     ckpt_dir = output_dir / f"step-{optimizer_step}"
                     logger.info(f"  saving checkpoint to {ckpt_dir}")
                     save_hf_checkpoint(model, tokenizer, str(ckpt_dir))

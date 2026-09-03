@@ -516,6 +516,32 @@ def build_matched_optimizer(
 TRAINER_STATE_FILE = "trainer_state.pt"
 
 
+def parse_checkpoint_steps(spec):
+    """Parse "1,2,3 5" into a frozenset of optimizer steps.
+
+    An explicit list exists because the interesting range is logarithmic. The
+    transition from "forgets a little" to "destroyed" spans roughly steps
+    1-100 while the tail runs to thousands, so a fixed interval either steps
+    straight over the transition or writes hundreds of 5.9 GB checkpoints
+    across the flat part.
+    """
+    if not spec:
+        return frozenset()
+    out = set()
+    for tok in str(spec).replace(",", " ").split():
+        tok = tok.strip()
+        if tok:
+            out.add(int(tok))
+    return frozenset(out)
+
+
+def should_checkpoint(step, explicit_steps, every_n):
+    """Explicit step list wins when given; otherwise the fixed interval."""
+    if explicit_steps:
+        return step in explicit_steps
+    return bool(every_n) and step % every_n == 0
+
+
 def save_trainer_state(ckpt_dir, optimizer, *, optimizer_step, micro_step, epoch):
     """Write the optimizer and stream position beside an HF checkpoint."""
     payload = {

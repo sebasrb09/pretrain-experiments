@@ -385,6 +385,16 @@ COMMON_ARGS+=(
   --dtype "$DTYPE"
 )
 
+# CKPT_STEPS overrides the interval with an explicit list, e.g.
+# CKPT_STEPS="1,2,3,5,8,13,21,34". The range where anything happens is
+# logarithmic -- the transition from "forgets a little" to "destroyed" spans
+# roughly steps 1-100 while the tail runs to thousands -- so a fixed interval
+# either steps over the transition or writes hundreds of 5.9 GB checkpoints
+# across the flat part.
+if [ -n "${CKPT_STEPS:-}" ]; then
+  COMMON_ARGS+=(--checkpoint-steps "$CKPT_STEPS")
+fi
+
 # ce_u.py takes --batch-size; every other driver takes --forget-batch-size.
 if [ "$METHOD" = "ce-u" ]; then
   COMMON_ARGS+=(--batch-size "$MICRO_BATCH")
