@@ -133,7 +133,10 @@ if [ "$ANCHORS_ONLY" != "1" ]; then
       for ckpt in $ckpts; do
         [ -d "$ckpt" ] || continue
         tag="$(basename "$ckpt")"
-        submit "pe-${method}-${cell}-${tag}"           "CELL_DIR=$cell_dir,CKPT=$ckpt,EVAL_OUT=$ckpt/evals"
+        # RUN_TAG first, for the same reason as in launch_pareto_sweep_1B.sh:
+        # <method>/<knob>-<value> repeats across sweeps, so without the tag two
+        # unrelated experiments produce identical job names in squeue.
+        submit "pe-${RUN_TAG}-${method}-${cell}-${tag}" "CELL_DIR=$cell_dir,CKPT=$ckpt,EVAL_OUT=$ckpt/evals"
         n_sub=$((n_sub + 1))
       done
     done

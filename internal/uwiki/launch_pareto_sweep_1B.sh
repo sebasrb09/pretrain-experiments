@@ -228,7 +228,13 @@ for method in $METHODS; do
   knob="$(knob_for "$method")"
   echo "--- $method (knob: $knob) ---"
   for v in $values; do
-    job_name="pareto-${method}-${knob}${v}"
+    # RUN_TAG is in the job name because it is the only thing that identifies
+    # which experiment a job belongs to. Without it the same name is reused
+    # across unrelated sweeps -- pareto-wga-beta10.5 was emitted by both the
+    # pretraining-rate sweep (1B-pareto) and the beta1 comparison
+    # (1B-beta-wga-b0.5) -- and the slurm logs become useless for provenance,
+    # since only the "output:" line inside each .out says where it went.
+    job_name="${RUN_TAG}-${method}-${knob}${v}"
     # CHAIN=N submits N jobs per cell, each depending on the previous with
     # afterany, so a cell that hits the walltime is picked up by the next link
     # rather than lost. The drivers --auto-resume from the highest step-N

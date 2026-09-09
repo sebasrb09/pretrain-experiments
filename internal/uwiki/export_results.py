@@ -112,6 +112,40 @@ def insertion_likelihood(eval_dir, experiment):
     return flat[hit[0]] if hit else None
 
 
+_LR_CACHE = {}
+
+
+def cell_lr(cell_dir):
+    """learning_rate from the driver's own config dump, or None.
+
+    Authoritative, unlike parsing it out of the RUN_TAG: every driver writes
+    <driver>_config.json into the cell directory with the rate it actually
+    used. The tag only carries it when the tag happens to end in lr<value>,
+    which is false for 20 of the sweeps -- `1B-lr1e-5-base` names the rate in
+    the middle, `1B-p2-satimp-rt` not at all -- and a cell launched without
+    LR= silently takes the driver default, which no tag records.
+
+    tokenizer_config.json and generation_config.json sit in the same tree and
+    match the same glob, so they are excluded by name rather than by position.
+    """
+    if cell_dir in _LR_CACHE:
+        return _LR_CACHE[cell_dir]
+    lr = None
+    for p in sorted(glob.glob(os.path.join(cell_dir, "*_config.json"))):
+        if os.path.basename(p) in ("tokenizer_config.json", "generation_config.json"):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                v = json.load(f).get("learning_rate")
+            if v is not None:
+                lr = v
+                break
+        except Exception:
+            continue
+    _LR_CACHE[cell_dir] = lr
+    return lr
+
+
 def watermark(eval_dir):
     """(full-set mean, Q4 mean) from the saved per-sequence scores.
 
@@ -245,9 +279,11 @@ def main():
             continue
         variant, tag_lr = parse_tag(tag)
         knob, _, knob_value = cell.partition("-")
-        # ce-u and gradient-ascent take the learning rate AS their swept value,
-        # so the cell name carries it and the tag may not.
-        lr = tag_lr or (knob_value if knob == "lr" else None)
+        # The driver's config dump is the only authoritative record -- see
+        # cell_lr(). Fall back to the tag, then to the swept value for ce-u and
+        # gradient-ascent, which take the learning rate AS their knob.
+        cell_dir = os.path.dirname(os.path.dirname(eval_dir))
+        lr = cell_lr(cell_dir) or tag_lr or (knob_value if knob == "lr" else None)
         wm_full, wm_q4 = watermark(eval_dir)
         row = {
             "run_tag": tag, "method": method, "variant": variant or "",
