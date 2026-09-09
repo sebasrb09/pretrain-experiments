@@ -543,7 +543,31 @@ def should_checkpoint(step, explicit_steps, every_n):
 
 
 def save_trainer_state(ckpt_dir, optimizer, *, optimizer_step, micro_step, epoch):
-    """Write the optimizer and stream position beside an HF checkpoint."""
+    """Write the optimizer and stream position beside an HF checkpoint.
+
+    NO_TRAINER_STATE=1 skips the write. Adam's two moment buffers for 1.48B
+    fp32 parameters are ~12-18 GB, four to six times the ~3 GB of weights, and
+    NOTHING in the eval or aggregation path reads them: the eval scripts load
+    the HF checkpoint, export_results.py takes the step from the directory
+    name, and aggregate_pareto.py falls back to that same name -- which for a
+    step-N checkpoint IS the optimizer step. The file buys exactly one thing,
+    the ability to --auto-resume a run that hits its walltime.
+
+    So set it for dense diagnostic sweeps, whose runs are tens of steps and
+    finish inside one allocation. Leave it unset for anything long enough to
+    need CHAIN, such as the 10k-step control, where losing resume means
+    restarting from zero.
+
+    A skipped write is invisible to find_latest_checkpoint, which ignores
+    checkpoints without a state file rather than failing on them -- so a run
+    launched this way simply has no resume points.
+    """
+    if os.environ.get("NO_TRAINER_STATE") == "1":
+        logger.info(
+            "NO_TRAINER_STATE=1 -> skipping %s for %s (no resume point)",
+            TRAINER_STATE_FILE, ckpt_dir,
+        )
+        return
     payload = {
         "optimizer": optimizer.state_dict(),
         "optimizer_step": int(optimizer_step),

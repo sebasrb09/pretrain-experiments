@@ -188,7 +188,12 @@ knob_for () {
 # Forward only the overrides that were actually set, so unlearn_cell_1B.sh keeps
 # its own defaults for everything else.
 EXPORTS="ALL,RUN_TAG=${RUN_TAG}"
-for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RETAIN_WEIGHT OUTPUT_ROOT; do
+# CKPT_STEPS, KEEP_CHECKPOINTS and NO_TRAINER_STATE are read by
+# unlearn_cell_body.sh but were reaching the job only through --export=ALL,
+# i.e. only when the caller happened to use the `VAR=x bash launch...` prefix
+# form. Listing them explicitly means they also survive being set earlier in a
+# calling script, which is how a dense sweep is usually driven.
+for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RETAIN_WEIGHT OUTPUT_ROOT CKPT_STEPS KEEP_CHECKPOINTS NO_TRAINER_STATE; do
   if [ -n "${!var:-}" ]; then
     EXPORTS="${EXPORTS},${var}=${!var}"
   fi
