@@ -596,9 +596,17 @@ def load_trainer_state(ckpt_dir, optimizer, device="cpu"):
     if blob.get("numpy_rng") is not None:
         np.random.set_state(blob["numpy_rng"])
     if blob.get("cuda_rng") is not None and torch.cuda.is_available():
+        # Same coercion as the CPU path above, and for the same reason: this
+        # blob was loaded with map_location=device, so on a GPU resume every
+        # tensor in it -- the RNG states included -- comes back as a CUDA
+        # tensor, while set_rng_state requires a CPU ByteTensor. Omitting it
+        # raised `TypeError: RNG state must be a torch.ByteTensor`, which the
+        # old except clause did not catch, so a recoverable RNG mismatch killed
+        # the whole resume.
         try:
-            torch.cuda.set_rng_state_all(blob["cuda_rng"])
-        except (RuntimeError, ValueError) as exc:
+            states = [s.cpu().to(torch.uint8) for s in blob["cuda_rng"]]
+            torch.cuda.set_rng_state_all(states)
+        except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
             logger.warning("could not restore CUDA RNG (%s); continuing", exc)
     logger.info(
         "resumed from %s: optimizer_step=%d, micro_step=%d, epoch=%d",
