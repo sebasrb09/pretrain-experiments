@@ -188,12 +188,22 @@ knob_for () {
 # Forward only the overrides that were actually set, so unlearn_cell_1B.sh keeps
 # its own defaults for everything else.
 EXPORTS="ALL,RUN_TAG=${RUN_TAG}"
-# CKPT_STEPS, KEEP_CHECKPOINTS and NO_TRAINER_STATE are read by
-# unlearn_cell_body.sh but were reaching the job only through --export=ALL,
-# i.e. only when the caller happened to use the `VAR=x bash launch...` prefix
-# form. Listing them explicitly means they also survive being set earlier in a
-# calling script, which is how a dense sweep is usually driven.
-for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RETAIN_WEIGHT OUTPUT_ROOT CKPT_STEPS KEEP_CHECKPOINTS NO_TRAINER_STATE; do
+# NEVER list a variable whose value can contain a comma. sbatch --export takes
+# a COMMA-SEPARATED list of VAR=VALUE, so embedding CKPT_STEPS="14,15,17" here
+# produced `--export=...,CKPT_STEPS=14,15,17,...`: sbatch read CKPT_STEPS as
+# "14" and treated 15 and 17 as bare names to inherit. Every cell in a dense
+# sweep then wrote exactly one checkpoint -- the first entry of its schedule --
+# and ran on to --max-steps looking perfectly healthy.
+#
+# CKPT_STEPS does not belong here at all: it reaches the job through
+# --export=ALL, which propagates the submitting environment verbatim and is
+# comma-safe. The same goes for any future list-valued variable.
+# KEEP_CHECKPOINTS and NO_TRAINER_STATE are single tokens, so they are safe.
+for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RETAIN_WEIGHT OUTPUT_ROOT KEEP_CHECKPOINTS NO_TRAINER_STATE; do
+  case "${!var:-}" in *,*)
+    echo "ERROR: $var contains a comma; --export cannot carry it. Pass it via the environment (--export=ALL handles it) instead of listing it here." >&2
+    exit 1 ;;
+  esac
   if [ -n "${!var:-}" ]; then
     EXPORTS="${EXPORTS},${var}=${!var}"
   fi
