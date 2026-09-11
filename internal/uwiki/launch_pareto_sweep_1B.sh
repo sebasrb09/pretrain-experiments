@@ -199,7 +199,7 @@ EXPORTS="ALL,RUN_TAG=${RUN_TAG}"
 # --export=ALL, which propagates the submitting environment verbatim and is
 # comma-safe. The same goes for any future list-valued variable.
 # KEEP_CHECKPOINTS and NO_TRAINER_STATE are single tokens, so they are safe.
-for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RETAIN_WEIGHT OUTPUT_ROOT KEEP_CHECKPOINTS NO_TRAINER_STATE; do
+for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RMU_NLAYERS RETAIN_WEIGHT OUTPUT_ROOT KEEP_CHECKPOINTS NO_TRAINER_STATE; do
   case "${!var:-}" in *,*)
     echo "ERROR: $var contains a comma; --export cannot carry it. Pass it via the environment (--export=ALL handles it) instead of listing it here." >&2
     exit 1 ;;

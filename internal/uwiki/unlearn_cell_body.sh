@@ -275,8 +275,16 @@ case "$METHOD" in
     # forgetting axis partly just from training twice as long, which is a
     # confound the Pareto comparison cannot separate. RMU_STEPS still overrides.
     METHOD_EPOCHS=1; METHOD_MAX_STEPS="${RMU_STEPS:-$HARD_STEP_CAP}"
+    # RMU_NLAYERS: how many MLP down_proj matrices train, ending at the target
+    # layer; the driver accepts 1 .. RMU_LAYER+1, so RMU_NLAYERS=8 with
+    # RMU_LAYER=7 updates every layer up to it. The paper default is 3, and it was
+    # hardcoded here until the loss logs showed 34 steps closing only 2-7% of the
+    # distance to the steering target, with a sublinear response to learning rate
+    # -- what an update scope too narrow to move the representation looks like.
+    # It does NOT enter the output path (<RUN_TAG>/rmu/c-<value>), so runs that
+    # differ only in RMU_NLAYERS need distinct RUN_TAGs or they overwrite.
     METHOD_ARGS+=(--steering-coef "$VALUE" --target-layer "${RMU_LAYER:-7}"
-                  --alpha "${RMU_ALPHA:-1200.0}" --n-layers-to-update 3
+                  --alpha "${RMU_ALPHA:-1200.0}" --n-layers-to-update "${RMU_NLAYERS:-3}"
                   "${LR_ARGS[@]}" --frozen-dtype "$FROZEN_DTYPE")
     ;;
   *)
