@@ -1,0 +1,77 @@
+# The control, re-run at the resolution the methods live at (P1).
+#
+# The published control (sbordt/OLMo-2-1B-Exp-Unlearning, branches
+# stage1-step101000 .. 150000) is checkpointed every 1000 steps, while every
+# unlearning method's usable window is 5-16 steps somewhere in its first 50. So
+# in the range where the comparison actually happens there is no control point
+# at all. This config reproduces the same run -- continued pretraining on the
+# OLMo-2 stage1 stream past step 100000, no intervention -- and checkpoints it
+# on a log schedule from step 1.
+#
+# It is the SAME procedure that produced the published branches: same OLMo
+# trainer, same data order, same optimizer state, resumed from the OLMo-native
+# step100000-unsharded branch. That is what makes step 1000 a validation point:
+# its evals must match the published stage1-step101000 branch before the fine
+# points are spliced onto the published curve.
+#
+# Cost: ~5h50m per 1000 steps at 1B on 4x H100 (GAUSSIAN_NOISE_UNLEARNING.md,
+# experiment 3), so roughly a 6 hour job on one full MUSICA node.
+#
+# DISK: each additional checkpoint is an OLMo unsharded save (model + optimizer,
+# ~18 GB at 1B). Fifteen of them is ~270 GB, plus ~6 GB per HF conversion for
+# the evals. Check `df -h $DATA` before launching.
+#
+# NOTE ON THE STEP NUMBERS: `additional_checkpoint_steps` is consumed by the
+# modified OLMo repo via OLMO_ADDITIONAL_CHECKPOINTS_FILE, and OLMo's trainer
+# counts global steps, which continue from 100000 here. The list below is
+# therefore ABSOLUTE (100001 = one step of continued pretraining). Verify once
+# against the OLMo hook before trusting a long run -- see the smoke test.
+
+experiment: control-fine-1B
+save_folder: ${DATA}/control-fine
+
+wandb:
+  name: OLMo-2-1B-control-fine
+  entity: "ai4life_pawel"
+
+framework: olmo
+
+model:
+  checkpoint_hf_repo: sbordt/OLMo-2-1B-Exp-Unlearning
+  checkpoint_hf_revision: step100000-unsharded
+  checkpoint_save_path: ${DATA}/checkpoints/1B-Exp-Unlearning
+  config: ${DATA}/checkpoints/1B-Exp-Unlearning/step100000-unsharded/config.yaml
+
+training:
+  num_steps: 1000
+  # Regular saves only at the end; the log schedule below does the real work.
+  checkpoint_interval: 1000
+  # Fibonacci-ish through the methods' range (steps 1-50), then widening.
+  additional_checkpoint_steps:
+    - 100001
+    - 100002
+    - 100003
+    - 100005
+    - 100008
+    - 100013
+    - 100021
+    - 100034
+    - 100055
+    - 100089
+    - 100144
+    - 100233
+    - 100377
+    - 100610
+
+# No intervention: this IS the control. `skip` short-circuits InsertionBuilder,
+# so nothing is inserted into the stream and the run is plain continued
+# pretraining.
+experiments:
+  skip: true
+
+# Checkpoints are evaluated afterwards with internal/asc/eval_pareto_cell.sh in
+# MODEL mode, the same suite and the same .done markers as every other point on
+# the plot. Running them here instead would use a different eval path.
+evaluation:
+  eval_on_load: false
+  evaluations: []
