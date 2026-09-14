@@ -212,7 +212,16 @@ def run_experiment():
 
     while current_step < initial_checkpoint_step + num_steps_to_train:
         # convert the current checkpoint to huggingface format for dynamic insertions
-        if current_checkpoint.has_weights():
+        #
+        # `experiments_config` is empty when experiments.skip is set, which is how
+        # the control is expressed: plain continued pretraining, nothing inserted.
+        # Without this guard the loop still converts a 1.5B checkpoint to HF on
+        # every iteration, hands it to an InsertionBuilder with no experiments,
+        # gets an empty dict back and deletes it. That is pure waste on a good
+        # day; on a cluster whose `transformers` no longer exposes the module
+        # convert_olmo2_to_hf.py imports, it is a hard failure in a run that has
+        # no insertions to build in the first place.
+        if current_checkpoint.has_weights() and experiments_config:
             tmp_hf_checkpoint_path = os.path.join(experiment_dir, f"step{current_step}-hf-tmp")
             tmp_hf_checkpoint_path = current_checkpoint.to_hf(tmp_hf_checkpoint_path)
 

@@ -62,6 +62,28 @@ import tempfile
 
 MARKER = "_ADDITIONAL_CHECKPOINT_STEPS"
 
+# --- second, independent fix: scripts/convert_olmo2_to_hf.py ----------------
+# That script does
+#     from transformers.models.gpt2.tokenization_gpt2_fast import GPT2TokenizerFast
+# which no longer resolves on the cluster's transformers, so every OLMo ->
+# HF conversion dies with ModuleNotFoundError. The name is load-bearing (it is
+# instantiated in _write_tokenizer), so it cannot simply be dropped -- but it
+# has always been re-exported at the top level, which is the stable path.
+#
+# This matters beyond the training run: evaluating any control checkpoint goes
+# through this converter.
+CONVERT_MARKER = "# pretrain-experiments: tolerate both transformers layouts"
+CONVERT_OLD = (
+    "from transformers.models.gpt2.tokenization_gpt2_fast import GPT2TokenizerFast"
+)
+CONVERT_NEW = (
+    CONVERT_MARKER + "\n"
+    "try:\n"
+    "    from transformers.models.gpt2.tokenization_gpt2_fast import GPT2TokenizerFast\n"
+    "except ModuleNotFoundError:  # newer transformers moved the submodule\n"
+    "    from transformers import GPT2TokenizerFast"
+)
+
 LOADER = '''
 # --- pretrain-experiments: additional checkpoint steps ----------------------
 # OLMo can only save every N steps, which cannot express the logarithmic
@@ -165,30 +187,46 @@ def patch(text: str) -> tuple[str, list[str]]:
     return text, notes
 
 
-def main() -> int:
-    default = os.path.join(
-        os.environ.get("SCRATCH", os.path.expanduser("~")), "OLMo", "olmo", "train.py"
-    )
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("path", nargs="?", default=default,
-                    help=f"olmo/train.py to patch (default: {default})")
-    ap.add_argument("--apply", action="store_true",
-                    help="write the change; without it this is a dry run")
-    args = ap.parse_args()
+def patch_converter(text: str) -> tuple[str, list[str]]:
+    """Make scripts/convert_olmo2_to_hf.py import GPT2TokenizerFast portably.
 
-    if not os.path.isfile(args.path):
-        print(f"ERROR: no such file: {args.path}", file=sys.stderr)
-        print("       Pass the path to your OLMo checkout's olmo/train.py.",
-              file=sys.stderr)
+    Separate from patch() because it touches a different file for a different
+    reason: this one is not about checkpoint schedules at all, it is about the
+    conversion path that BOTH the training loop and every checkpoint evaluation
+    depend on.
+
+    The name is load-bearing -- _write_tokenizer instantiates it -- so the fix
+    is a fallback import, not a deletion.
+    """
+    if CONVERT_MARKER in text:
+        return text, ["already patched (marker present); nothing to do"]
+
+    n = text.count(CONVERT_OLD)
+    if n != 1:
+        raise SystemExit(
+            f"ERROR: expected exactly one occurrence of\n    {CONVERT_OLD}\n"
+            f"but found {n}. The file has changed; patch by hand."
+        )
+    text = text.replace(CONVERT_OLD, CONVERT_NEW, 1)
+    return text, ["GPT2TokenizerFast: import now falls back to the top level"]
+
+
+def _process(path: str, patch_fn, apply_it: bool) -> int:
+    """Read, patch, diff, syntax-check and optionally write ONE file.
+
+    Each target gets its own backup and its own compile gate, so a failure in
+    one cannot leave the other half-written.
+    """
+    if not os.path.isfile(path):
+        print(f"ERROR: no such file: {path}", file=sys.stderr)
         return 2
 
-    with open(args.path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         original = f.read()
 
-    patched, notes = patch(original)
+    patched, notes = patch_fn(original)
 
-    print(f"target: {args.path}")
+    print(f"\ntarget: {path}")
     for n in notes:
         print(f"  - {n}")
 
@@ -197,7 +235,7 @@ def main() -> int:
 
     diff = difflib.unified_diff(
         original.splitlines(keepends=True), patched.splitlines(keepends=True),
-        fromfile=args.path, tofile=args.path + " (patched)", n=3,
+        fromfile=path, tofile=path + " (patched)", n=3,
     )
     print("\n" + "".join(diff))
 
@@ -216,18 +254,55 @@ def main() -> int:
     finally:
         os.unlink(tmp_path)
 
-    if not args.apply:
-        print("\ndry run -- nothing written. Re-run with --apply to write.")
+    if not apply_it:
+        print("dry run -- nothing written. Re-run with --apply to write.")
         return 0
 
-    backup = args.path + ".bak"
-    shutil.copy2(args.path, backup)
-    with open(args.path, "w", encoding="utf-8") as f:
+    backup = path + ".bak"
+    shutil.copy2(path, backup)
+    with open(path, "w", encoding="utf-8") as f:
         f.write(patched)
-    print(f"\nwritten. backup at {backup}")
-    print("Verify with the 2-step smoke test; step100001-unsharded and")
-    print("step100002-unsharded must appear.")
+    print(f"written. backup at {backup}")
     return 0
+
+
+def main() -> int:
+    scratch = os.environ.get("SCRATCH", os.path.expanduser("~"))
+    default = os.path.join(scratch, "OLMo", "olmo", "train.py")
+
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", nargs="?", default=default,
+                    help=f"olmo/train.py to patch (default: {default})")
+    ap.add_argument("--apply", action="store_true",
+                    help="write the changes; without it this is a dry run")
+    ap.add_argument("--skip-converter", action="store_true",
+                    help="patch only olmo/train.py, leaving "
+                         "scripts/convert_olmo2_to_hf.py alone")
+    args = ap.parse_args()
+
+    # scripts/ sits beside olmo/ in the same checkout, so the converter's path
+    # follows from the trainer's rather than needing a second argument.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(args.path)))
+    converter = os.path.join(repo, "scripts", "convert_olmo2_to_hf.py")
+
+    targets = [(args.path, patch)]
+    if not args.skip_converter:
+        if os.path.isfile(converter):
+            targets.append((converter, patch_converter))
+        else:
+            print(f"note: no converter at {converter}; skipping that fix",
+                  file=sys.stderr)
+
+    rc = 0
+    for target_path, fn in targets:
+        rc = _process(target_path, fn, args.apply) or rc
+
+    if args.apply and rc == 0:
+        print("\nVerify with the 2-step smoke test: step100001-unsharded and")
+        print("step100002-unsharded must appear, and the job log must carry")
+        print("'[olmo] additional checkpoint steps from ...'.")
+    return rc
 
 
 if __name__ == "__main__":
