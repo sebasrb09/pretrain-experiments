@@ -32,6 +32,8 @@
 #   METHODS      restrict to these methods (default: every method found)
 #   SKIP_ANCHORS 1 to skip the three reference points
 #   ANCHORS_ONLY 1 to submit only the anchors
+#   SKIP_EPOCH_CKPTS 1 to evaluate only step-N/ checkpoints, skipping the
+#                end-of-run epoch-N/ duplicate each truncated cell writes
 #   CELL_SCRIPT  site wrapper to submit (default: ASC if internal/asc/env.sh
 #                and $SCRATCH/$DATA are present, else the uwiki one)
 #   TIME         walltime per eval job (default: 12:00:00)
@@ -124,7 +126,24 @@ if [ "$ANCHORS_ONLY" != "1" ]; then
       # --checkpoint-every-n-steps (default 2000) as step-N/, so a cell holds a
       # trajectory rather than a single end state. epoch-N/ is still accepted so
       # older trees keep working.
-      ckpts="$(ls -d "$cell_dir"/step-* "$cell_dir"/epoch-* 2>/dev/null || true)"
+      # SKIP_EPOCH_CKPTS=1 drops epoch-N/ from the fan-out.
+      #
+      # Every driver writes a final epoch-N checkpoint when the run ends --
+      # `epoch % checkpoint_every_n_epochs == 0 or epoch == args.epochs`, plus
+      # `or stopped` in rmu.py -- so any cell truncated by --max-steps emits one
+      # epoch-N that duplicates its last step-N. A 14-cell sweep therefore queues
+      # 14 eval jobs re-measuring models already measured.
+      #
+      # They are wasteful, not harmful: export_results.py globs only step-*, and
+      # aggregate_pareto.py's checkpoint_step() refuses to place an epoch
+      # checkpoint without trainer state on the x-axis rather than guessing from
+      # the directory name. Leave it unset for older trees that have only
+      # epoch-N/ checkpoints, where dropping them would evaluate nothing.
+      if [ "${SKIP_EPOCH_CKPTS:-0}" = "1" ]; then
+        ckpts="$(ls -d "$cell_dir"/step-* 2>/dev/null || true)"
+      else
+        ckpts="$(ls -d "$cell_dir"/step-* "$cell_dir"/epoch-* 2>/dev/null || true)"
+      fi
       if [ -z "$ckpts" ]; then
         echo "  [skip] $cell -- no checkpoint yet"
         n_skip=$((n_skip + 1))
