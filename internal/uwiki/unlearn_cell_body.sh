@@ -124,6 +124,15 @@ REVISION="${REVISION:-}"
 # moments instead, which costs the first few hundred steps to rebuilding
 # second-moment estimates the pretraining run already had.
 RESUME_OPTIM="${RESUME_OPTIM-auto}"
+# RESUME_OPTIM=none is an EXPLICIT request for zeroed moments, and it exists
+# because an empty value cannot be forwarded reliably. sbatch --export carries
+# only non-empty VAR=VALUE pairs, so `RESUME_OPTIM=` reaches the job through
+# --export=ALL alone; if that ever fails to propagate, the default "auto" takes
+# over and downloads optim.pt from the CONTINUOUS checkpoint. Pairing those
+# moments with the DECAYED release (sbordt/OLMo-2-1B-Exp@main, which ships no
+# optimizer state at all) is silently wrong -- the run trains and reports
+# nothing unusual. "none" is a non-empty token, so it always survives the trip.
+[ "$RESUME_OPTIM" = "none" ] && RESUME_OPTIM=""
 if [ "$RESUME_OPTIM" = "auto" ]; then
   RESUME_OPTIM="$(python -c "
 from huggingface_hub import hf_hub_download
