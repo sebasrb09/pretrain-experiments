@@ -653,12 +653,69 @@ def build_lr_schedule(optimizer, total_steps: int, kind: str = "constant"):
 
     kind="linear" gives linear decay to zero over total_steps, for runs that
     should finish rather than be truncated mid-trajectory.
+
+    kind="warmup" and kind="warmup-cooldown" are the P2 schedule ablation:
+    whether shaping the rate widens a method's usable window, only shifts it,
+    or does nothing.
     """
     if kind == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
     if kind == "linear":
         return build_linear_decay_schedule(optimizer, total_steps)
-    raise ValueError(f"unknown lr schedule {kind!r}; use constant or linear")
+    if kind in ("warmup", "warmup-cooldown"):
+        return build_warmup_cooldown_schedule(
+            optimizer, total_steps, cooldown=(kind == "warmup-cooldown")
+        )
+    raise ValueError(
+        f"unknown lr schedule {kind!r}; use constant, linear, warmup or "
+        "warmup-cooldown"
+    )
+
+
+# Every knob in this ablation is a FRACTION of total_steps, never an absolute
+# step count. The usable window of every method on the Pareto plot is 5-16
+# optimizer steps (findings SS12), so a warmup expressed in steps -- the usual
+# 100 or 2000 -- would be longer than the entire run it is meant to shape.
+WARMUP_FRAC = 0.20
+COOLDOWN_FRAC = 0.50
+INIT_FRAC = 0.01
+
+
+def build_warmup_cooldown_schedule(optimizer, total_steps: int, cooldown: bool = True,
+                                   warmup_frac: float = WARMUP_FRAC,
+                                   cooldown_frac: float = COOLDOWN_FRAC,
+                                   init_frac: float = INIT_FRAC):
+    """Linear warmup to the peak LR, hold, then optionally cool down to zero.
+
+    Starts at `init_frac` of the peak rate (1%, matching how OLMo-2 itself
+    warms up) and reaches the peak after `warmup_frac` of the run. With
+    cooldown, decays linearly to zero over the last `cooldown_frac`.
+
+    The warmup is clamped to at least one step, so a 5-step run still gets a
+    real ramp rather than silently becoming constant-LR -- which would make the
+    ablation's "warmup" arm identical to its control and look like a null
+    result.
+    """
+    if total_steps <= 0:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+
+    warmup_steps = max(1, int(round(warmup_frac * total_steps)))
+    cooldown_steps = max(1, int(round(cooldown_frac * total_steps)))
+    # Where the decay begins. Never before the warmup has finished, or the two
+    # phases overlap and the peak rate is never actually reached.
+    cooldown_start = max(warmup_steps, total_steps - cooldown_steps)
+
+    def factor(step):
+        if step < warmup_steps:
+            return init_frac + (1.0 - init_frac) * (step / float(warmup_steps))
+        if cooldown and step >= cooldown_start:
+            remaining = total_steps - cooldown_start
+            if remaining <= 0:
+                return 0.0
+            return max(0.0, (total_steps - step) / float(remaining))
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
 def build_linear_decay_schedule(optimizer, total_steps: int):

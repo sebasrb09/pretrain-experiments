@@ -198,8 +198,12 @@ EXPORTS="ALL,RUN_TAG=${RUN_TAG}"
 # CKPT_STEPS does not belong here at all: it reaches the job through
 # --export=ALL, which propagates the submitting environment verbatim and is
 # comma-safe. The same goes for any future list-valued variable.
-# KEEP_CHECKPOINTS and NO_TRAINER_STATE are single tokens, so they are safe.
-for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR RMU_LAYER RMU_ALPHA RMU_STEPS RMU_NLAYERS RETAIN_WEIGHT OUTPUT_ROOT KEEP_CHECKPOINTS NO_TRAINER_STATE; do
+# KEEP_CHECKPOINTS, NO_TRAINER_STATE and LR_SCHEDULE are single tokens, so they
+# are safe. LR_SCHEDULE is the P2 ablation knob (constant | linear | warmup |
+# warmup-cooldown); unlearn_cell_body.sh forwards it as --lr-schedule. Without
+# it listed here the cell would fall back to the driver default and a scheduled
+# arm would be indistinguishable from its own control.
+for var in TOTAL_BATCH MICRO_BATCH EPOCHS MAX_STEPS HARD_STEP_CAP DTYPE FROZEN_DTYPE GRAD_CKPT MODEL REVISION OLMO_CONFIG START_STEP FORGET_EXPS SEED MAX_SEQ_LEN LR LR_SCHEDULE RMU_LAYER RMU_ALPHA RMU_STEPS RMU_NLAYERS RETAIN_WEIGHT OUTPUT_ROOT KEEP_CHECKPOINTS NO_TRAINER_STATE; do
   case "${!var:-}" in *,*)
     echo "ERROR: $var contains a comma; --export cannot carry it. Pass it via the environment (--export=ALL handles it) instead of listing it here." >&2
     exit 1 ;;

@@ -181,9 +181,10 @@ def main():
                         default=OLMO2_1B_WEIGHT_DECAY,
                         help="Matched to the pretraining run; the embedding "
                              "matrix is excluded from decay automatically.")
-    parser.add_argument("--lr-schedule", choices=("constant", "linear"),
+    parser.add_argument("--lr-schedule",
+                        choices=("constant", "linear", "warmup", "warmup-cooldown"),
                         default="constant",
-                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps.")
+                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
     parser.add_argument("--auto-resume", dest="auto_resume",
                         action="store_true", default=True,
                         help="Resume from the highest step-N checkpoint in --output-dir that carries a trainer_state.pt. On by default: a 10k-step cell outlives the 72h QOS ceiling, so runs are expected to be chained. Resuming is always logged, never silent.")

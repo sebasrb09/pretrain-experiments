@@ -403,6 +403,20 @@ if [ -n "${CKPT_STEPS:-}" ]; then
   COMMON_ARGS+=(--checkpoint-steps "$CKPT_STEPS")
 fi
 
+# LR_SCHEDULE shapes the rate: constant (the driver default, and what every run
+# on the Pareto plot used), linear, warmup, warmup-cooldown. This is the P2
+# ablation knob -- until it existed the cell script never passed --lr-schedule at
+# all, so "every run is constant-LR" was true by omission rather than by choice.
+#
+# All eight methods route through the six drivers that accept it (gradient-ascent,
+# wga and satimp all use reweighted_ga), so no method needs an exception here.
+#
+# Unlike CKPT_STEPS this is a single token, so it is safe to name in the
+# launcher's --export list.
+if [ -n "${LR_SCHEDULE:-}" ]; then
+  COMMON_ARGS+=(--lr-schedule "$LR_SCHEDULE")
+fi
+
 # ce_u.py takes --batch-size; every other driver takes --forget-batch-size.
 if [ "$METHOD" = "ce-u" ]; then
   COMMON_ARGS+=(--batch-size "$MICRO_BATCH")
