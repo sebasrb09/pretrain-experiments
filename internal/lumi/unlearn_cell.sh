@@ -75,7 +75,7 @@
 # EPOCHS, MAX_STEPS, HARD_STEP_CAP, MODEL, REVISION, FORGET_EXPS, LR,
 # LR_SCHEDULE, DTYPE, RMU_LAYER, RETAIN_WEIGHT, KEEP_CHECKPOINTS, ...) are
 # documented in internal/uwiki/unlearn_cell_body.sh. Site-level vars
-# (PE_PROJECT, PE_PROJECT_DIR, PE_SCRATCH, PE_REPO, PE_LUMI_STACK,
+# (PE_PROJECT, PE_WORK, PE_REPO, PE_PROJECT_DIR, PE_LUMI_STACK,
 # PE_TORCH_MOD, HF_HOME, OUTPUT_ROOT, OLMO_CONFIG) are documented in
 # internal/lumi/env.sh.
 
@@ -90,7 +90,7 @@ find_repo () {
   local c
   for c in "${PE_REPO:-}" \
            "${SLURM_SUBMIT_DIR:-}" \
-           "/project/${PE_PROJECT:-project_465003383}/${USER}/pretrain-experiments" \
+           "${PE_WORK:-/scratch/${PE_PROJECT:-project_465003383}/unlearning_baselines}/pretrain-experiments" \
            "$PWD"; do
     if [ -n "$c" ] && [ -f "$c/internal/lumi/env.sh" ]; then
       echo "$c"; return 0
