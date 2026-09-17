@@ -54,6 +54,7 @@ from collections import defaultdict
 # that does not record a field leaves it blank rather than failing the row.
 FIELDS = [
     "run_tag", "method", "knob", "knob_value", "cell_dir", "config_file",
+    "method_label",
     "retain_loss_weight", "model", "revision", "learning_rate",
     "beta1", "beta2", "beta", "gamma", "steering_coefficient", "alpha",
     "max_steps", "epochs", "seed", "dtype", "lr_schedule",
@@ -114,7 +115,19 @@ def main():
         row = {k: "" for k in FIELDS}
         row.update(run_tag=tag, method=method, knob=knob, knob_value=value,
                    cell_dir=cell, config_file=os.path.basename(cfg))
+        # The driver's own "method" is its MODULE name -- ce_u.py records
+        # "ce_u", grad_diff.py "grad_diff" -- while the sweep tables and the
+        # output path use the dispatch name ("ce-u", "grad-diff"). Letting the
+        # JSON overwrite the path-derived identity silently breaks the join to
+        # results_cells.csv for exactly those methods, which then look like
+        # cells with no config at all. Keep the path's version as the key and
+        # carry the driver's label separately.
+        IDENTITY = {"run_tag", "method", "knob", "knob_value",
+                    "cell_dir", "config_file"}
+        row["method_label"] = d.get("method", "")
         for k in FIELDS:
+            if k in IDENTITY:
+                continue
             if k in d and d[k] is not None:
                 row[k] = d[k]
         # grad-diff's lambda IS its retain weight, recorded under the generic
@@ -155,12 +168,23 @@ def main():
     for r in rows:
         by[(r["run_tag"], r["method"])].add(str(r["retain_loss_weight"]))
         models[(r["run_tag"], r["method"])].add(f"{r['model']}@{r['revision'] or 'main'}")
+    # grad-diff is the deliberate exception: its lambda IS the retain weight
+    # (unlearn_cell_body.sh passes --retain-loss-weight "$VALUE"), so a lambda
+    # sweep MUST vary retain_loss_weight across a tag's cells. Flagging that is
+    # a false positive, and a checker that cries wolf is one people stop
+    # reading -- which is how the real mixed-retain tags got missed.
+    GRAD_DIFF = {"grad-diff", "grad_diff"}
     for k in sorted(by):
         vals = sorted(by[k])
-        flag = "  <<< INCONSISTENT" if len(vals) > 1 else ""
+        if len(vals) > 1 and k[1] in GRAD_DIFF:
+            flag = "  (lambda IS the retain weight -- expected)"
+        elif len(vals) > 1:
+            flag = "  <<< INCONSISTENT"
+        else:
+            flag = ""
         print(f"  {k[0]:<34}{k[1]:<17}retain={','.join(vals)}{flag}")
 
-    incons = [k for k in by if len(by[k]) > 1]
+    incons = [k for k in by if len(by[k]) > 1 and k[1] not in GRAD_DIFF]
     multi_model = [k for k in models if len(models[k]) > 1]
     print("\n" + "=" * 92)
     print("FLAGS")
