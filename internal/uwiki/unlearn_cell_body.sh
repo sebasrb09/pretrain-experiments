@@ -481,6 +481,22 @@ else
 fi
 
 if [ "$USES_RETAIN" -eq 1 ]; then
+  # Fail here rather than inside the driver. build_olmo_retain_dataset opens the
+  # config only AFTER the model is on the GPU (grad_diff.py:305), so a missing or
+  # not-yet-built config costs a full 2.7B load -- and with CHAIN=N every link
+  # repeats that, because the chain depends with afterany precisely so a timeout
+  # is survived. This check is cheap and runs before any python starts.
+  if [ ! -f "$OLMO_CONFIG" ]; then
+    echo "ERROR: retain-carrying method '$METHOD' needs an OLMo config, and" >&2
+    echo "       OLMO_CONFIG does not point at a file:" >&2
+    echo "         $OLMO_CONFIG" >&2
+    echo "       If this is a materialized retain slice, the build has not" >&2
+    echo "       finished (or failed) -- it must report 'Wrote:' with all three" >&2
+    echo "       of retain_tokens.npy, retain-config.yaml, build-info.yaml" >&2
+    echo "       BEFORE any retain cell is submitted. See" >&2
+    echo "       internal/uwiki/build_retain_slice.py." >&2
+    exit 1
+  fi
   COMMON_ARGS+=(--retain-batch-size "$MICRO_BATCH"
                 --olmo-config "$OLMO_CONFIG"
                 --retain-start-step "$START_STEP")
