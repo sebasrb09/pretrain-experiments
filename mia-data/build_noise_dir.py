@@ -43,6 +43,47 @@ import torch
 from datasets import load_dataset
 
 
+class _ParquetRows:
+    """The slice of datasets.Dataset this script uses: len, column_names, iter."""
+
+    def __init__(self, table):
+        self._table = table
+        self.column_names = list(table.column_names)
+
+    def __len__(self):
+        return self._table.num_rows
+
+    def __iter__(self):
+        # to_pylist() over the whole table would materialise every noise array
+        # at once -- at 4096 x embed_dim float32 per row that is tens of GB.
+        # Batching keeps the peak near one batch.
+        for batch in self._table.to_batches(max_chunksize=64):
+            yield from batch.to_pylist()
+
+
+def _load_parquet(repo, revision, split):
+    """Read the dataset's parquet files without going through `datasets`."""
+    import os
+    import pyarrow.parquet as pq
+    from huggingface_hub import snapshot_download
+
+    local = snapshot_download(repo_id=repo, repo_type="dataset", revision=revision,
+                              allow_patterns=["*.parquet", "*.json"])
+    files = []
+    for root, _dirs, names in os.walk(local):
+        files += [os.path.join(root, n) for n in names if n.endswith(".parquet")]
+    files.sort()
+    if split:
+        # Parquet shards are conventionally named <split>-00000-of-0000N.parquet.
+        # Fall back to everything if the naming does not follow that.
+        chosen = [f for f in files if split in os.path.basename(f)]
+        files = chosen or files
+    if not files:
+        raise SystemExit(f"no parquet files found under {local}")
+    print(f"  {len(files)} parquet file(s) under {local}")
+    return _ParquetRows(pq.ParquetDataset(files).read())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True,
@@ -65,7 +106,22 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading dataset {args.repo} (revision={args.revision}, split={args.split}) ...")
-    ds = load_dataset(args.repo, revision=args.revision, split=args.split)
+    try:
+        ds = load_dataset(args.repo, revision=args.revision, split=args.split)
+    except ValueError as exc:
+        # `datasets` refuses to parse a feature type it does not know. The 2.7B
+        # NoiseVectors repo declares `List`, which arrived in datasets 4.0, so an
+        # older datasets dies with "Feature type 'List' not found".
+        #
+        # Upgrading the library is the obvious fix and the wrong one here: on a
+        # shared container it is also in use by training jobs that may be
+        # running. The parquet files carry the four columns this script needs,
+        # so read them directly and skip feature parsing altogether.
+        if "Feature type" not in str(exc):
+            raise
+        print(f"  load_dataset failed ({exc})")
+        print("  falling back to reading the parquet files directly")
+        ds = _load_parquet(args.repo, args.revision, args.split)
     print(f"  {len(ds)} rows; columns: {ds.column_names}")
 
     noise_dtype = torch.bfloat16 if args.noise_dtype == "bfloat16" else torch.float32

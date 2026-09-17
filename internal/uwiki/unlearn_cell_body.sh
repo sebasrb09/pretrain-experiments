@@ -497,6 +497,13 @@ echo "  site:          ${PE_SITE:-unknown}"
 echo "  module:        $MODULE"
 echo "  model:         $MODEL @ ${REVISION:-local}"
 echo "  resume optim:  ${RESUME_OPTIM:-none (zeroed moments)}"
+# The two settings that decide whether a cell fits in memory, and the one that
+# decides how much of it is fp32. A 2.7B cell OOMed on a 64 GB GCD with no way
+# to tell from the log whether it had actually received MICRO_BATCH=1 and
+# GRAD_CKPT=1 or fallen back to the retain-method defaults (2 and 0), which
+# need roughly twice the memory.
+echo "  micro batch:   $MICRO_BATCH  (accum to TOTAL_BATCH=$TOTAL_BATCH)"
+echo "  grad ckpt:     $GRAD_CKPT    dtype: $DTYPE"
 echo "  forget set:    ${FORGET_EXPS:-<library default: full minus iid-replacements-*>}"
 echo "  budget:        total_batch=$TOTAL_BATCH (forget $FORGET_EFF + retain $RETAIN_EFF)"
 echo "                 micro=$MICRO_BATCH accum=$ACCUM epochs=$EPOCHS max_steps=$MAX_STEPS"

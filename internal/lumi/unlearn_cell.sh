@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=7
 #SBATCH --gpus-per-node=1
-#SBATCH --mem=60G
+#SBATCH --mem=120G
 #SBATCH --time=24:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
@@ -37,10 +37,23 @@
 #                            cores but the first core of each of the 8 CCDs is
 #                            reserved for the OS ('low-noise mode'), leaving 56.
 #                            Asking for 8 per GCD will not pack 8 cells a node.
-#   --mem=60G                the per-GCD share of usable host RAM. Note /tmp is
-#                            a RAM disk and counts against this -- the MIOpen
-#                            cache env.sh puts there is small, but do not write
-#                            checkpoints to /tmp.
+#   --mem=120G               NOT the per-GCD share (60G). The optimizer resume
+#                            needs it: load_olmo_optim_state uses
+#                            map_location="cpu", so the whole 21.6 GB optim.pt
+#                            lands in HOST ram, remap_olmo_optim_state builds a
+#                            second remapped copy through map_olmo_to_hf's
+#                            splits, and the HF weights add 10.8 GB -- roughly
+#                            54 GB before training starts, against a 60 GB
+#                            share. That is a host OOM (a bare "Killed" with no
+#                            Python traceback), not a GPU one.
+#                            Note /tmp is a RAM disk and counts against this --
+#                            the MIOpen cache env.sh puts there is small, but do
+#                            not write checkpoints to /tmp.
+#                            COST: on small-g, asking for more than the per-GCD
+#                            share of a resource can bill as more than one GCD.
+#                            Worth confirming against `lumi-allocations` before
+#                            launching a grid; for single smoke cells it is
+#                            noise.
 #
 # For a full node instead: --partition=standard-g --gpus-per-node=8
 # --exclusive, which bills all 8 GCDs whether or not you use them.
@@ -109,6 +122,17 @@ export PE_REPO
 
 # shellcheck disable=SC1091
 source "${PE_REPO}/internal/lumi/env.sh"
+
+# unlearn_cell_body.sh sets PYTORCH_CUDA_ALLOC_CONF, which ROCm builds of
+# PyTorch do not necessarily honour -- several versions read the HIP-named
+# variable instead and silently ignore the CUDA one. Set both, so the
+# expandable-segments allocator actually applies here.
+#
+# This matters more on LUMI than anywhere else: 2.7B sits within a few GB of a
+# 64 GB GCD, so allocator fragmentation alone is enough to turn a fit into an
+# OOM.
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # ---------------------------------------------------------------------------
 # 2.7B is the model this site exists to run, so the size lives here rather than
