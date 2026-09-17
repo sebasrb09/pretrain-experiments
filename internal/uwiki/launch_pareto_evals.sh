@@ -72,6 +72,13 @@ ANCHORS_ONLY="${ANCHORS_ONLY:-0}"
 # that is where the sweep currently runs.
 if [ -n "${CELL_SCRIPT:-}" ]; then
   :
+# /appl/local/containers exists only on LUMI and needs no modules loaded to
+# test, so it identifies the site at SUBMIT time. Without this branch LUMI fell
+# through to the u:wiki default and every job was rejected with
+# "invalid partition specified: p_datamining" -- u:wiki's partition, on a
+# cluster that has never heard of it.
+elif [ -d /appl/local/containers ] && [ -f internal/lumi/env.sh ]; then
+  CELL_SCRIPT="internal/lumi/eval_pareto_cell.sh"
 elif [ -f internal/asc/env.sh ] && [ -n "${SCRATCH:-}${DATA:-}" ]; then
   CELL_SCRIPT="internal/asc/eval_pareto_cell.sh"
 else

@@ -62,6 +62,12 @@ set -o pipefail
 # fixed; an explicit CELL_SCRIPT= still overrides.
 if [ -n "${CELL_SCRIPT:-}" ]; then
   :
+# /appl/local/containers exists only on LUMI and needs no modules loaded to
+# test, so it identifies the site at SUBMIT time. Without this branch LUMI fell
+# through to the u:wiki default and every job was rejected with
+# "invalid partition specified: p_datamining".
+elif [ -d /appl/local/containers ] && [ -f internal/lumi/env.sh ]; then
+  CELL_SCRIPT="internal/lumi/unlearn_cell.sh"
 elif [ -f internal/asc/env.sh ] && [ -n "${SCRATCH:-}${DATA:-}" ]; then
   CELL_SCRIPT="internal/asc/unlearn_cell_1B.sh"
 else
