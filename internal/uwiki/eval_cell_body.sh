@@ -77,8 +77,20 @@ else
       exit 1; }
     CKPT="$CELL_DIR/epoch-$LAST_EPOCH"
   fi
-  [ -f "$CKPT/model.safetensors" ] || [ -f "$CKPT/pytorch_model.bin" ] || {
-    echo "ERROR: $CKPT holds no model weights" >&2; exit 1; }
+  # A checkpoint larger than transformers' max_shard_size is written as
+  # model-0000N-of-0000M.safetensors plus model.safetensors.index.json, with NO
+  # single model.safetensors. 1B in fp32 is 5.9 GB and stays under the
+  # threshold, so this guard passed for all 834 1B checkpoints; 2.7B is 10.8 GB
+  # and shards, which made perfectly good checkpoints look empty and rejected
+  # the entire 2.7B arm. from_pretrained loads either layout from a directory,
+  # so accept both -- and on failure say what was sought and what is present,
+  # because "holds no model weights" on a populated directory is a bad message.
+  [ -f "$CKPT/model.safetensors" ] || [ -f "$CKPT/model.safetensors.index.json" ] || [ -f "$CKPT/pytorch_model.bin" ] || [ -f "$CKPT/pytorch_model.bin.index.json" ] || {
+    echo "ERROR: $CKPT holds no model weights" >&2
+    echo "       Sought model.safetensors, model.safetensors.index.json," >&2
+    echo "       pytorch_model.bin, pytorch_model.bin.index.json. Present:" >&2
+    ls -la "$CKPT" >&2
+    exit 1; }
   TARGET="$CKPT"
   EVAL_OUT="${EVAL_OUT:-$CELL_DIR/evals}"
   LABEL="$(basename "$(dirname "$CELL_DIR")")/$(basename "$CELL_DIR")"
