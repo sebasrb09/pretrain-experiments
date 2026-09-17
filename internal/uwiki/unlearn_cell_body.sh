@@ -285,7 +285,12 @@ case "$METHOD" in
   satimp)
     MODULE="pretrain_experiments.reweighted_ga"; USES_RETAIN=1; KNOB="beta1"
     METHOD_EPOCHS=5
-    METHOD_ARGS+=(--method-label satimp --beta1 "$VALUE" --beta2 1.0
+    # beta2 defaults to the paper's 1.0, so nothing changes for existing runs,
+    # but it is now sweepable: SatImp's published ablation lives in its GitHub
+    # repo rather than the paper, and beta2 = 0 reduces the weight to p^beta1,
+    # which is exactly WGA -- so the sweep also ties the two methods together.
+    METHOD_ARGS+=(--method-label satimp --beta1 "$VALUE"
+                  --beta2 "${SATIMP_BETA2:-1.0}"
                   --retain-loss-weight "${RETAIN_WEIGHT:-1.0}" "${LR_ARGS[@]}")
     ;;
   grad-diff)
@@ -309,7 +314,12 @@ case "$METHOD" in
   simnpo)
     MODULE="pretrain_experiments.simnpo"; USES_RETAIN=1; KNOB="beta"
     METHOD_EPOCHS=10
-    METHOD_ARGS+=(--beta "$VALUE" --gamma 0.0 --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
+    # gamma defaults to SimNPO's published 0.0. HYPER-PARAMS.md:349 already
+    # specifies the sweep gamma in {0, 0.5, 1.0, 2.0} at the winning beta, with
+    # alpha_retain pinned at 1.0 so the two do not confound -- it was written
+    # down and never runnable, because this line hardcoded the value.
+    METHOD_ARGS+=(--beta "$VALUE" --gamma "${SIMNPO_GAMMA:-0.0}"
+                  --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
                   "${LR_ARGS[@]}")
     ;;
   rmu)
