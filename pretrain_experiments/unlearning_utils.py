@@ -578,7 +578,32 @@ def save_trainer_state(ckpt_dir, optimizer, *, optimizer_step, micro_step, epoch
         "cuda_rng": (torch.cuda.get_rng_state_all()
                      if torch.cuda.is_available() else None),
     }
-    torch.save(payload, os.path.join(str(ckpt_dir), TRAINER_STATE_FILE))
+    # Write to a sibling temp file and rename, rather than straight to the
+    # final path. A bare torch.save leaves a TRUNCATED trainer_state.pt behind
+    # when the write fails part-way -- which is what a full disk does, and what
+    # it did here:
+    #     RuntimeError: [enforce fail at inline_container.cc:672]
+    #     unexpected pos 2684755136 vs 2684755028
+    # That half-file is worse than no file at all, because
+    # find_latest_checkpoint selects the highest step-N that HAS a state file
+    # without validating it, so the next link of a CHAIN resumes from garbage
+    # instead of failing cleanly or falling back to an earlier checkpoint.
+    #
+    # rename(2) within a directory is atomic, so the final path only ever holds
+    # a complete file. On failure the partial temp file is removed and the
+    # exception propagates -- the run still dies, but it dies without leaving a
+    # booby trap for its own resume.
+    final = os.path.join(str(ckpt_dir), TRAINER_STATE_FILE)
+    tmp = final + ".partial"
+    try:
+        torch.save(payload, tmp)
+        os.replace(tmp, final)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def find_latest_checkpoint(output_dir):

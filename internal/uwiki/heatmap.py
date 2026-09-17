@@ -105,6 +105,14 @@ NUMERIC = ("lr", "knob_value", "step", "fk_prob", "fk_forgot", "il_ppl",
            "il_forgot", "c4_ppl", "c4_delta_pct", "wm_full", "wm_q4",
            "wm_removed")
 
+# Config fields merged in from results_configs.csv. These become usable as axes
+# and as filters, which is the only way to plot a method on the plane its own
+# two hyperparameters span -- satimp's beta1 x retain_loss_weight, say, rather
+# than knob x learning rate.
+CONFIG_NUMERIC = ("retain_loss_weight", "beta1", "beta2", "beta", "gamma",
+                  "steering_coefficient", "alpha", "learning_rate",
+                  "max_steps", "epochs", "seed")
+
 
 def fnum(s):
     """Float, or None. '' and 'nan' are missing, not zero."""
@@ -134,6 +142,59 @@ def load_cells(exports_dir, tags=None, methods=None, variant=None):
                 r["_" + k] = fnum(r.get(k))
             rows.append(r)
     return rows
+
+
+def load_configs(exports_dir):
+    """(run_tag, method, knob_value) -> that cell's config record.
+
+    Merged into every row so the CONFIGURED parameters -- retain_loss_weight,
+    beta1, beta2, gamma, alpha, steering_coefficient -- can be used as axes and
+    filters. results_cells.csv carries only the swept knob and the learning
+    rate, which is why the first version of this tool could plot knob x lr and
+    nothing else, and why a two-hyperparameter method like satimp could not be
+    shown on the plane its two hyperparameters actually span.
+
+    Method names are normalised because drivers record their MODULE name
+    ("ce_u", "grad_diff") while the sweep tables use the dispatch name
+    ("ce-u", "grad-diff"), so a naive join silently misses those two.
+    """
+    path = os.path.join(exports_dir, "results_configs.csv")
+    if not os.path.isfile(path):
+        return None
+    out = {}
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            key = (r.get("run_tag", ""),
+                   (r.get("method") or "").replace("_", "-"),
+                   (r.get("knob_value") or ""))
+            out[key] = r
+    return out
+
+
+def load_retain(exports_dir):
+    """(run_tag, method) -> retain_loss_weight, from audit_configs.py's CSV.
+
+    The retain weight is NOT in results_cells.csv, and it is the field that
+    decides whether two cells may share a plane at all. Reading it from the
+    cells' own config records is the only reliable route: tag names do not
+    carry it (`1B-p3-satimp-b10.0` has no -fo suffix and is forget-only), and
+    one tag can hold different weights for different methods.
+
+    Method names are normalised because drivers record their MODULE name
+    ("ce_u", "grad_diff") while the sweep tables use the dispatch name
+    ("ce-u", "grad-diff"), so a naive join silently misses those two.
+    """
+    path = os.path.join(exports_dir, "results_configs.csv")
+    if not os.path.isfile(path):
+        return None
+    out = {}
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            key = (r.get("run_tag", ""), (r.get("method") or "").replace("_", "-"))
+            w = (r.get("retain_loss_weight") or "").strip()
+            if w:
+                out.setdefault(key, set()).add(w)
+    return {k: sorted(v) for k, v in out.items()}
 
 
 def load_endpoints(exports_dir):
@@ -204,6 +265,12 @@ def main():
     ap.add_argument("--tags", action="append",
                     help="glob on run_tag; repeatable")
     ap.add_argument("--variant", help="exact match on the variant column")
+    ap.add_argument("--retain", default="any",
+                    help="filter on retain_loss_weight: 'any', 'on' (1.0), "
+                         "'off' (0.0), or an EXACT value such as 0.01. "
+                         "Intermediate weights are real -- SatImp's alpha sweep "
+                         "used 0.01 and 0.1 -- and an on/off filter drops them "
+                         "silently, which is why this is not a fixed choice list.")
 
     ap.add_argument("--x", default="lr", help="column for the x axis")
     ap.add_argument("--y", default="knob_value", help="column for the y axis")
@@ -264,6 +331,58 @@ def main():
                       a.variant)
     if not rows:
         sys.exit("ERROR: no rows matched. Check --exports / --method / --tags.")
+
+    # --- merge the configured parameters onto every row ---------------------
+    # results_cells.csv records only the swept knob and the learning rate; the
+    # rest of the configuration lives in results_configs.csv. Merging makes
+    # retain_loss_weight, beta1, beta2, gamma and alpha available as AXES, so a
+    # method with two hyperparameters can be plotted on the plane they span.
+    cmap = load_configs(a.exports)
+    if cmap:
+        merged = 0
+        for r in rows:
+            c = cmap.get((r.get("run_tag", ""),
+                          (r.get("method") or "").replace("_", "-"),
+                          r.get("knob_value", "")))
+            if not c:
+                continue
+            merged += 1
+            for k, v in c.items():
+                # Never let a config field shadow the cell's own measurements,
+                # or the identity columns the join was keyed on.
+                if k in r:
+                    continue
+                r[k] = v
+                if k in CONFIG_NUMERIC:
+                    r["_" + k] = fnum(v)
+        if merged < len(rows):
+            print(f"note: {len(rows) - merged} of {len(rows)} row(s) have no "
+                  "config record; config-derived axes and --retain drop them.",
+                  file=sys.stderr)
+
+    # --- retain filter ------------------------------------------------------
+    if a.retain != "any":
+        if not cmap:
+            sys.exit("ERROR: --retain needs results_configs.csv beside "
+                     f"results_cells.csv in {a.exports!r}. Build it with:\n"
+                     "       python internal/uwiki/audit_configs.py "
+                     "--output-root <sweep root> --out <exports dir>")
+        want = {"on": "1.0", "off": "0.0"}.get(a.retain, a.retain)
+        wantf = fnum(want)
+        if wantf is None:
+            sys.exit(f"ERROR: --retain {a.retain!r} must be 'any', 'on', 'off', "
+                     "or an exact numeric weight such as 0.01")
+        # Compared as FLOATS: the CSV may hold 0.01, 0.010 or 1e-2 for one
+        # value, and a string match would silently return an empty plane.
+        rows = [r for r in rows
+                if r.get("_retain_loss_weight") is not None
+                and abs(r["_retain_loss_weight"] - wantf) < 1e-12]
+        if not rows:
+            sys.exit(f"ERROR: no cells with retain_loss_weight == {wantf:g}. "
+                     "Methods whose published form has no retain term (ce-u, "
+                     "gradient-ascent, wga) are always empty for a nonzero "
+                     "value. Values actually present are listed by:\n"
+                     "       python internal/uwiki/audit_configs.py --print")
     if col not in rows[0]:
         sys.exit(f"ERROR: no column {col!r}. Available: "
                  + ", ".join(k for k in rows[0] if not k.startswith('_')))
