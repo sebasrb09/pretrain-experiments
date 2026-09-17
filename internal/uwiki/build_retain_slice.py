@@ -78,8 +78,14 @@ def main():
     # Defaults follow the ASC/MUSICA split (internal/asc/env.sh): the OLMo clone
     # is code and lives on $SCRATCH; the slice is data and lives on $DATA, which
     # is permanent. Falls back to $HOME when neither is set.
-    _scratch = os.environ.get("SCRATCH") or os.path.expanduser("~")
-    _data = os.environ.get("DATA") or os.path.expanduser("~/pretrain-experiments")
+    # Site roots differ: ASC/u:wiki split code on $SCRATCH from data on $DATA,
+    # while LUMI puts both under one shared $PE_WORK on scratch and defines
+    # NEITHER of those variables. Without the PE_* fallbacks this resolved to
+    # $HOME on LUMI and pointed at /users/<me>/OLMo/... , which does not exist.
+    _work = os.environ.get("PE_WORK")
+    _scratch = os.environ.get("SCRATCH") or _work or os.path.expanduser("~")
+    _data = (os.environ.get("DATA") or os.environ.get("PE_DATA") or _work
+             or os.path.expanduser("~/pretrain-experiments"))
     parser.add_argument("--olmo-config", type=str,
                         default=os.environ.get(
                             "OLMO_CONFIG",
