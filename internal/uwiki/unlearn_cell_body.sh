@@ -133,11 +133,20 @@ RESUME_OPTIM="${RESUME_OPTIM-auto}"
 # optimizer state at all) is silently wrong -- the run trains and reports
 # nothing unusual. "none" is a non-empty token, so it always survives the trip.
 [ "$RESUME_OPTIM" = "none" ] && RESUME_OPTIM=""
+# Where "auto" pulls Adam's moments from. The defaults are the 1B unsharded
+# branch -- what every run so far used -- so this changes nothing for existing
+# or already-queued jobs (this file is sourced at job runtime, not submit time).
+#
+# It MUST be overridden for any other model size. Moments are per-parameter, so
+# 2.7B's optim.pt is a different shape entirely; leaving this at the 1B default
+# while training 2.7B asks for one model's moments on another model's weights.
+OPTIM_REPO="${OPTIM_REPO:-sbordt/OLMo-2-1B-Exp-Unlearning}"
+OPTIM_REVISION="${OPTIM_REVISION:-step100000-unsharded}"
 if [ "$RESUME_OPTIM" = "auto" ]; then
   RESUME_OPTIM="$(python -c "
 from huggingface_hub import hf_hub_download
-print(hf_hub_download('sbordt/OLMo-2-1B-Exp-Unlearning', 'optim.pt',
-                      revision='step100000-unsharded'))" 2>&1)" || {
+print(hf_hub_download('${OPTIM_REPO}', 'optim.pt',
+                      revision='${OPTIM_REVISION}'))" 2>&1)" || {
     echo "ERROR: could not resolve optim.pt from the hub:" >&2
     echo "$RESUME_OPTIM" | sed 's/^/       /' >&2
     echo "       Set RESUME_OPTIM=/path/to/optim.pt, or RESUME_OPTIM= to skip." >&2
