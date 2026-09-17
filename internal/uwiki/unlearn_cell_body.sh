@@ -119,6 +119,32 @@ SEED="${SEED:-42}"
 MODEL="${MODEL:-${PE_DATA:-${DATA:-$HOME}}/checkpoints/1B-Exp-Unlearning-step100000-hf}"
 REVISION="${REVISION:-}"
 
+# That default is a LOCAL directory, and PE_DATA/DATA are unset on sites other
+# than the one it was converted on -- so it silently degrades to
+# $HOME/checkpoints/... there. transformers then cannot find the directory,
+# falls through to treating the path as a Hub repo id, and dies with
+#   HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name'
+# which names the symptom and hides the cause. Fail here instead, while the
+# cause is still on screen.
+case "$MODEL" in
+  /*|./*|../*)
+    if [ ! -d "$MODEL" ]; then
+      echo "ERROR: MODEL is a local directory that does not exist:" >&2
+      echo "         $MODEL" >&2
+      echo "" >&2
+      echo "       That is this script's 1B default, which means MODEL did not" >&2
+      echo "       reach the job. Pass it explicitly, e.g. for 2.7B:" >&2
+      echo "         MODEL=sbordt/OLMo-2-2.7B-Exp-Unlearning" >&2
+      echo "         REVISION=stage1-step100000-tokens210B" >&2
+      echo "         OPTIM_REPO=sbordt/OLMo-2-2.7B-Exp-Unlearning" >&2
+      echo "         OPTIM_REVISION=step100000-unsharded" >&2
+      echo "" >&2
+      echo "       OPTIM_REPO must match the model SIZE: the default pulls 1B" >&2
+      echo "       moments, which are the wrong shape for any other model." >&2
+      exit 1
+    fi ;;
+esac
+
 # Adam moments from the same checkpoint. "auto" resolves the hub cache (no
 # download if it is already there); set RESUME_OPTIM="" to start from zeroed
 # moments instead, which costs the first few hundred steps to rebuilding
@@ -169,7 +195,9 @@ GRAD_CKPT="${GRAD_CKPT:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/pretrain-experiments/unlearning-pareto}"
 
 scontrol show job "${SLURM_JOB_ID:-}" 2>/dev/null || true
-nvidia-smi || true
+# rocm-smi on AMD (LUMI), nvidia-smi on NVIDIA (MUSICA, MeluXina, u:wiki).
+# Neither is required; this is only for the log.
+nvidia-smi 2>/dev/null || rocm-smi 2>/dev/null || echo "  (no GPU query tool on PATH)"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

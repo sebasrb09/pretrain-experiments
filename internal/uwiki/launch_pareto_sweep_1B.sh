@@ -231,6 +231,17 @@ echo "  Pareto sweep launch (1B)"
 echo "  run_tag:      $RUN_TAG"
 echo "  cell:         $CELL_SCRIPT"
 echo "  methods:      $METHODS"
+# Printed because a wrong model is otherwise invisible until a traceback deep
+# inside transformers. MODEL unset means the cell falls back to its 1B LOCAL
+# checkpoint path, which on any other site does not exist and surfaces as
+# "HFValidationError: Repo id must be in the form ..." -- naming the symptom
+# and hiding the cause. OPTIM_REPO is here for the same reason: its default is
+# 1B, and 1B moments are the wrong shape for any other model size.
+echo "  model:        ${MODEL:-<unset -> cell default: LOCAL 1B checkpoint>}"
+echo "  revision:     ${REVISION:-<none>}"
+echo "  optim:        ${OPTIM_REPO:-<unset -> default 1B>} @ ${OPTIM_REVISION:-step100000-unsharded}"
+echo "  output root:  ${OUTPUT_ROOT:-<unset -> cell default>}"
+echo "  retain:       ${RETAIN_WEIGHT:-<method default>}"
 echo "  budget:       total_batch=${TOTAL_BATCH:-512 (default)} micro=${MICRO_BATCH:-2 (default)} seq_len=${MAX_SEQ_LEN:-4096 (default)}"
 echo "                step cap=${MAX_STEPS:-${HARD_STEP_CAP:-10000}}  (1 epoch = 10249 steps, so EPOCHS is inert)"
 echo "                chain=${CHAIN} job(s) per cell"
