@@ -110,5 +110,52 @@ export PE_REPO
 # shellcheck disable=SC1091
 source "${PE_REPO}/internal/lumi/env.sh"
 
+# ---------------------------------------------------------------------------
+# 2.7B is the model this site exists to run, so the size lives here rather than
+# on every command line. All DEFAULTS -- an explicit value always wins -- so a
+# 1B cell can still be run here by passing MODEL/REVISION and the matching
+# OPTIM_* explicitly.
+#
+# These sit in the TRAINING wrapper, not in env.sh, because env.sh is also
+# sourced by internal/lumi/eval_pareto_cell.sh, and eval_cell_body.sh reads a
+# set MODEL as an explicit target that OVERRIDES the checkpoint found in the
+# cell directory. A default MODEL there would make every cell evaluation score
+# the pristine base model and report no unlearning, convincingly.
+#
+# Without these, unlearn_cell_body.sh falls back to its 1B defaults: a LOCAL
+# checkpoint path that does not exist here (surfacing as the misleading
+# "HFValidationError: Repo id must be in the form ..."), and 1B optimizer
+# moments, which are the wrong shape for 2.7B and fail silently.
+# ---------------------------------------------------------------------------
+# The HF-format branch carries safetensors, so no conversion job is needed.
+export MODEL="${MODEL:-sbordt/OLMo-2-2.7B-Exp-Unlearning}"
+export REVISION="${REVISION:-stage1-step100000-tokens210B}"
+# Adam moments live only on the OLMo-native branch, and MUST match the size.
+export OPTIM_REPO="${OPTIM_REPO:-sbordt/OLMo-2-2.7B-Exp-Unlearning}"
+export OPTIM_REVISION="${OPTIM_REVISION:-step100000-unsharded}"
+
+# A GCD is 64 GB. At 2.7B: fp32 weights 10.8 + Adam 21.6 + grads 10.8 = 43.2 GB
+# fixed, leaving ~20 GB, and activations run ~4.8 MB/token -- so micro-batch 1
+# (4096 tokens, ~19.6 GB) only fits with gradient checkpointing. The cell body
+# would otherwise default retain-carrying methods to 2, which was calibrated on
+# a 94 GB H100 and would need ~82 GB here.
+export MICRO_BATCH="${MICRO_BATCH:-1}"
+export GRAD_CKPT="${GRAD_CKPT:-1}"
+
+# The 2.7B OLMo config is NOT in OLMo/configs -- that directory holds 1B, 7B
+# and 13B only. The config the run actually used ships inside the unsharded
+# checkpoint, so take it from there (cached after the first job). Retain-carrying
+# methods hard-fail without it: reweighted_ga.py exits with
+# "--retain-loss-weight > 0 requires both --olmo-config and --retain-start-step".
+if [ -z "${OLMO_CONFIG:-}" ]; then
+  OLMO_CONFIG="$(python -c "
+from huggingface_hub import hf_hub_download
+print(hf_hub_download('${OPTIM_REPO}', 'config.yaml',
+                      revision='${OPTIM_REVISION}'))" 2>/dev/null)" || OLMO_CONFIG=""
+  [ -n "$OLMO_CONFIG" ] || echo "  WARNING: could not resolve the OLMo config;" \
+    "retain-carrying methods will fail. Check ~/.hf_token, or set OLMO_CONFIG." >&2
+fi
+export OLMO_CONFIG
+
 # shellcheck disable=SC1091
 source "${PE_REPO}/internal/uwiki/unlearn_cell_body.sh"

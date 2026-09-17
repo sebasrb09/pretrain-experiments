@@ -124,11 +124,21 @@ fi
 
 # Large and/or many-file: scratch, which has the 2M file quota.
 export HF_HOME="${HF_HOME:-${PE_WORK}/hf}"
-export OUTPUT_ROOT="${OUTPUT_ROOT:-${PE_WORK}/unlearning-pareto}"
-# OLMo is a git checkout of many thousands of files, so it belongs on scratch
-# beside the repo, never on /project's 100k-file quota.
-export OLMO_CONFIG="${OLMO_CONFIG:-${PE_WORK}/OLMo/configs/official-0425/OLMo2-1B-stage1.yaml}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-${PE_WORK}/unlearning-pareto-2.7B}"
 mkdir -p "$HF_HOME" "$OUTPUT_ROOT"
+
+# NOTE: the 2.7B model identity (MODEL, REVISION, OPTIM_REPO, OPTIM_REVISION,
+# MICRO_BATCH, GRAD_CKPT, OLMO_CONFIG) is deliberately NOT set here.
+#
+# This file is sourced by the EVAL wrapper as well as the training one, and
+# eval_cell_body.sh treats a set MODEL as "mode 2": an explicit target that
+# OVERRIDES the checkpoint found inside the cell directory. Defaulting MODEL
+# here would therefore make every cell evaluation silently score the pristine
+# base model instead of the trained one -- producing clean-looking results that
+# show no unlearning whatsoever.
+#
+# Those settings live in internal/lumi/unlearn_cell.sh, which only the training
+# path sources.
 
 # MIOpen compiles kernels at first use and caches them. LUMI's docs put this
 # cache in /tmp, which on compute nodes is a RAM disk and counts against the

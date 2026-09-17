@@ -78,7 +78,26 @@ if [ ! -f "$CELL_SCRIPT" ]; then
   exit 1
 fi
 
+# --- flags ------------------------------------------------------------------
+# DRY_RUN is still read from the environment so existing scripts keep working,
+# but a FLAG is the safer interface. An exported DRY_RUN persists in the shell
+# and silently changes every later launch until someone remembers to unset it;
+# a flag applies to exactly the command that was typed. The same hazard, with
+# an exported MODEL, once sent two cells off to train the wrong checkpoint.
+#
+#   bash internal/uwiki/launch_pareto_sweep_1B.sh --dry-run
+#   bash internal/uwiki/launch_pareto_sweep_1B.sh --go
 DRY_RUN="${DRY_RUN:-0}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run|--dry) DRY_RUN=1 ;;
+    --go|--submit)      DRY_RUN=0 ;;
+    -h|--help)          sed -n '2,50p' "$0"; exit 0 ;;
+    *) echo "ERROR: unknown argument '$1' (expected --dry-run or --go)" >&2
+       exit 2 ;;
+  esac
+  shift
+done
 # Jobs chained per cell. A 10k-step forget-only cell is ~183 h at 65.9 s/step
 # and the QOS caps a job at 72 h, so one submission cannot finish a cell.
 CHAIN="${CHAIN:-1}"
