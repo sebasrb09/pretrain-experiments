@@ -95,6 +95,13 @@ def main():
                         help="Output directory for the .pkl files")
     parser.add_argument("--chunk-size", type=int, default=1000,
                         help="Group rows by batch_idx // chunk_size (default 1000)")
+    parser.add_argument("--reader", choices=["auto", "parquet", "datasets"],
+                        default="auto",
+                        help="auto: try `datasets`, fall back to raw parquet on "
+                             "an unknown feature type. parquet: skip `datasets` "
+                             "entirely (use when its version predates the "
+                             "feature types the repo declares). datasets: never "
+                             "fall back, so the original error is visible.")
     parser.add_argument("--noise-dtype", choices=["float32", "bfloat16"],
                         default="bfloat16",
                         help="Cast noise tensors to this dtype before pickling. "
@@ -106,22 +113,35 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading dataset {args.repo} (revision={args.revision}, split={args.split}) ...")
-    try:
-        ds = load_dataset(args.repo, revision=args.revision, split=args.split)
-    except ValueError as exc:
-        # `datasets` refuses to parse a feature type it does not know. The 2.7B
-        # NoiseVectors repo declares `List`, which arrived in datasets 4.0, so an
-        # older datasets dies with "Feature type 'List' not found".
-        #
-        # Upgrading the library is the obvious fix and the wrong one here: on a
-        # shared container it is also in use by training jobs that may be
-        # running. The parquet files carry the four columns this script needs,
-        # so read them directly and skip feature parsing altogether.
-        if "Feature type" not in str(exc):
-            raise
-        print(f"  load_dataset failed ({exc})")
-        print("  falling back to reading the parquet files directly")
+    print(f"  reader: {args.reader}")
+    if args.reader == "parquet":
+        # Explicit: skip `datasets` entirely. Use this when the environment's
+        # datasets is older than the feature types the repo declares -- trying
+        # and failing first wastes a job and, if the exception does not arrive
+        # in the shape the fallback expects, hides the real error.
         ds = _load_parquet(args.repo, args.revision, args.split)
+    else:
+        try:
+            ds = load_dataset(args.repo, revision=args.revision, split=args.split)
+        # Deliberately broad: datasets has wrapped this in different exception
+        # types across versions, and a fallback that only catches ValueError is
+        # a fallback that silently is not there. The message check keeps it
+        # targeted; anything else re-raises untouched.
+        except Exception as exc:
+            # `datasets` refuses to parse a feature type it does not know. The
+            # 2.7B NoiseVectors repo declares `List`, which arrived in datasets
+            # 4.0, so an older datasets dies with "Feature type 'List' not
+            # found".
+            #
+            # Upgrading the library is the obvious fix and the wrong one here:
+            # on a shared container it is also in use by training jobs that may
+            # be running. The parquet files carry the four columns this script
+            # needs, so read them directly and skip feature parsing altogether.
+            if args.reader == "datasets" or "Feature type" not in str(exc):
+                raise
+            print(f"  load_dataset failed ({type(exc).__name__}: {exc})")
+            print("  falling back to reading the parquet files directly")
+            ds = _load_parquet(args.repo, args.revision, args.split)
     print(f"  {len(ds)} rows; columns: {ds.column_names}")
 
     noise_dtype = torch.bfloat16 if args.noise_dtype == "bfloat16" else torch.float32
