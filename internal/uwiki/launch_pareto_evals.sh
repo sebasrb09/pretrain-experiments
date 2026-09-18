@@ -34,8 +34,10 @@
 #   ANCHORS_ONLY 1 to submit only the anchors
 #   SKIP_EPOCH_CKPTS 1 to evaluate only step-N/ checkpoints, skipping the
 #                end-of-run epoch-N/ duplicate each truncated cell writes
-#   CELL_SCRIPT  site wrapper to submit (default: ASC if internal/asc/env.sh
-#                and $SCRATCH/$DATA are present, else the uwiki one)
+#   EVAL_CELL_SCRIPT  site EVAL wrapper to submit (default: ASC if internal/asc/env.sh
+#                and $SCRATCH/$DATA are present, else the uwiki one). NOT
+#                CELL_SCRIPT -- that is the TRAINING wrapper and leaks between
+#                launchers; it is still accepted but validated.
 #   TIME         walltime per eval job (default: 12:00:00)
 #   DRY_RUN      1 to print the sbatch commands without submitting
 #   Anything the cell script reads (SKIP_GW, SKIP_MIA, NOISE_DIR, FORCE_EVAL...)
@@ -70,7 +72,18 @@ SKIP_ANCHORS="${SKIP_ANCHORS:-0}"
 ANCHORS_ONLY="${ANCHORS_ONLY:-0}"
 # Site wrapper to submit. Default picks ASC when its env.sh is present, since
 # that is where the sweep currently runs.
-if [ -n "${CELL_SCRIPT:-}" ]; then
+#
+# EVAL_CELL_SCRIPT, not CELL_SCRIPT. The training sweep launcher reads
+# CELL_SCRIPT for the TRAINING wrapper, and a value exported for one leaks into
+# the other: `CELL_SCRIPT=internal/asc/unlearn_cell_1B.sh` left in the login
+# shell made every eval job here run the training body and die on `set METHOD`.
+# It happened three times, because `unset` only lasts for one shell. Two
+# incompatible things sharing one variable name is the actual bug; separate
+# names make the collision impossible. CELL_SCRIPT is still honoured so older
+# invocations keep working, but it is validated below either way.
+if [ -n "${EVAL_CELL_SCRIPT:-}" ]; then
+  CELL_SCRIPT="$EVAL_CELL_SCRIPT"
+elif [ -n "${CELL_SCRIPT:-}" ]; then
   :
 # /appl/local/containers exists only on LUMI and needs no modules loaded to
 # test, so it identifies the site at SUBMIT time. Without this branch LUMI fell
