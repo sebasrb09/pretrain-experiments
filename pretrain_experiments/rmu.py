@@ -406,6 +406,7 @@ def main():
         "steering_coef": args.steering_coef,
         "alpha": args.alpha,
         "learning_rate": args.learning_rate,
+        "lr_schedule": args.lr_schedule,
         "weight_decay": args.weight_decay,
         "forget_batch_size": args.forget_batch_size,
         "retain_batch_size": args.retain_batch_size,

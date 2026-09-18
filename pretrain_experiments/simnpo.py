@@ -379,6 +379,7 @@ def main():
         "gamma": args.gamma,
         "retain_loss_weight": args.retain_loss_weight,
         "learning_rate": args.learning_rate,
+        "lr_schedule": args.lr_schedule,
         "weight_decay": args.weight_decay,
         "forget_batch_size": args.forget_batch_size,
         "retain_batch_size": args.retain_batch_size,

@@ -85,6 +85,32 @@ else
   CELL_SCRIPT="internal/uwiki/eval_pareto_cell.sh"
 fi
 
+# CELL_SCRIPT is honoured verbatim above, which makes a TRAINING wrapper left
+# over in the environment -- exported for an earlier sweep launch, or carried in
+# by --export=ALL -- silently become the script every eval job runs. The job
+# still gets its `pe-` name from this launcher, so the queue looks right, and
+# each one dies deep inside the training body with
+#   "METHOD: set METHOD (gradient-ascent|grad-diff|npo|...)"
+# which names a variable this launcher never sets and does not mention evals at
+# all. Every checkpoint of every tag fails the same way, at full walltime cost.
+# Check what the file actually SOURCES rather than trusting its name -- matching
+# the bare string anywhere passes internal/lumi/unlearn_cell.sh, whose comments
+# discuss eval_cell_body.sh at length while it sources the training body.
+sources_body () {  # sources_body <script> <body-filename>
+  grep -qE "^[[:space:]]*(source|\.)[[:space:]].*$2" "$1" 2>/dev/null
+}
+if ! sources_body "$CELL_SCRIPT" "eval_cell_body\.sh"; then
+  echo "ERROR: CELL_SCRIPT does not look like an eval wrapper:" >&2
+  echo "         $CELL_SCRIPT" >&2
+  echo "       It never sources internal/uwiki/eval_cell_body.sh, so every job" >&2
+  echo "       submitted here would run something other than the eval suite." >&2
+  if sources_body "$CELL_SCRIPT" "unlearn_cell_body.sh"; then
+    echo "       This is a TRAINING wrapper. It is almost certainly still set" >&2
+    echo "       from a sweep launch: run 'unset CELL_SCRIPT' and try again." >&2
+  fi
+  exit 1
+fi
+
 SWEEP_DIR="$OUTPUT_ROOT/$RUN_TAG"
 
 echo "============================================"

@@ -339,6 +339,7 @@ def main():
         "forget_set_info": forget_info,
         "min_forget_ce": args.min_forget_ce,
         "learning_rate": args.learning_rate,
+        "lr_schedule": args.lr_schedule,
         "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
