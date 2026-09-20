@@ -12,6 +12,7 @@ from pretrain_experiments.evaluation.inference_engine import InferenceEngineFact
 from pretrain_experiments.logging_config import get_logger
 
 import numpy as np
+import os
 from typing import List
 
 logger = get_logger(__name__)
@@ -38,6 +39,17 @@ def eval_perplexity(model :str, prompts :List[str | List[int]], responses_file :
         max_seq_len = 512  # estimate for string prompts; actual length depends on tokenization
     if max_seq_len > 512:
         engine.max_num_seqs = max(1, int(engine.max_num_seqs * 512 / max_seq_len))
+
+    # STRING prompts skip the scaling above, because max_seq_len is the 512
+    # estimate rather than a measured length -- but c4 validation documents
+    # tokenize well past that. log_softmax then upcasts to fp32 over a 100352
+    # vocab, so batch 8 asks for ~19 GB in one allocation: survivable on a 94 GB
+    # H100, an OOM on a 64 GB MI250X GCD. EVAL_MAX_NUM_SEQS forces the batch
+    # down per site without touching the tuned default anywhere else.
+    _override = os.environ.get("EVAL_MAX_NUM_SEQS")
+    if _override:
+        engine.max_num_seqs = max(1, int(_override))
+        logger.info(f"EVAL_MAX_NUM_SEQS={_override}: batch forced to {engine.max_num_seqs}")
 
     # Deduplicate prompts
     seen = set()
