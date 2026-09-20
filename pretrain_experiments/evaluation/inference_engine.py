@@ -688,10 +688,29 @@ class TransformersInferenceEngine(InferenceEngine):
                 padded_token_ids.append(padded_ids)
                 attention_masks.append(mask)
             
-            # Create batch tensors
+            # Create batch tensors.
+            #
+            # position_ids is REQUIRED here, not optional. The padding above is
+            # LEFT padding, and OLMo-2 uses rotary embeddings; with position_ids
+            # unset, transformers falls back to arange(seq_len), which places a
+            # padded sequence's first real token at absolute position pad_len
+            # instead of 0 and shifts every token's rotary phase. The attention
+            # mask hides the pad tokens but does nothing about their positions.
+            #
+            # Measured on sbordt/OLMo-2-1B-Exp over the same 2500 c4 documents:
+            #   batch 1 -> 17.40   (no padding, correct)
+            #   batch 2 -> 46.73
+            #   batch 4 -> 77.36
+            # Perplexity must not depend on batch size. Deriving positions from
+            # the mask -- real tokens numbered 0,1,2,... regardless of how much
+            # padding precedes them -- makes it batch-invariant.
+            attn = torch.tensor(attention_masks, device=self.device)
+            position_ids = attn.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attn == 0, 1)
             inputs = {
                 'input_ids': torch.tensor(padded_token_ids, device=self.device),
-                'attention_mask': torch.tensor(attention_masks, device=self.device)
+                'attention_mask': attn,
+                'position_ids': position_ids,
             }
             
             # Forward pass for entire batch
