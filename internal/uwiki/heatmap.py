@@ -254,6 +254,47 @@ def aggregate(rows, col, higher_better, how, at_step):
     return r["_" + col], len(rows)
 
 
+def newest_bundle(prefix="iclr"):
+    """The highest-year tueplots bundle whose name starts with `prefix`.
+
+    Hardcoding `bundles.iclr2024` means the figures silently keep 2024's
+    geometry after tueplots ships a newer one, and the submission target moves
+    every year. Resolving it at call time makes `pip install -U tueplots` the
+    whole upgrade. Falls back to the newest neurips bundle, whose column widths
+    are close enough to be a sane default, then to None (matplotlib defaults).
+    """
+    from tueplots import bundles
+    import re
+    for pre in (prefix, "neurips"):
+        cand = []
+        for name in dir(bundles):
+            m = re.fullmatch(rf"{pre}(\d{{4}})", name)
+            if m:
+                cand.append((int(m.group(1)), name))
+        if cand:
+            return max(cand)[1]
+    return None
+
+
+def apply_paper_style(plt, ncols=1, usetex=False, prefix="iclr"):
+    """Set rcParams from the newest ICLR bundle. Returns the bundle name used.
+
+    usetex=False by default: the bundles ask for LaTeX, and a machine without a
+    TeX install fails deep inside the first draw with an error that does not
+    mention fonts. Pass usetex=True once you have confirmed `latex` is on PATH --
+    the glyphs then match the template exactly.
+    """
+    try:
+        from tueplots import bundles
+    except ImportError:
+        return "none (tueplots not installed -- pip install tueplots)"
+    name = newest_bundle(prefix)
+    if name is None:
+        return "none (no matching bundle)"
+    plt.rcParams.update(getattr(bundles, name)(ncols=ncols, usetex=usetex))
+    return f"{name} (ncols={ncols}, usetex={usetex})"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Hyperparameter heatmaps over exported sweep tables.",
@@ -301,6 +342,14 @@ def main():
                     help="list the (x, y) pairs that were never run, and stop")
     ap.add_argument("--out", help="write a PNG/SVG/PDF here (needs matplotlib)")
     ap.add_argument("--json", dest="json_out", help="write the matrix as JSON")
+    ap.add_argument("--style", default="iclr", choices=("iclr", "neurips", "none"),
+                    help="tueplots bundle family for --out; the newest year that "
+                         "tueplots ships is resolved at run time (default: iclr)")
+    ap.add_argument("--ncols", type=int, default=1, choices=(1, 2),
+                    help="1 for a full-width figure, 2 for a single column")
+    ap.add_argument("--usetex", action="store_true",
+                    help="render text with LaTeX -- matches the template exactly, "
+                         "but fails obscurely without a TeX install")
     ap.add_argument("--vmax", type=float, help="fix the colour scale maximum")
     ap.add_argument("--cmap", default="Blues")
     ap.add_argument("--decimals", type=int, default=4)
@@ -506,9 +555,22 @@ def main():
         except ImportError:
             sys.exit("ERROR: --out needs matplotlib. The table above is "
                      "complete; re-run without --out, or pip install matplotlib.")
+        if a.style != "none":
+            applied = apply_paper_style(plt, ncols=a.ncols, usetex=a.usetex)
+            print(f"style: {applied}")
         arr = np.array([[np.nan if v is None else v for v in r] for r in matrix],
                        dtype=float)
-        fig, ax = plt.subplots(figsize=(1.5 + 1.25 * len(xs), 1.4 + 0.85 * len(ys)))
+        if a.style == "none":
+            figsize = (1.5 + 1.25 * len(xs), 1.4 + 0.85 * len(ys))
+        else:
+            # The bundle fixes WIDTH to the template's text block -- that is the
+            # point of using it, so never override it. Height is ours: the
+            # bundle's default assumes a line plot, and a plane with eleven rows
+            # needs more. Scale from the bundle width so cells stay near-square,
+            # and cap it so a tall plane cannot run off the page.
+            w = plt.rcParams["figure.figsize"][0]
+            figsize = (w, min(0.90 * w * len(ys) / max(len(xs), 1) + 0.7, 8.0))
+        fig, ax = plt.subplots(figsize=figsize)
         cmap = matplotlib.colormaps[a.cmap].copy()
         cmap.set_bad("none")          # never-run cells are hollow, not tinted
         im = ax.imshow(np.ma.masked_invalid(arr), cmap=cmap, origin="lower",
@@ -536,7 +598,13 @@ def main():
                             ha="center", va="center", fontsize=8,
                             color="white" if v > mid else "black")
         fig.colorbar(im, ax=ax, shrink=.85)
-        fig.tight_layout()
+        # The tueplots bundles switch on constrained_layout, and calling
+        # tight_layout() after a colorbar exists then raises
+        # "Colorbar layout of new layout engine not compatible with old engine".
+        # Constrained layout already does the job, so only lay out by hand when
+        # no bundle is active.
+        if a.style == "none":
+            fig.tight_layout()
         fig.savefig(a.out, dpi=200)
         print(f"wrote {a.out}")
 

@@ -153,10 +153,23 @@ run_eval () {
 
 # --- the utility axis -------------------------------------------------------
 if [ "${SKIP_PPL:-0}" != "1" ]; then
+  # Absolute, not relative. Nothing here cd's to the repo root, so a bare
+  # `resources/...` resolves against whatever SLURM set as the working
+  # directory -- fine when submitted from the checkout, and a silent
+  # "FAILED: c4_perplexity" with an empty stderr otherwise. That failure costs
+  # the whole utility axis while every other eval in the suite still succeeds,
+  # so the cell looks 5/6 healthy rather than unusable.
+  C4_TASK_FILE="${C4_TASK_FILE:-${PE_REPO:-.}/resources/validation-set/c4_en_validation.jsonl}"
+  if [ ! -s "$C4_TASK_FILE" ]; then
+    echo "ERROR: no c4 validation set at $C4_TASK_FILE" >&2
+    echo "       Every cell would lose its utility axis. Set C4_TASK_FILE, or" >&2
+    echo "       create it (2500 lines) with internal/uwiki/download_c4_validation.sh." >&2
+    exit 1
+  fi
   run_eval c4_perplexity \
     python pretrain_experiments/evaluation/perplexity.py \
       --model "$TARGET" "${REV_ARGS[@]}" \
-      --task-file resources/validation-set/c4_en_validation.jsonl \
+      --task-file "$C4_TASK_FILE" \
       --results-yaml "$EVAL_OUT/c4_perplexity/results.yaml" \
       --detailed-results-jsonl "$EVAL_OUT/c4_perplexity/detailed.jsonl"
 fi
