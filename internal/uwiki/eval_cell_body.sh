@@ -143,8 +143,18 @@ run_eval () {
   local t0
   t0=$(date +%s)
   if "$@"; then
-    touch "$marker"
-    echo "  [$name] OK in $(( $(date +%s) - t0 ))s"
+    # Exit 0 is not enough. gaussian_watermark.py catches per-file exceptions,
+    # prints "Error processing <file>", and still returns 0 -- so a run where
+    # every noise file failed was being marked done with no results.yaml on
+    # disk. The marker then suppressed every retry, and the missing metric only
+    # surfaced as an empty column at aggregation time. Require the artefact.
+    if [ -s "$EVAL_OUT/$name/results.yaml" ]; then
+      touch "$marker"
+      echo "  [$name] OK in $(( $(date +%s) - t0 ))s"
+    else
+      echo "  [$name] exited 0 but wrote no results.yaml -- NOT marking done" >&2
+      FAILED="$FAILED $name"
+    fi
   else
     echo "  [$name] FAILED -- continuing with the rest" >&2
     FAILED="$FAILED $name"
