@@ -145,10 +145,15 @@ run_eval () {
   if "$@"; then
     # Exit 0 is not enough. gaussian_watermark.py catches per-file exceptions,
     # prints "Error processing <file>", and still returns 0 -- so a run where
-    # every noise file failed was being marked done with no results.yaml on
-    # disk. The marker then suppressed every retry, and the missing metric only
-    # surfaced as an empty column at aggregation time. Require the artefact.
-    if [ -s "$EVAL_OUT/$name/results.yaml" ]; then
+    # every noise file failed was being marked done with nothing written. The
+    # marker then suppressed every retry, and the missing metric only surfaced
+    # as an empty column at aggregation time.
+    #
+    # Require SOME artefact, not results.yaml specifically: most evals write
+    # results.yaml, but gaussian_watermark writes
+    # gaussian_privacy_scores_{in,out}_*.pt. Checking for results.yaml alone
+    # would reject every successful watermark run.
+    if [ -n "$(ls -A "$EVAL_OUT/$name" 2>/dev/null)" ]; then
       touch "$marker"
       echo "  [$name] OK in $(( $(date +%s) - t0 ))s"
     else
