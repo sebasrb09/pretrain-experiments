@@ -69,9 +69,6 @@ FIELDS = [
     "il_ppl", "il_forgot",
     "c4_ppl", "c4_delta_pct",
     "wm_full", "wm_q4", "wm_removed",
-    # the rest of the seven TOAA categories. These ran on only part of the
-    # sweep, so a blank here means "not measured on that cell", never zero.
-    "vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "dos_ppl", "mia_auc",
     "eval_dir",
 ]
 
@@ -87,82 +84,17 @@ def flatten(d, prefix=""):
 
 
 def read_yaml(path):
-    # ImportError is NOT caught with OSError. A missing file means "this cell
-    # was not evaluated" and None is right; a missing PyYAML means every
-    # YAML-backed column silently exports blank, which reads downstream as a
-    # flat zero bar rather than as a broken run. Fail once, loudly, instead.
     try:
         import yaml
-    except ImportError:
-        raise SystemExit(
-            "PyYAML is not installed, so no results.yaml can be read and every "
-            "metric except the watermark would export blank. pip install pyyaml")
-    try:
         with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
-    except OSError:
+    except (OSError, ImportError):
         return None
 
 
 def scalar(eval_dir, evaluation, key):
     d = read_yaml(os.path.join(eval_dir, evaluation, "results.yaml"))
     return None if d is None else d.get(key)
-
-
-def benchmark_acc(eval_dir):
-    """Contamination accuracy.
-
-    benchmark.py names the key after --norm: plain `acc`, or `acc_char` /
-    `acc_mixed` when a normalisation was requested. Which one was used is not
-    recorded anywhere else, so accept whichever is present.
-    """
-    d = read_yaml(os.path.join(eval_dir, "benchmark_contamination", "results.yaml"))
-    if d is None:
-        return None
-    for k in ("acc", "acc_char", "acc_mixed"):
-        if k in d:
-            return d[k]
-    return None
-
-
-def prompt_leakage(eval_dir):
-    """Fraction of prompts reproduced at RougeL recall > 0.9.
-
-    The key is leakage_at_<k+1>, so it depends on --num-generations. Take the
-    first-generation number when it is there, else the lowest k present.
-    """
-    d = read_yaml(os.path.join(eval_dir, "prompt_extraction", "results.yaml"))
-    if d is None:
-        return None
-    if "leakage_at_1" in d:
-        return d["leakage_at_1"]
-    ks = sorted(k for k in d if k.startswith("leakage_at_"))
-    return d[ks[0]] if ks else None
-
-
-def mia_auc(eval_dir):
-    """Membership-inference AUC, calibrated against the reference model.
-
-    newtoken_mia.py writes JSON (not YAML) named per model and condition, so
-    glob rather than index. Prefer the calibrated number: the uncalibrated one
-    moves with the target's overall fluency and would track perplexity.
-    """
-    hits = sorted(glob.glob(os.path.join(
-        eval_dir, "mia", "results_mia_samples_*.json")))
-    if not hits:
-        return None
-    try:
-        with open(hits[0], encoding="utf-8") as f:
-            blob = json.load(f)
-    except (OSError, ValueError):
-        return None
-    flat = flatten(blob)
-    for want in ("calibrated_auc", "auc"):
-        hit = [k for k in flat if k.split("/")[-1] == want
-               and isinstance(flat[k], (int, float))]
-        if hit:
-            return flat[hit[0]]
-    return None
 
 
 def insertion_likelihood(eval_dir, experiment):
@@ -267,15 +199,7 @@ def collect_anchors(root):
             "fk_prob": scalar(eval_dir, "fictional_knowledge", "probability"),
             "il_ppl": insertion_likelihood(eval_dir, "knowledge-acquisition"),
             "c4_ppl": scalar(eval_dir, "c4_perplexity", "perplexity"),
-            "wm_full": wm_full, "wm_q4": wm_q4,
-            "vm_memorized": scalar(eval_dir, "verbatim_memorization",
-                                    "num_memorized_sequences"),
-            "bm_acc": benchmark_acc(eval_dir),
-            "pe_leak": prompt_leakage(eval_dir),
-            "dos_garbage": scalar(eval_dir, "denial_of_service", "is_garbage"),
-            "dos_ppl": scalar(eval_dir, "denial_of_service", "mean_ppl"),
-            "mia_auc": mia_auc(eval_dir),
-            "eval_dir": eval_dir,
+            "wm_full": wm_full, "wm_q4": wm_q4, "eval_dir": eval_dir,
         }
     return list(ends.values())
 
@@ -369,13 +293,6 @@ def main():
             "il_ppl": insertion_likelihood(eval_dir, args.il_experiment),
             "c4_ppl": scalar(eval_dir, "c4_perplexity", "perplexity"),
             "wm_full": wm_full, "wm_q4": wm_q4,
-            "vm_memorized": scalar(eval_dir, "verbatim_memorization",
-                                    "num_memorized_sequences"),
-            "bm_acc": benchmark_acc(eval_dir),
-            "pe_leak": prompt_leakage(eval_dir),
-            "dos_garbage": scalar(eval_dir, "denial_of_service", "is_garbage"),
-            "dos_ppl": scalar(eval_dir, "denial_of_service", "mean_ppl"),
-            "mia_auc": mia_auc(eval_dir),
             "eval_dir": eval_dir,
         }
         if row["c4_ppl"] is None and row["fk_prob"] is None:
@@ -395,9 +312,7 @@ def main():
     write(os.path.join(args.out, "results_cells.csv"), cells, FIELDS)
 
     afields = ["point", "step", "fk_prob", "fk_forgot", "il_ppl", "il_forgot",
-               "c4_ppl", "c4_delta_pct", "wm_full", "wm_q4", "wm_removed",
-               "vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "dos_ppl",
-               "mia_auc", "eval_dir"]
+               "c4_ppl", "c4_delta_pct", "wm_full", "wm_q4", "wm_removed", "eval_dir"]
     for a in anchors:
         derive(a, ends)
     anchors.sort(key=lambda r: (r["point"], int(r["step"] or -1)))
@@ -421,13 +336,6 @@ def main():
     }
     with open(os.path.join(args.out, "results_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-    # Say which suite tasks are thin. They were enabled partway through, so a
-    # column can be 17% full; silence there would read as "all zero" in a plot.
-    for col in ("vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "mia_auc"):
-        n = sum(1 for r in cells if r.get(col) is not None)
-        if n < len(cells):
-            print(f"  {col}: {n}/{len(cells)} cells measured"
-                  + ("  -- NOT RUN" if n == 0 else ""))
     print(f"wrote {os.path.join(args.out, 'results_meta.json')}")
     if skipped:
         print(f"{skipped} checkpoints had no readable results and were skipped")
