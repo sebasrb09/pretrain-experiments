@@ -147,8 +147,10 @@ def mia_auc(eval_dir):
     glob rather than index. Prefer the calibrated number: the uncalibrated one
     moves with the target's overall fluency and would track perplexity.
     """
+    # "mia*" not "mia": eval_cell_body.sh writes one directory per condition
+    # (mia_rare_1tok_16x), while older runs wrote a single mia/. Both are read.
     hits = sorted(glob.glob(os.path.join(
-        eval_dir, "mia", "results_mia_samples_*.json")))
+        eval_dir, "mia*", "results_mia_samples_*.json")))
     if not hits:
         return None
     try:
