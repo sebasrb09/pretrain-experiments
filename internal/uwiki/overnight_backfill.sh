@@ -31,7 +31,9 @@ cd "$REPO" || { echo "cannot cd to REPO=$REPO"; exit 1; }
 # the sweep launcher resolves internal/lumi/unlearn_cell.sh RELATIVELY,
 # so everything below must run from the repo root
 PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
-MAXQ="${MAXQ:-150}"                    # keep fewer than this many of your jobs queued
+MAXQ="${MAXQ:-160}"                    # LUMI allows 210 submitted / 200 running;
+                                       # 160 leaves headroom for the anchors and for
+                                       # other people on the partition
 POLL="${POLL:-120}"                    # seconds between queue checks
 DRY_RUN="${DRY_RUN:-0}"
 EVAL_SCRIPT="${EVAL_SCRIPT:-$REPO/internal/lumi/eval_pareto_cell.sh}"
