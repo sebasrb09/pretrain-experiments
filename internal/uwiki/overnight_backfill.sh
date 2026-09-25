@@ -225,8 +225,39 @@ launch_train 1e-05 ce-u            "1e-05"
 launch_train 1e-05 gradient-ascent "1e-05"
 launch_train 5e-05 gradient-ascent "5e-05"
 
-log "=== done. Training submitted. Evaluate the new cells with: ==="
-log "    for t in 1B-full-lr3e-06 1B-full-lr1e-05 1B-full-lr5e-05; do"
-log "      OUTPUT_ROOT=$PE/unlearning-pareto-1B RUN_TAG=\$t SKIP_ANCHORS=1 \\"
-log "      SKIP_MIA=0 SKIP_DOS=0 EVAL_MAX_NUM_SEQS=1 MIA_CACHE_DIR=$MIA_CACHE \\"
-log "      HF_HUB_OFFLINE=1 bash internal/uwiki/launch_pareto_evals.sh; done"
+# ---- 4. wait for training, then evaluate the NEW cells --------------
+# The cells from phase 3 have NOTHING evaluated, so this is the full suite,
+# not the MIA/DoS pair. Training job names come from launch_pareto_sweep_1B.sh
+# as ${RUN_TAG}-${method}-${knob}${value}, so they all start with "1B-full-lr".
+if [ "$DRY_RUN" = "1" ]; then
+  log "=== [dry] would wait for training, then evaluate the new cells ==="
+  exit 0
+fi
+
+log "  waiting for the 1B training sweep to finish"
+while squeue -u "$USER" -h -o %j 2>/dev/null | grep -q '^1B-full-lr'; do
+  log "    $(squeue -u "$USER" -h -o %j | grep -c '^1B-full-lr') training job(s) left"
+  sleep "$POLL"
+done
+log "=== training done; evaluating the new cells (FULL suite) ==="
+
+for tag in 1B-full-lr3e-06 1B-full-lr1e-05 1B-full-lr5e-05; do
+  if [ ! -d "$PE/unlearning-pareto-1B/$tag" ]; then
+    log "  [skip] $tag -- no cells (training may have failed)"
+    continue
+  fi
+  wait_for_room
+  log "  evaluating $tag"
+  OUTPUT_ROOT="$PE/unlearning-pareto-1B" RUN_TAG="$tag" \
+  SKIP_ANCHORS=1 SKIP_MIA=0 SKIP_DOS=0 \
+  EVAL_MAX_NUM_SEQS=1 \
+  MIA_CACHE_DIR="$MIA_CACHE" MIA_REF_CACHE_DIR="$MIA_CACHE/ref" \
+  HF_HUB_OFFLINE="$OFFLINE" HF_DATASETS_OFFLINE="$OFFLINE" \
+  DRY_RUN=0 \
+    bash "$REPO/internal/uwiki/launch_pareto_evals.sh" || \
+      log "    eval launch FAILED for $tag"
+done
+
+log "=== ALL DONE. Export with: ==="
+log "    python internal/uwiki/audit_configs.py  --output-root $PE/unlearning-pareto-1B --out \$DATA/exports-1B-lumi/results_configs.csv"
+log "    python internal/uwiki/export_results.py --output-root $PE/unlearning-pareto-1B --out \$DATA/exports-1B-lumi"
