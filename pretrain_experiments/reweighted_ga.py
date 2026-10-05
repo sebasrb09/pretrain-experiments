@@ -255,6 +255,11 @@ def main():
                         choices=("constant", "linear", "warmup", "warmup-cooldown"),
                         default="constant",
                         help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
+    parser.add_argument("--warmup-frac", type=float, default=None,
+                        help="Fraction of the run spent warming up, used by the "
+                             "warmup schedules only. None keeps the 0.20 default in "
+                             "unlearning_utils, so the P2 ablation arms are unchanged. "
+                             "The HPO driver sweeps it.")
     parser.add_argument("--auto-resume", dest="auto_resume",
                         action="store_true", default=True,
                         help="Resume from the highest step-N checkpoint in --output-dir that carries a trainer_state.pt. On by default: a 10k-step cell outlives the 72h QOS ceiling, so runs are expected to be chained. Resuming is always logged, never silent.")
@@ -418,7 +423,8 @@ def main():
     # long (t_max ~5e12 tokens) that it is flat over a 10k-step window, and
     # decaying to zero instead would confound a method unlearning less late in
     # training with the optimizer simply having stopped moving.
-    scheduler = build_lr_schedule(optimizer, args.max_steps or 0, args.lr_schedule)
+    scheduler = build_lr_schedule(optimizer, args.max_steps or 0, args.lr_schedule,
+                                  warmup_frac=args.warmup_frac)
 
     # Resume Adam's moments from the pretraining checkpoint. Without this the
     # first steps run on zeroed second moments, so every parameter takes a
@@ -457,6 +463,10 @@ def main():
         "retain_loss_weight": args.retain_loss_weight,
         "learning_rate": args.learning_rate,
         "lr_schedule": args.lr_schedule,
+        "warmup_frac": args.warmup_frac,
+        "adam_beta1": args.betas[0],
+        "adam_beta2": args.betas[1],
+        "max_grad_norm": args.max_grad_norm,
         "weight_decay": args.weight_decay,
         "forget_batch_size": args.forget_batch_size,
         "retain_batch_size": args.retain_batch_size,

@@ -665,7 +665,8 @@ def load_trainer_state(ckpt_dir, optimizer, device="cpu"):
 
 
 
-def build_lr_schedule(optimizer, total_steps: int, kind: str = "constant"):
+def build_lr_schedule(optimizer, total_steps: int, kind: str = "constant",
+                      warmup_frac: float = None):
     """LR schedule for an unlearning run. Default: constant.
 
     Constant is the DEFAULT because it is what the checkpoint we resume from
@@ -688,8 +689,11 @@ def build_lr_schedule(optimizer, total_steps: int, kind: str = "constant"):
     if kind == "linear":
         return build_linear_decay_schedule(optimizer, total_steps)
     if kind in ("warmup", "warmup-cooldown"):
+        # warmup_frac=None keeps the module default, so the P2 ablation arms are
+        # unchanged; the HPO driver passes a sampled value instead.
+        kw = {} if warmup_frac is None else {"warmup_frac": warmup_frac}
         return build_warmup_cooldown_schedule(
-            optimizer, total_steps, cooldown=(kind == "warmup-cooldown")
+            optimizer, total_steps, cooldown=(kind == "warmup-cooldown"), **kw
         )
     raise ValueError(
         f"unknown lr schedule {kind!r}; use constant, linear, warmup or "
