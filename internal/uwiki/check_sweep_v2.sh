@@ -10,8 +10,21 @@
 set -u
 
 PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
-ROOT="${OUTPUT_ROOT:-$PE/unlearning-pareto-1B}"
+
+# The root is NOT taken from $OUTPUT_ROOT. A stale OUTPUT_ROOT exported for an
+# earlier 2.7B launch made the first version of this script count checkpoints in
+# unlearning-pareto-2.7B and report zero, while training was writing to the 1B
+# tree perfectly happily. A diagnostic that inherits the thing it is meant to
+# verify is worse than no diagnostic. Pass a path as $1 to override.
+ROOT="${1:-$PE/unlearning-pareto-1B}"
 TAG_GLOB="${TAG_GLOB:-1B-v2-lr*}"
+
+echo "  checking root: $ROOT"
+case "$ROOT" in *2.7B*) echo "  WARNING: that is the 2.7B tree, not the 1.5B sweep" ;; esac
+[ -d "$ROOT" ] || echo "  WARNING: $ROOT does not exist"
+if [ -n "${OUTPUT_ROOT:-}" ] && [ "$OUTPUT_ROOT" != "$ROOT" ]; then
+  echo "  note: OUTPUT_ROOT=$OUTPUT_ROOT is set and DIFFERS, and is being ignored"
+fi
 
 hr () { printf '%s\n' "------------------------------------------------------------"; }
 
@@ -54,14 +67,33 @@ hr; echo "4. DID THE SETTINGS ARRIVE?  (newest job log)"; hr
 # The cell echoes its resolved configuration before training. If these lines are
 # wrong the job is burning time on the wrong experiment, and nothing else will
 # say so.
-log=$(ls -t unlearn-lumi_*.out 2>/dev/null | head -1)
+# Find the log by JOB ID of a job that is actually running now. Globbing a job
+# NAME is what broke the first version: --output=%x_%j.out expands %x to the
+# name sbatch was given, and the launcher passes -J 1B-v2-lr..., so
+# unlearn-lumi_*.out only ever matched logs from OTHER, older jobs. It happily
+# read a log from the previous failed attempt and reported its 2.7B optimizer
+# path as though it were current.
+log=""
+jid=$(squeue -u "$USER" -h -o '%i %j' 2>/dev/null | awk '$2 ~ /^1B-v2-lr/ {print $1; exit}')
+if [ -n "$jid" ]; then
+  for d in . "$PE" "$PE/logs" "$HOME"; do
+    cand=$(ls -t "$d"/*_"$jid".out 2>/dev/null | head -1)
+    [ -n "$cand" ] && { log="$cand"; break; }
+  done
+fi
+# Fall back to the newest log of ANY currently running job of this sweep.
 if [ -z "$log" ]; then
-  log=$(ls -t "$PE"/unlearn-lumi_*.out 2>/dev/null | head -1)
+  for d in . "$PE" "$PE/logs" "$HOME"; do
+    cand=$(ls -t "$d"/1B-v2-lr*.out 2>/dev/null | head -1)
+    [ -n "$cand" ] && { log="$cand"; break; }
+  done
 fi
 if [ -z "$log" ]; then
-  echo "  no unlearn-lumi_*.out found here or in $PE"
-  echo "  (run this from the directory you launched sbatch in)"
+  echo "  no log found for a running 1B-v2-lr* job (looked in . $PE $PE/logs $HOME)"
+  echo "  running job ids: $(squeue -u "$USER" -h -o '%i %j' 2>/dev/null | awk '$2 ~ /^1B-v2-lr/ {printf "%s ", $1}')"
+  echo "  find one with: ls -t *_<jobid>.out"
 else
+  echo "  (job $jid)"
   echo "  log: $log"
   grep -m1 -E 'optim(izer)? (state|repo)|resume.*optim|optim\.pt' "$log" 2>/dev/null | sed 's/^/    /'
   grep -m1 'micro batch:'  "$log" 2>/dev/null | sed 's/^/    /'
@@ -75,7 +107,7 @@ fi
 hr; echo "5. KNOWN FAILURE SIGNATURES"; hr
 pat='split_with_sizes|sum exactly to 8640|out of memory|HIP out of memory|CUDA out of memory|Traceback|could not resolve|does not point at a file|No such file'
 hits=0
-for f in $(ls -t unlearn-lumi_*.out unlearn-lumi_*.err 2>/dev/null | head -12); do
+for f in $(ls -t 1B-v2-lr*.out 1B-v2-lr*.err 2>/dev/null | head -12); do
   m=$(grep -nE "$pat" "$f" 2>/dev/null | head -2)
   if [ -n "$m" ]; then
     hits=$((hits+1)); echo "  $f"; echo "$m" | sed 's/^/      /'
