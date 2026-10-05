@@ -473,6 +473,46 @@ if [ -n "${LR_SCHEDULE:-}" ]; then
   COMMON_ARGS+=(--lr-schedule "$LR_SCHEDULE")
 fi
 
+# WEIGHT_DECAY and WARMUP_FRAC exist for the Optuna HPO. Both are single
+# tokens, so unlike CKPT_STEPS they are safe to name in the launcher list.
+# Unset leaves the driver default, which is the pretraining value (0.1) for
+# decay and 0.20 for the warmup fraction, so every existing sweep and the P2
+# ablation are byte-identical to before this block existed.
+if [ -n "${WEIGHT_DECAY:-}" ]; then
+  COMMON_ARGS+=(--weight-decay "$WEIGHT_DECAY")
+fi
+# All six drivers accept --warmup-frac, but it only does anything when the
+# schedule is warmup or warmup-cooldown.
+if [ -n "${WARMUP_FRAC:-}" ]; then
+  COMMON_ARGS+=(--warmup-frac "$WARMUP_FRAC")
+fi
+
+# MIN_FORGET_CE is ce-u only. It floors the per-token forget CE, which caps
+# the 1/(1-q) gradient factor at 1/eps, so it is what bounds how hard a
+# heavily memorized token can pull on the first steps. Unset leaves the
+# faithful 1e-7 default in ce_u.py. Passing it to any other driver is an
+# unrecognized-argument error, hence the method guard.
+if [ -n "${MIN_FORGET_CE:-}" ] && [ "$METHOD" = "ce-u" ]; then
+  COMMON_ARGS+=(--min-forget-ce "$MIN_FORGET_CE")
+fi
+
+# Adam betas and the gradient clip, both searched by the HPO. All six drivers
+# accept them. NAMED ADAM_BETA1/ADAM_BETA2 ON PURPOSE: this file already uses
+# beta1 as wga and satimp Q unlearning knob and SATIMP_BETA2 as satimp second
+# one, so a bare BETA1 here would be two different quantities under one name.
+# --betas is nargs=2, so it takes two separate tokens, and passing only one of
+# the pair would silently leave both at the pretraining default.
+if [ -n "${ADAM_BETA1:-}" ] || [ -n "${ADAM_BETA2:-}" ]; then
+  if [ -z "${ADAM_BETA1:-}" ] || [ -z "${ADAM_BETA2:-}" ]; then
+    echo "ERROR: set ADAM_BETA1 and ADAM_BETA2 together, or neither." >&2
+    exit 1
+  fi
+  COMMON_ARGS+=(--betas "$ADAM_BETA1" "$ADAM_BETA2")
+fi
+if [ -n "${MAX_GRAD_NORM:-}" ]; then
+  COMMON_ARGS+=(--max-grad-norm "$MAX_GRAD_NORM")
+fi
+
 # ce_u.py takes --batch-size; every other driver takes --forget-batch-size.
 if [ "$METHOD" = "ce-u" ]; then
   COMMON_ARGS+=(--batch-size "$MICRO_BATCH")

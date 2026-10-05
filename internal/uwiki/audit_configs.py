@@ -58,6 +58,21 @@ FIELDS = [
     "retain_loss_weight", "model", "revision", "learning_rate",
     "beta1", "beta2", "beta", "gamma", "steering_coefficient", "alpha",
     "max_steps", "epochs", "seed", "dtype", "lr_schedule",
+    # Batch geometry. RECORDED BECAUSE IT CHANGES THE OBJECTIVE, not just the
+    # speed. collate_pad pads per micro-batch and each loss divides by that
+    # micro-batch's non-pad token count, so the accumulated gradient is a mean
+    # of per-micro-batch means. At micro-batch 1 every sequence weighs the same
+    # regardless of length; larger micro-batches slide toward per-token
+    # weighting. Two runs at different micro-batch are not comparable, and
+    # until now nothing in the exports said which one a cell used.
+    #
+    # ce_u.py calls it batch_size, the other five forget_batch_size, so both
+    # names are carried and exactly one will be populated per row.
+    "batch_size", "forget_batch_size", "retain_batch_size",
+    "gradient_accumulation_steps", "effective_batch_size",
+    # Searched by the Optuna HPO, so unrecorded means unreproducible.
+    "weight_decay", "warmup_frac", "adam_beta1", "adam_beta2",
+    "max_grad_norm", "min_forget_ce", "frozen_dtype",
 ]
 
 

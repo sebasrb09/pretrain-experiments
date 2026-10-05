@@ -59,6 +59,28 @@ REVISION="${REVISION:-}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 
 # ---------------------------------------------------------------- what to eval
+# MODEL and CELL_DIR are mutually exclusive, and MODEL wins the test below, so
+# a MODEL left in the environment makes this script silently evaluate an HF repo
+# while every signal says it evaluated the trained cell. The sweep orchestrators
+# export MODEL for TRAINING and then submit evals with --export=ALL, so it
+# arrives here without anyone passing it: 387 eval jobs would each re-measure
+# the pristine base model, agree with each other, and exit 0.
+#
+# No legitimate caller sets both. Anchor mode passes MODEL plus EVAL_OUT and no
+# CELL_DIR; cell mode passes CELL_DIR and no MODEL. Refuse the ambiguous case
+# rather than pick, which is the same reasoning as the CELL_SCRIPT guard in
+# launch_pareto_evals.sh after that collision bit three times.
+if [ -n "$MODEL" ] && [ -n "$CELL_DIR" ]; then
+  echo "ERROR: both MODEL and CELL_DIR are set, which is ambiguous." >&2
+  echo "         MODEL=$MODEL" >&2
+  echo "         CELL_DIR=$CELL_DIR" >&2
+  echo "       MODEL takes precedence here, so this job would evaluate the HF" >&2
+  echo "       repo and IGNORE the trained checkpoint, reporting baseline" >&2
+  echo "       numbers that look entirely plausible." >&2
+  echo "       MODEL is almost certainly inherited from a training launch." >&2
+  echo "       Submit the eval with 'env -u MODEL -u REVISION', or unset it." >&2
+  exit 1
+fi
 if [ -n "$MODEL" ]; then
   EVAL_OUT="${EVAL_OUT:-}"
   [ -n "$EVAL_OUT" ] || { echo "ERROR: MODEL mode needs EVAL_OUT" >&2; exit 1; }

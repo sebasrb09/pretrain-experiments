@@ -91,7 +91,13 @@ case "$CKPT_STEPS"  in *,*) : ;; *) echo "PRE-FLIGHT FAIL: CKPT_STEPS has no com
 [ -f "$REPO/$CELL_SCRIPT" ] || { echo "PRE-FLIGHT FAIL: no $CELL_SCRIPT"; fail=1; }
 [ "$fail" -eq 0 ] || { echo "aborting without submitting anything"; exit 1; }
 
-log "=== 1.5B sweep v2 (DRY_RUN=$DRY_RUN) ==="
+# SKIP_TRAIN=1 runs the EVAL PHASE ONLY, for when training was launched by an
+# earlier invocation and this one must not resubmit 43 jobs. Use it after
+# killing an orchestrator mid-run: the training jobs are independent sbatch
+# jobs, not children of this script, so they survive its death.
+SKIP_TRAIN="${SKIP_TRAIN:-0}"
+
+log "=== 1.5B sweep v2 (DRY_RUN=$DRY_RUN, SKIP_TRAIN=$SKIP_TRAIN) ==="
 log "    optim    : $OPTIM_REPO @ $OPTIM_REVISION  (d_model 2048)"
 log "    output   : $OUTPUT_ROOT"
 log "    budget   : MAX_STEPS=$MAX_STEPS, checkpoints at $CKPT_STEPS"
@@ -119,6 +125,9 @@ launch () {   # <lr> <method> <values> <grad_ckpt> <micro_batch> <frozen_dtype>
       || log "    LAUNCH FAILED: $2 @ $1"
 }
 
+if [ "$SKIP_TRAIN" = "1" ]; then
+  log "  SKIP_TRAIN=1 -> not submitting any training, going straight to evals"
+else
 launch 1e-05 rmu             "2.0 4.0 6.5 10.0"   0 1 float32
 launch 5e-05 rmu             "5.0 6.5 50.0 500.0" 0 1 float32
 launch 1e-03 rmu             "6.5"                0 1 float32
@@ -139,6 +148,7 @@ launch 1e-05 ce-u            "1e-05"              1 4 float32
 launch 5e-05 ce-u            "5e-05"              1 4 float32
 launch 1e-05 gradient-ascent "1e-05"              1 4 float32
 launch 5e-05 gradient-ascent "5e-05"              1 4 float32
+fi
 
 log "=== training submitted ==="
 if [ "$DRY_RUN" != "0" ]; then
@@ -174,6 +184,12 @@ for tag in 1B-v2-lr3e-06 1B-v2-lr1e-05 1B-v2-lr5e-05 1B-v2-lr1e-03; do
   [ -d "$OUTPUT_ROOT/$tag" ] || { log "  [skip] $tag not present"; continue; }
   wait_for_room
   log "  evaluating $tag"
+  # env -u MODEL -u REVISION is NOT optional. This script exports them for
+  # TRAINING, launch_pareto_evals.sh submits with --export=ALL, and
+  # eval_cell_body.sh tests MODEL before CELL_DIR. Left set, every one of the
+  # ~387 eval jobs would evaluate the pristine HF repo instead of its own
+  # checkpoint, return identical baseline numbers, and exit 0.
+  env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION \
   OUTPUT_ROOT="$OUTPUT_ROOT" RUN_TAG="$tag" TIME="$TIME_EVAL" \
   SKIP_ANCHORS=1 SKIP_EPOCH_CKPTS=1 SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" \
   MIA_CACHE_DIR="$MIA_CACHE" MIA_REF_CACHE_DIR="$MIA_CACHE/ref" \
