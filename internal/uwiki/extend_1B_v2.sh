@@ -39,6 +39,8 @@ set -u
 REPO="${REPO:-$PWD}"
 cd "$REPO" || { echo "cannot cd to REPO=$REPO"; exit 1; }
 PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
+source "$REPO/internal/uwiki/scrub_env.sh"   # nothing experiment-defining from the shell
+scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE
 DRY_RUN="${DRY_RUN:-1}"
 ALLOW_RESTART="${ALLOW_RESTART:-0}"
 POLL="${POLL:-300}"
@@ -82,7 +84,7 @@ export KEEP_CHECKPOINTS=0
 RESUME_TIME="${RESUME_TIME:-16:00:00}"     # 34 steps at the measured ~15 min/step + startup
 RESTART_TIME="${RESTART_TIME:-24:00:00}"   # 55 steps from scratch
 EVAL_TIME="${EVAL_TIME:-12:00:00}"
-SKIP_DOS="${SKIP_DOS:-1}"
+SKIP_DOS="${SKIP_DOS:-0}"   # full suite, same as the sweep it extends
 MIA_CACHE="$PE/hf/mia-cache"
 
 log () { echo "[$(date '+%F %T')] $*"; }
@@ -193,6 +195,12 @@ done
 # That covers the race where the main eval orchestrator, still working through
 # its queue throttle, picked up a new step-34 itself.
 if [ -d "$MIA_CACHE" ] && [ -n "$(ls -A "$MIA_CACHE" 2>/dev/null)" ]; then OFF=1; else OFF=0; fi
+if [ "$SKIP_DOS" = "0" ] && [ "$OFF" = "1" ]; then
+  JUDGE_DIR="${HF_HOME:-$PE/hf}/hub/models--meta-llama--Meta-Llama-3-8B-Instruct"
+  ls "$JUDGE_DIR"/snapshots/*/*.safetensors >/dev/null 2>&1 || {
+    log "  NO CACHED JUDGE at $JUDGE_DIR and evals run offline. Not submitting evals."
+    exit 1; }
+fi
 n_ev=0
 for row in "${TODO[@]}"; do
   read -r method lr value gc mb dtype mode <<< "$row"

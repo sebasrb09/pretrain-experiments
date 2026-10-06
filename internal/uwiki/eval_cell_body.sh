@@ -35,11 +35,12 @@
 #   CKPT        explicit checkpoint dir  (default: highest-numbered epoch-*/)
 #   NOISE_DIR   gaussian-watermark noise vectors
 #   NOISE_STD   default 0.075 (the value the watermarks were injected at)
-#   Per-eval switches, 1 to skip. All default to RUN except SKIP_DOS:
+#   Per-eval switches, 1 to skip. All default to RUN except SKIP_MIA and
+#   SKIP_DOS, which default to 1. MIA is OFF unless SKIP_MIA=0 is passed:
 #     SKIP_PPL  c4 perplexity (the utility axis)
 #     SKIP_FK   fictional knowledge          SKIP_VM   verbatim memorization
 #     SKIP_IL   insertion likelihood         SKIP_BM   benchmark contamination
-#     SKIP_GW   gaussian watermark           SKIP_MIA  membership inference
+#     SKIP_GW   gaussian watermark           SKIP_MIA  membership inference (default OFF)
 #     SKIP_PE   prompt extraction
 #     SKIP_DOS  denial of service -- defaults to 1, needs a gated judge model
 #   Sub-options: IL_EXPERIMENT (default all), BM_SPLIT (0-8, default 0),

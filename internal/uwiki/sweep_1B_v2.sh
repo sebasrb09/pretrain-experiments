@@ -36,6 +36,13 @@ REPO="${REPO:-$PWD}"
 cd "$REPO" || { echo "cannot cd to REPO=$REPO"; exit 1; }
 PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
 
+# Nothing that defines the experiment may come from the login shell: env.sh
+# alone exports a 2.7B OUTPUT_ROOT. Overrides this script deliberately accepts
+# from the caller are named here; everything else is set below or left to the
+# cell default. See internal/uwiki/scrub_env.sh.
+source "$REPO/internal/uwiki/scrub_env.sh"
+scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE
+
 DRY_RUN="${DRY_RUN:-1}"            # SAFE DEFAULT: dry unless told otherwise
 MAXQ="${MAXQ:-160}"
 POLL="${POLL:-120}"
@@ -63,13 +70,13 @@ export TIME=06:00:00                                 #     6h per TRAINING job
 # no step is trained that nothing reads.
 export CKPT_STEPS="1,2,3,5,8,13,21,34,55"
 
-# Evaluation. SKIP_DOS defaults to 1 in eval_cell_body.sh because the judge is
-# gated, and v1 of this script wrongly forced it to 0. DoS is the single most
-# expensive task (200 generations scored by an 8B judge) and its noise-to-signal
-# is 1.58, so it feeds no panel in the paper. Left off. Set SKIP_DOS=0 to
-# include it, at roughly double the evaluation allocation.
+# Evaluation: the FULL suite, every task including denial of service. The sweep
+# is the reference arm and its tables need all of them. eval_cell_body.sh
+# defaults SKIP_MIA and SKIP_DOS to 1, so both are switched on explicitly.
+# DoS needs the gated judge meta-llama/Meta-Llama-3-8B-Instruct, which is
+# checked before any eval is submitted (see "judge" below).
 TIME_EVAL="${TIME_EVAL:-12:00:00}"
-SKIP_DOS="${SKIP_DOS:-1}"
+SKIP_DOS="${SKIP_DOS:-0}"
 MIA_CACHE="$PE/hf/mia-cache"
 
 log () { echo "[$(date '+%F %T')] $*"; }
@@ -179,6 +186,28 @@ if [ -d "$MIA_CACHE" ] && [ -n "$(ls -A "$MIA_CACHE" 2>/dev/null)" ]; then
 else
   OFFLINE=0; log "  MIA cache EMPTY, evaluating online (watch for 429s)"
 fi
+
+# judge. Offline evals can only load the DoS judge from the local hub cache, and
+# a missing judge would fail DoS in every one of ~330 jobs after the other tasks
+# had already spent their time. Refuse up front instead.
+if [ "$SKIP_DOS" = "0" ] && [ "$OFFLINE" = "1" ]; then
+  JUDGE_DIR="${HF_HOME:-$PE/hf}/hub/models--meta-llama--Meta-Llama-3-8B-Instruct"
+  if ls "$JUDGE_DIR"/snapshots/*/*.safetensors >/dev/null 2>&1; then
+    log "  judge cached: $JUDGE_DIR"
+  else
+    log "  NO CACHED JUDGE at $JUDGE_DIR, and evals run offline. Not submitting."
+    log "  Prime it online once, or run with SKIP_DOS=1 knowingly."
+    exit 1
+  fi
+fi
+
+# Never submit evals for these tags while evals for them are still queued or
+# running: a rerun (for example to add DoS) would race the jobs in flight on the
+# same checkpoint. Completed tasks carry .done markers, so once the queue is
+# clear a rerun only computes what is missing.
+while have_pe=$(squeue -u "$USER" -h -o '%j' 2>/dev/null | grep -c '^pe-1B-v2-lr'); [ "$have_pe" -gt 0 ]; do
+  log "    $have_pe eval job(s) for this sweep still in flight, waiting"; sleep "$POLL"
+done
 
 for tag in 1B-v2-lr3e-06 1B-v2-lr1e-05 1B-v2-lr5e-05 1B-v2-lr1e-03; do
   [ -d "$OUTPUT_ROOT/$tag" ] || { log "  [skip] $tag not present"; continue; }

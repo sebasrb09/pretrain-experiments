@@ -26,6 +26,7 @@ Usage:
         --method ce-u --budget-tokens 300e6 --max-parallel 8
 """
 import argparse
+import glob
 import json
 import math
 import os
@@ -48,6 +49,47 @@ PE = os.environ.get("PE_WORK", "/scratch/project_465003383/unlearning_baselines"
 # best steps on the working sweep were 5, 8, 13, 14, 21, 25, 28 and 51, so the
 # ladder brackets all of them.
 DEFAULT_RUNGS = [3, 8, 21, 55]
+
+# The sweep's own checkpoint schedule. A finalized winner is retrained on it so
+# its trajectory lines up rung for rung with every sweep cell.
+FINAL_RUNGS = [1, 2, 3, 5, 8, 13, 21, 34, 55]
+
+# The 1.5B identity, the same overrides sweep_1B_v2.sh uses. Without these the
+# LUMI wrapper supplies its 2.7B defaults.
+IDENTITY = {
+    "MODEL": "sbordt/OLMo-2-1B-Exp-Unlearning",
+    "REVISION": "stage1-step100000-tokens210B",
+    "OPTIM_REPO": "sbordt/OLMo-2-1B-Exp-Unlearning",
+    "OPTIM_REVISION": "step100000-unsharded",
+    "OLMO_CONFIG": "",
+}
+
+
+def _scrub_vars():
+    """SCRUB_VARS from internal/uwiki/scrub_env.sh, so there is one list."""
+    path = os.path.join(REPO, "internal", "uwiki", "scrub_env.sh")
+    src = open(path, encoding="utf-8").read()
+    body = src[src.index("SCRUB_VARS=(") + len("SCRUB_VARS=("):]
+    body = body[:body.index(chr(10) + ")")]
+    names = []
+    for line in body.splitlines():
+        names += line.split("#", 1)[0].split()
+    return names
+
+
+SCRUB_VARS = _scrub_vars()
+
+
+def _clean_env():
+    """The login environment minus everything that defines the experiment.
+
+    sbatch --export=ALL hands the job this whole environment, and the cell
+    scripts read dozens of experiment variables with ${VAR:-default}. So a
+    value left in the shell, and env.sh exports a 2.7B OUTPUT_ROOT on every
+    source, would silently change what a trial runs. Each such variable is
+    either set explicitly by this driver or absent.
+    """
+    return {k: v for k, v in os.environ.items() if k not in SCRUB_VARS}
 
 
 # --------------------------------------------------------------- stub sampler
@@ -144,7 +186,7 @@ def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=2
 
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
     tag = f"hpo-{method}-t{trial_no:04d}"
-    env = dict(os.environ)
+    env = _clean_env()
     trial_env = spaces.env_for(method, params, steps, rungs)
     # Refuse to submit a trial carrying a dimension the cell cannot forward.
     # Two such dimensions existed before this check: grad-diff's retain_weight
@@ -157,14 +199,8 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
         "RUN_TAG": tag,
         "OUTPUT_ROOT": out_root,
         "RUNGS": " ".join(str(r) for r in rungs),
-        # The 1.5B identity, the same overrides sweep_1B_v2.sh uses. Without
-        # these the LUMI wrapper supplies its 2.7B defaults.
-        "MODEL": "sbordt/OLMo-2-1B-Exp-Unlearning",
-        "REVISION": "stage1-step100000-tokens210B",
-        "OPTIM_REPO": "sbordt/OLMo-2-1B-Exp-Unlearning",
-        "OPTIM_REVISION": "step100000-unsharded",
-        "OLMO_CONFIG": "",
     })
+    env.update(IDENTITY)
     cmd = ["sbatch", "-J", tag, f"--time={time_limit}", "--export=ALL",
            os.path.join(HERE, "hpo_trial.sh")]
     if dry:
@@ -181,8 +217,18 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
 
 
 def _running(job):
+    """True while the job is queued or running, and also when we cannot tell.
+
+    squeue on LUMI occasionally fails with "Socket timed out". Reading that
+    empty reply as "finished" would harvest a trial that is still training,
+    find no result, and mark it failed, losing its tokens and its result. A
+    finished job makes squeue -j exit non-zero with "Invalid job id", which is
+    the only failure taken to mean done.
+    """
     r = subprocess.run(["squeue", "-j", str(job), "-h"],
                        capture_output=True, text=True)
+    if r.returncode != 0:
+        return "Invalid job id" not in (r.stderr or "")
     return bool(r.stdout.strip())
 
 
@@ -199,10 +245,7 @@ def _harvest(out_root, tag, method):
     return None
 
 
-def search(args):
-    import optuna
-    from optuna.samplers import GPSampler
-
+def _storage(args):
     # Journal storage by default, not SQLite. The study lives on Lustre, and
     # SQLite relies on POSIX byte-range locks that parallel filesystems do not
     # reliably honour, which shows up as "database is locked" or "disk I/O
@@ -213,13 +256,19 @@ def search(args):
         if args.storage.startswith("sqlite:///"):
             os.makedirs(os.path.dirname(args.storage[len("sqlite:///"):]) or ".",
                         exist_ok=True)
-        storage = args.storage
-    else:
-        from optuna.storages import JournalStorage
-        from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
-        os.makedirs(os.path.dirname(args.storage) or ".", exist_ok=True)
-        storage = JournalStorage(JournalFileBackend(
-            args.storage, lock_obj=JournalFileOpenLock(args.storage)))
+        return args.storage
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+    os.makedirs(os.path.dirname(args.storage) or ".", exist_ok=True)
+    return JournalStorage(JournalFileBackend(
+        args.storage, lock_obj=JournalFileOpenLock(args.storage)))
+
+
+def search(args):
+    import optuna
+    from optuna.samplers import GPSampler
+
+    storage = _storage(args)
 
     def constraints_func(trial):
         # Positive is a violation. A trial whose every rung blew the utility cap
@@ -249,6 +298,9 @@ def search(args):
     print(f"  budget {args.budget_tokens/1e9:.3f}B tokens, already spent "
           f"{spent/1e9:.3f}B over {len(study.trials)} trial(s)")
     print(f"  uniform random for the first {args.startup} trials, then GP")
+    gone = sorted(k for k in os.environ if k in SCRUB_VARS)
+    if gone:
+        print(f"  ignoring {len(gone)} inherited experiment variable(s): {' '.join(gone)}")
 
     inflight = {}        # trial_no -> (optuna trial, job, tag, tokens)
     submit_failures = 0
@@ -291,6 +343,9 @@ def search(args):
                 continue
             submit_failures = 0
             trial.set_user_attr("tokens", cost)
+            # The natural values (betas, not their logits) exactly as sent to
+            # the job, so a winner can be retrained without re-deriving them.
+            trial.set_user_attr("params", params)
             trial.set_user_attr("job", job)
             trial.set_user_attr("tag", tag)
             inflight[trial.number] = (trial, job, tag, cost)
@@ -339,6 +394,174 @@ def search(args):
         print("  no in-budget trial yet")
 
 
+def _natural_params(trial):
+    """A trial's hyperparameters as values, not as the logits Optuna stores.
+
+    Trials submitted by this version carry the exact values in user_attrs.
+    Older ones are reconstructed by squashing each *_logit parameter back.
+    """
+    if "params" in trial.user_attrs:
+        return dict(trial.user_attrs["params"])
+    p = {}
+    for k, v in trial.params.items():
+        if k.endswith("_logit"):
+            p[k[:-len("_logit")]] = 1.0 / (1.0 + math.exp(-v))
+        else:
+            p[k] = v
+    return p
+
+
+def _queued_names():
+    """Job names in the queue, or None when squeue could not be read."""
+    r = subprocess.run(["squeue", "-u", os.environ.get("USER", ""), "-h", "-o", "%j"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return set(r.stdout.split())
+
+
+def _cell_dir(root, tag, method):
+    parent = os.path.join(root, tag, method)
+    if not os.path.isdir(parent):
+        return None
+    subs = sorted(d for d in os.listdir(parent)
+                  if os.path.isdir(os.path.join(parent, d)))
+    return os.path.join(parent, subs[0]) if subs else None
+
+
+def finalize(args):
+    """Retrain the best trial(s) on the sweep schedule and run the FULL suite.
+
+    The search measures only its objective and constraint. The winner then gets
+    everything a sweep cell gets: every task including MIA and denial of
+    service, on every rung of the sweep's own checkpoint schedule, so it sits in
+    the same tables and on the same axes as the sweep.
+
+    Retraining uses the trial's exact settings and seed, so its trajectory
+    reproduces the trial's up to GPU nondeterminism, and the |wm_q4| it reports
+    at the trial's best step is a direct check on the search.
+
+    Idempotent. Training is skipped for a winner that already has its last
+    checkpoint or is queued, and an eval for a checkpoint that already has an
+    evals/ directory or a queued job, so a rerun does only what is missing.
+    """
+    import optuna
+    study = optuna.load_study(study_name=args.study or f"hpo-{args.method}",
+                              storage=_storage(args))
+    ok = [t for t in study.trials
+          if t.state.name == "COMPLETE" and t.value is not None
+          and t.user_attrs.get("feasible")]
+    if not ok:
+        sys.exit("no feasible completed trial to finalize")
+    winners = sorted(ok, key=lambda t: t.value)[:args.top_k]
+    root = args.final_root
+    last = FINAL_RUNGS[-1]
+    print(f"=== finalize {args.method}: top {len(winners)} of {len(ok)} feasible trial(s) ===")
+    print(f"  root {root}, schedule {FINAL_RUNGS}, full suite incl. MIA and DoS")
+
+    queued = set() if args.dry_run else _queued_names()
+    if queued is None:
+        sys.exit("squeue could not be read, so duplicates cannot be ruled out. Rerun.")
+
+    tags = []
+    for t in winners:
+        params = _natural_params(t)
+        tag = f"hpo-final-{args.method}-t{t.number:04d}"
+        tags.append(tag)
+        print(f"  trial {t.number}: |wm_q4|={t.value:.4f} at step "
+              f"{t.user_attrs.get('best_step')}, c4 "
+              f"+{t.user_attrs.get('c4_delta_pct', float('nan')):.2f}% in the search")
+        for k, v in sorted(params.items()):
+            print(f"      {k} = {v}")
+        cell = _cell_dir(root, tag, args.method)
+        if cell and os.path.isdir(os.path.join(cell, f"step-{last}")):
+            print(f"    already trained: {cell}")
+            continue
+        if tag in queued:
+            print("    already queued")
+            continue
+        tenv = spaces.env_for(args.method, params, args.steps, FINAL_RUNGS)
+        spaces.validate(args.method, params, tenv)
+        env = _clean_env()
+        env.update(tenv)
+        env.update(IDENTITY)
+        env.update({"RUN_TAG": tag, "OUTPUT_ROOT": root})
+        wt = args.time or trial_walltime(args.method, params, args.steps, [],
+                                         args.tokens_per_hour, 0.0)
+        cmd = ["sbatch", "-J", tag, f"--time={wt}", "--export=ALL",
+               os.path.join(REPO, "internal", "lumi", "unlearn_cell.sh")]
+        if args.dry_run:
+            print(f"    [dry] {' '.join(cmd)}")
+            print(f"          CKPT_STEPS={tenv['CKPT_STEPS']} MICRO_BATCH={tenv['MICRO_BATCH']} "
+                  f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']}")
+            continue
+        out = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if out.returncode != 0:
+            print(f"    TRAIN SUBMIT FAILED: {out.stderr.strip()}", file=sys.stderr)
+            continue
+        print(f"    training submitted as job {out.stdout.strip().split()[-1]}, walltime {wt}")
+
+    if args.dry_run:
+        print("[dry] nothing submitted")
+        return
+
+    # Wait by NAME, so a restarted finalize also waits for jobs it did not
+    # submit itself. An unreadable queue counts as still busy.
+    while True:
+        q = _queued_names()
+        if q is not None and not [tag for tag in tags if tag in q]:
+            break
+        print("  winner(s) still training" if q is not None else "  squeue unreadable, waiting")
+        time.sleep(args.poll)
+
+    mia = os.path.join(PE, "hf", "mia-cache")
+    off = "1" if (os.path.isdir(mia) and os.listdir(mia)) else "0"
+    hub = os.path.join(os.environ.get("HF_HOME", os.path.join(PE, "hf")), "hub")
+    judge = os.path.join(hub, "models--meta-llama--Meta-Llama-3-8B-Instruct", "snapshots")
+    if off == "1" and not glob.glob(os.path.join(judge, "*", "*.safetensors")):
+        sys.exit(f"no cached DoS judge under {judge} and evals run offline. Not submitting.")
+
+    queued = _queued_names()
+    if queued is None:
+        sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
+    n = 0
+    for tag in tags:
+        cell = _cell_dir(root, tag, args.method)
+        if cell is None:
+            print(f"  {tag}: no cell directory, training did not run")
+            continue
+        cname = os.path.basename(cell)
+        have = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
+                      key=lambda d: int(d[len("step-"):]))
+        missing = [r for r in FINAL_RUNGS if f"step-{r}" not in have]
+        if missing:
+            print(f"  WARNING {tag}: no checkpoint at steps {missing}")
+        for st in have:
+            ck = os.path.join(cell, st)
+            jn = f"pe-{tag}-{args.method}-{cname}-{st}"
+            if os.path.isdir(os.path.join(ck, "evals")) or jn in queued:
+                continue
+            eenv = _clean_env()   # no MODEL: it would make the eval measure the HF repo
+            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0",
+                         "MIA_CACHE_DIR": mia,
+                         "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
+                         "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
+            cmd = ["sbatch", "-J", jn, "-t", args.eval_time,
+                   f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
+                   os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
+            out = subprocess.run(cmd, env=eenv, capture_output=True, text=True)
+            if out.returncode != 0:
+                print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
+                continue
+            n += 1
+    print(f"=== {n} full-suite eval job(s) submitted ===")
+    print("  once they finish, export both together:")
+    print(f"    python internal/uwiki/audit_configs.py  --output-root {root} "
+          f"--out \"$PE_WORK/exports-hpo-final/results_configs.csv\"")
+    print(f"    python internal/uwiki/export_results.py --output-root {root} "
+          f"--out \"$PE_WORK/exports-hpo-final\" --tags 'hpo-final-*'")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", required=True, choices=sorted(spaces.USES_RETAIN))
@@ -376,6 +599,14 @@ def main():
                     help="a file path selects Lustre-safe journal storage (default); "
                          "a URL such as sqlite:///... is passed to Optuna as is")
     ap.add_argument("--study", default=None)
+    ap.add_argument("--finalize", action="store_true",
+                    help="retrain the best feasible trial(s) on the sweep schedule "
+                         "and run the FULL eval suite on every checkpoint")
+    ap.add_argument("--top-k", type=int, default=1,
+                    help="how many of the best trials --finalize retrains")
+    ap.add_argument("--final-root", default=os.path.join(PE, "hpo-final"))
+    ap.add_argument("--eval-time", default="12:00:00",
+                    help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
     if args.startup is None:
@@ -396,6 +627,9 @@ def main():
     if args.plan:
         plan(args.method, args.budget_tokens, args.steps, args.rungs, 10,
              args.max_batch, args.tokens_per_hour, args.eval_minutes)
+        return 0
+    if args.finalize:
+        finalize(args)
         return 0
     search(args)
     return 0
