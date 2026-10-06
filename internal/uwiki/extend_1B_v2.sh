@@ -41,6 +41,16 @@ cd "$REPO" || { echo "cannot cd to REPO=$REPO"; exit 1; }
 PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
 source "$REPO/internal/uwiki/scrub_env.sh"   # nothing experiment-defining from the shell
 scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE
+# The watermark noise vectors, set EXPLICITLY. Nothing on LUMI resolves the
+# eval body's default ($PE_DATA or $HOME/pretrain-experiments), and with the
+# vectors missing the watermark is not scored. build_noise_dir.sh writes them here.
+NOISE_DIR_1B="$PE/noise-vectors/OLMo-2-1B-Exp"
+n_noise=$(ls "$NOISE_DIR_1B"/gaussian_poisoning_*.pkl 2>/dev/null | wc -l)
+if [ "$n_noise" -eq 0 ]; then
+  echo "NO NOISE VECTORS in $NOISE_DIR_1B. The watermark cannot be scored. Not launching."
+  exit 1
+fi
+echo "  noise vectors: $NOISE_DIR_1B ($n_noise files)"
 DRY_RUN="${DRY_RUN:-1}"
 ALLOW_RESTART="${ALLOW_RESTART:-0}"
 POLL="${POLL:-300}"
@@ -219,7 +229,7 @@ for row in "${TODO[@]}"; do
     # Same stripping as the sweep's eval phase: MODEL would make the eval measure
     # the HF repo instead of $ck, and CELL_SCRIPT is the training wrapper.
     env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION -u CELL_SCRIPT \
-      SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" \
+      SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" NOISE_DIR="$NOISE_DIR_1B" EVAL_MAX_NUM_SEQS=1 \
       MIA_CACHE_DIR="$MIA_CACHE" MIA_REF_CACHE_DIR="$MIA_CACHE/ref" \
       HF_HUB_OFFLINE="$OFF" HF_DATASETS_OFFLINE="$OFF" \
       sbatch -J "$jn" -t "$EVAL_TIME" \

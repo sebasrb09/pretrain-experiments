@@ -98,6 +98,29 @@ def _clean_env():
 
 BRIDGE_DIR = os.path.join(PE, "hpo", "bridge")
 
+# Where build_noise_dir.sh puts the 1.5B watermark vectors on LUMI. Passed to
+# every trial and eval EXPLICITLY: the eval body's own default resolves to a
+# $HOME path that does not exist here, and the first pilot died on exactly that.
+NOISE_DIR_1B = os.path.join(PE, "noise-vectors", "OLMo-2-1B-Exp")
+
+# 18.7734 is the C4 perplexity of the 1.5B BASELINE anchor (step 0) on LUMI,
+# from exports-1B-lumi/results_anchors.csv, identical on ASC. 19.71 is the 5%
+# CAP (18.7734 x 1.05), and an earlier version used it here as the baseline,
+# which put the feasibility line at 20.70, a 10.3% budget.
+C4_BASELINE_1B = "18.7734"
+UTIL_CAP_PCT = "5.0"
+
+# Eval batch for perplexity. Every LUMI eval launcher before the HPO set 1:
+# perplexity.py documents batch 8 asking for ~19 GB in one allocation, an OOM
+# on a 64 GB MI250X GCD. Memory only: LUMI and ASC baselines agree to 4 d.p.
+EVAL_MAX_NUM_SEQS = "1"
+
+
+def _require_noise():
+    if not glob.glob(os.path.join(NOISE_DIR_1B, "gaussian_poisoning_*.pkl")):
+        sys.exit(f"no gaussian_poisoning_*.pkl in {NOISE_DIR_1B}: the watermark, which is "
+                 "the objective, cannot be scored. Not launching.")
+
 
 def _host_run(cmd, explicit=None, timeout=900):
     """Run a SLURM command on the host, even from inside the container.
@@ -284,6 +307,10 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
         "RUN_TAG": tag,
         "OUTPUT_ROOT": out_root,
         "RUNGS": " ".join(str(r) for r in rungs),
+        "NOISE_DIR": NOISE_DIR_1B,
+        "BASE_C4_PPL": C4_BASELINE_1B,
+        "UTIL_CAP_PCT": UTIL_CAP_PCT,
+        "EVAL_MAX_NUM_SEQS": EVAL_MAX_NUM_SEQS,
     })
     env.update(IDENTITY)
     cmd = ["sbatch", "-J", tag, f"--time={time_limit}", "--export=ALL",
@@ -354,6 +381,7 @@ def search(args):
 
     if not args.dry_run:
         _require_host_slurm()
+        _require_noise()
     storage = _storage(args)
 
     def constraints_func(trial):
@@ -390,6 +418,10 @@ def search(args):
 
     inflight = {}        # trial_no -> (optuna trial, job, tag, tokens)
     submit_failures = 0
+    # Trials that ran but returned nothing. Three in a row means something
+    # systematic (a missing input, a broken path), and continuing would spend
+    # the whole budget on trials that cannot produce an objective.
+    empty_results = 0
 
     while True:
         # Fill the queue while there is budget and room.
@@ -450,6 +482,11 @@ def search(args):
             if res is None or res.get("best") is None:
                 print(f"  trial {no} ({tag}) produced no result, marked failed")
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                empty_results += 1
+                if empty_results >= 3:
+                    sys.exit("ABORT: 3 consecutive trials produced no result. Read one "
+                             f"hpo-{args.method}-t*.out before relaunching. Trials still "
+                             "in the queue are not cancelled.")
             else:
                 best = res["best"]
                 trial.set_user_attr("constraint", res["constraint"])
@@ -457,6 +494,7 @@ def search(args):
                 trial.set_user_attr("c4_delta_pct", best["c4_delta_pct"])
                 trial.set_user_attr("feasible", res["feasible"])
                 study.tell(trial, res["objective"])
+                empty_results = 0
                 flag = "" if res["feasible"] else "  INFEASIBLE"
                 print(f"  trial {no}: |wm_q4|={res['objective']:.4f} at step "
                       f"{best['step']}, c4 +{best['c4_delta_pct']:.2f}%{flag}"
@@ -533,6 +571,7 @@ def finalize(args):
     import optuna
     if not args.dry_run:
         _require_host_slurm()
+        _require_noise()
     study = optuna.load_study(study_name=args.study or f"hpo-{args.method}",
                               storage=_storage(args))
     ok = [t for t in study.trials
@@ -629,7 +668,8 @@ def finalize(args):
             if os.path.isdir(os.path.join(ck, "evals")) or jn in queued:
                 continue
             eenv = {}   # explicit only; MODEL in particular must never reach an eval
-            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0",
+            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0", "NOISE_DIR": NOISE_DIR_1B,
+                         "EVAL_MAX_NUM_SEQS": EVAL_MAX_NUM_SEQS,
                          "MIA_CACHE_DIR": mia,
                          "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
                          "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})

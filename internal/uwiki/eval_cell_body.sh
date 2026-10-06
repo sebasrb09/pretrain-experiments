@@ -289,7 +289,12 @@ fi
 if [ "${SKIP_GW:-0}" = "1" ]; then
   echo "  [gaussian_watermark] SKIP_GW=1, skipping"
 elif [ ! -d "$NOISE_DIR" ] || ! ls "$NOISE_DIR"/gaussian_poisoning_*.pkl >/dev/null 2>&1; then
-  echo "  [gaussian_watermark] no gaussian_poisoning_*.pkl in $NOISE_DIR -- skipping."
+  # A FAILURE, not a skip. The watermark is the main detectability axis, and a
+  # skip let jobs finish "successfully" with no score and no .done marker, so a
+  # wrong NOISE_DIR went unnoticed across a whole sweep. Recorded in FAILED, the
+  # job now exits non-zero and sacct shows it.
+  echo "  [gaussian_watermark] FAILED: no gaussian_poisoning_*.pkl in $NOISE_DIR" >&2
+  FAILED="$FAILED gaussian_watermark"
   echo "     No script in this repo can build the 1B set and it is not on the Hub;"
   echo "     it has to be copied in. See PAPER-CONTEXT.md."
 else

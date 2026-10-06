@@ -43,7 +43,8 @@ def main():
         print(0)
         return 0
 
-    base = float(os.environ.get("BASE_C4_PPL", "19.71"))
+    # Baseline anchor, not the 19.71 cap; the driver passes it explicitly.
+    base = float(os.environ.get("BASE_C4_PPL", "18.7734"))
     cap = float(os.environ.get("UTIL_CAP_PCT", "5.0"))
     delta = 100.0 * (float(c4) - base) / base
     print(1 if delta > cap else 0)

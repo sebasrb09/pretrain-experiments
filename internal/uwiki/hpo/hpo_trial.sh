@@ -29,13 +29,25 @@ set -u
 REPO="${REPO:?REPO must be set by the driver}"
 cd "$REPO" || exit 1
 
+# Load the LUMI module environment HERE, not only inside the training and eval
+# wrappers: this script itself runs over_cap.py and summarize_trial.py, which
+# need the container Python (PyYAML, torch). Without this they ran on whatever
+# `python` the submitting shell happened to have on PATH. The two LUMI wrappers
+# source the same file under set -u, so it is safe here.
+source "$REPO/internal/lumi/env.sh"
+cd "$REPO" || exit 1
+
 TRIAL="${TRIAL:?}"
 METHOD="${METHOD:?}"
 VALUE="${VALUE:?}"
 RUN_TAG="${RUN_TAG:?}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?}"
 RUNGS="${RUNGS:?}"                      # space separated, e.g. "3 8 21 55"
-BASE_C4_PPL="${BASE_C4_PPL:-19.71}"     # pretrained 1.5B baseline
+# 18.7734 is the C4 perplexity of the 1.5B BASELINE anchor (step 0) on LUMI,
+# from exports-1B-lumi/results_anchors.csv, identical on ASC. 19.71 is the 5%
+# CAP (18.7734 x 1.05), and an earlier version used it here as the baseline,
+# which put the feasibility line at 20.70, a 10.3% budget.
+BASE_C4_PPL="${BASE_C4_PPL:-18.7734}"
 UTIL_CAP_PCT="${UTIL_CAP_PCT:-5.0}"
 
 CELL="$OUTPUT_ROOT/$RUN_TAG/$METHOD"
@@ -48,7 +60,8 @@ env | grep -E '^(LR|TOTAL_BATCH|WARMUP_FRAC|WEIGHT_DECAY|MIN_FORGET_CE|RETAIN_WE
 # only a log line when the noise vectors are absent, which would hand the
 # driver a null objective for every trial and look like a flat landscape.
 # Refuse to start instead.
-NOISE_DIR="${NOISE_DIR:-${PE_DATA:-$HOME/pretrain-experiments}/noise-vectors/OLMo-2-1B-Exp}"
+# The driver passes NOISE_DIR explicitly; this fallback is where LUMI keeps them.
+NOISE_DIR="${NOISE_DIR:-${PE_WORK:-/scratch/project_465003383/unlearning_baselines}/noise-vectors/OLMo-2-1B-Exp}"
 export NOISE_DIR
 if ! ls "$NOISE_DIR"/gaussian_poisoning_*.pkl >/dev/null 2>&1; then
   echo "FATAL: no gaussian_poisoning_*.pkl in NOISE_DIR=$NOISE_DIR" >&2
@@ -64,7 +77,10 @@ METHOD="$METHOD" VALUE="$VALUE" \
 
 # The knob directory name is chosen by the cell script, and the HPO varies more
 # than one knob, so find it rather than reconstructing it.
-CELL_DIR="$(find "$CELL" -mindepth 1 -maxdepth 1 -type d | head -1)"
+# Match this trial's own VALUE (the cell is <knob>-<VALUE>), not "the first
+# subdirectory": a stale directory left by an earlier trial under the same tag
+# would otherwise be evaluated in place of the one just trained.
+CELL_DIR="$(find "$CELL" -mindepth 1 -maxdepth 1 -type d -name "*-$VALUE" | head -1)"
 if [ -z "$CELL_DIR" ]; then
   echo "FATAL: no cell directory under $CELL" >&2; exit 1
 fi

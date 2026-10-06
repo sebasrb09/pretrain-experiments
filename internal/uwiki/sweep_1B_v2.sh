@@ -43,6 +43,17 @@ PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
 source "$REPO/internal/uwiki/scrub_env.sh"
 scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE
 
+# The watermark noise vectors, set EXPLICITLY. Nothing on LUMI resolves the
+# eval body's default ($PE_DATA or $HOME/pretrain-experiments), and with the
+# vectors missing the watermark is not scored. build_noise_dir.sh writes them here.
+NOISE_DIR_1B="$PE/noise-vectors/OLMo-2-1B-Exp"
+n_noise=$(ls "$NOISE_DIR_1B"/gaussian_poisoning_*.pkl 2>/dev/null | wc -l)
+if [ "$n_noise" -eq 0 ]; then
+  echo "NO NOISE VECTORS in $NOISE_DIR_1B. The watermark cannot be scored. Not launching."
+  exit 1
+fi
+echo "  noise vectors: $NOISE_DIR_1B ($n_noise files)"
+
 DRY_RUN="${DRY_RUN:-1}"            # SAFE DEFAULT: dry unless told otherwise
 MAXQ="${MAXQ:-160}"
 POLL="${POLL:-120}"
@@ -223,7 +234,8 @@ for tag in 1B-v2-lr3e-06 1B-v2-lr1e-05 1B-v2-lr5e-05 1B-v2-lr1e-03; do
   # honours an inherited CELL_SCRIPT, and its guard then refuses a training
   # wrapper and exits. Without this every tag failed and no eval launched.
   env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION -u CELL_SCRIPT \
-  EVAL_CELL_SCRIPT=internal/lumi/eval_pareto_cell.sh \
+  EVAL_CELL_SCRIPT=internal/lumi/eval_pareto_cell.sh NOISE_DIR="$NOISE_DIR_1B" \
+  EVAL_MAX_NUM_SEQS=1 \
   OUTPUT_ROOT="$OUTPUT_ROOT" RUN_TAG="$tag" TIME="$TIME_EVAL" \
   SKIP_ANCHORS=1 SKIP_EPOCH_CKPTS=1 SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" \
   MIA_CACHE_DIR="$MIA_CACHE" MIA_REF_CACHE_DIR="$MIA_CACHE/ref" \

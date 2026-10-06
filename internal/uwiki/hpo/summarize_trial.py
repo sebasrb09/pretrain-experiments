@@ -34,7 +34,8 @@ def main():
 
     cell_dir = os.environ["CELL_DIR"]
     rungs = [int(r) for r in os.environ["RUNGS"].split()]
-    base = float(os.environ.get("BASE_C4_PPL", "19.71"))
+    # Baseline anchor, not the 19.71 cap; the driver passes it explicitly.
+    base = float(os.environ.get("BASE_C4_PPL", "18.7734"))
     cap = float(os.environ.get("UTIL_CAP_PCT", "5.0"))
 
     ex = _load_exporter()

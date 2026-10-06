@@ -114,7 +114,8 @@ since warmup clamps to one step starting at 1% of the peak.
 ## The objective
 
 Minimize **|wm_q4|**, the magnitude of the final-quarter Gaussian poison score,
-subject to C4 perplexity staying within 5% of the 19.71 baseline.
+subject to C4 perplexity staying within 5% of the baseline anchor, 18.7734, so at
+or below 19.71.
 
 The absolute value matters and is easy to get wrong. The score is signed: the
 baseline that saw every poison sits at `wm_q4 = -1.170` and a counterfactual
