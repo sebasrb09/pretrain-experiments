@@ -153,7 +153,10 @@ log "  plan: $n_res resume (~10h each), $n_rst restart (~16h each), $n_skip skip
 for row in "${TODO[@]}"; do
   read -r method lr value gc mb dtype mode <<< "$row"
   t="$RESUME_TIME"; [ "$mode" = "restart" ] && t="$RESTART_TIME"
-  while [ "$(nq)" -ge "$MAXQ" ]; do sleep "$POLL"; done
+  # Never wait silently: this can last hours while the eval orchestrator keeps
+  # the queue at its own cap, and an empty log looks like a dead script.
+  while [ "$(nq)" -ge "$MAXQ" ]; do
+    log "    queue at $(nq) >= MAXQ=$MAXQ, waiting to submit $method lr=$lr $value"; sleep "$POLL"; done
   GRAD_CKPT="$gc" MICRO_BATCH="$mb" FROZEN_DTYPE="$dtype" TIME="$t" \
   LR="$lr" METHODS="$method" VALUES="$value" RUN_TAG="1B-v2-lr$lr" \
   DRY_RUN="$DRY_RUN" \
@@ -211,7 +214,8 @@ for row in "${TODO[@]}"; do
     st="$(basename "$ck")"
     jn="pe-$tag-$method-$cname-$st"      # launch_pareto_evals.sh's naming
     if [ -d "$ck/evals" ] || queued "$jn"; then continue; fi
-    while [ "$(nq)" -ge "$MAXQ" ]; do sleep "$POLL"; done
+    while [ "$(nq)" -ge "$MAXQ" ]; do
+      log "    queue at $(nq) >= MAXQ=$MAXQ, waiting to submit eval $jn"; sleep "$POLL"; done
     # Same stripping as the sweep's eval phase: MODEL would make the eval measure
     # the HF repo instead of $ck, and CELL_SCRIPT is the training wrapper.
     env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION -u CELL_SCRIPT \
