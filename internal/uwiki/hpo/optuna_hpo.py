@@ -31,9 +31,13 @@ import json
 import math
 import os
 import random
+import shlex
+import shutil
 import subprocess
 import sys
 import time
+import uuid
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -90,6 +94,87 @@ def _clean_env():
     either set explicitly by this driver or absent.
     """
     return {k: v for k, v in os.environ.items() if k not in SCRUB_VARS}
+
+
+BRIDGE_DIR = os.path.join(PE, "hpo", "bridge")
+
+
+def _host_run(cmd, explicit=None, timeout=900):
+    """Run a SLURM command on the host, even from inside the container.
+
+    On LUMI this driver runs inside the PyTorch Singularity container, because
+    that is where optuna and torch live, and the container has no sbatch or
+    squeue: SLURM exists only on the host. When the command is on PATH (a
+    host Python, or a test) it runs directly. Otherwise it is handed to
+    hpo_bridge.sh, a host-side loop that executes request scripts dropped in
+    BRIDGE_DIR, and the reply is read back.
+
+    `explicit` holds the variables the job needs, and in bridge mode nothing
+    else from this process crosses over: inside the container os.environ
+    carries container paths (PATH, LD_LIBRARY_PATH, ...) that must never reach
+    a host job. The job inherits the bridge's host environment instead, with
+    every SCRUB_VARS entry removed and `explicit` exported on top.
+
+    Returns an object with returncode, stdout and stderr, like subprocess.run.
+    """
+    explicit = dict(explicit or {})
+    if shutil.which(cmd[0]):
+        env = _clean_env()
+        env.update(explicit)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    os.makedirs(BRIDGE_DIR, mode=0o700, exist_ok=True)
+    rid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    lines = ["set -u", f"cd {shlex.quote(os.getcwd())} || exit 97"]
+    drop = [v for v in SCRUB_VARS if v not in explicit]
+    if drop:
+        lines.append("unset " + " ".join(drop))
+    for k, v in explicit.items():
+        lines.append(f"export {k}={shlex.quote(str(v))}")
+    lines.append("exec " + " ".join(shlex.quote(c) for c in cmd))
+    base = os.path.join(BRIDGE_DIR, rid)
+    with open(base + ".tmp", "w", encoding="utf-8") as fh:
+        fh.write(chr(10).join(lines) + chr(10))
+    # Rename into place so the bridge never picks up half a request.
+    os.replace(base + ".tmp", base + ".req")
+
+    deadline = time.time() + timeout
+    while not os.path.exists(base + ".rc"):
+        if time.time() > deadline:
+            return types.SimpleNamespace(
+                returncode=124, stdout="",
+                stderr=f"no reply from hpo_bridge.sh within {timeout}s ({BRIDGE_DIR})")
+        time.sleep(1)
+
+    def _read(ext):
+        try:
+            with open(base + ext, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+    rc = int((_read(".rc").strip() or "1"))
+    res = types.SimpleNamespace(returncode=rc, stdout=_read(".out"), stderr=_read(".err"))
+    for ext in (".rc", ".out", ".err"):
+        try:
+            os.remove(base + ext)
+        except OSError:
+            pass
+    return res
+
+
+def _require_host_slurm():
+    """Fail fast when SLURM is unreachable, instead of hanging on every call."""
+    if shutil.which("sbatch"):
+        return
+    hb = os.path.join(BRIDGE_DIR, ".heartbeat")
+    age = time.time() - os.path.getmtime(hb) if os.path.exists(hb) else None
+    if age is None or age > 60:
+        sys.exit(
+            "sbatch is not available here (this is the container) and no live\n"
+            f"hpo_bridge.sh is serving {BRIDGE_DIR}. Start it on the HOST first:\n"
+            "  setsid nohup bash internal/uwiki/hpo/hpo_bridge.sh \\\n"
+            "      > \"$PE_WORK/hpo/bridge.log\" 2>&1 < /dev/null &\n"
+            "  disown")
 
 
 # --------------------------------------------------------------- stub sampler
@@ -186,7 +271,7 @@ def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=2
 
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
     tag = f"hpo-{method}-t{trial_no:04d}"
-    env = _clean_env()
+    env = {}            # only what the job needs; see _host_run
     trial_env = spaces.env_for(method, params, steps, rungs)
     # Refuse to submit a trial carrying a dimension the cell cannot forward.
     # Two such dimensions existed before this check: grad-diff's retain_weight
@@ -207,7 +292,7 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
         print(f"  [dry] {tag}  " + " ".join(
             f"{k}={env[k]}" for k in sorted(spaces.env_for(method, params, steps, rungs))))
         return None, tag
-    out = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    out = _host_run(cmd, env)
     if out.returncode != 0:
         print(f"  SUBMIT FAILED for {tag}: {out.stderr.strip()}", file=sys.stderr)
         return None, tag
@@ -225,8 +310,7 @@ def _running(job):
     finished job makes squeue -j exit non-zero with "Invalid job id", which is
     the only failure taken to mean done.
     """
-    r = subprocess.run(["squeue", "-j", str(job), "-h"],
-                       capture_output=True, text=True)
+    r = _host_run(["squeue", "-j", str(job), "-h"])
     if r.returncode != 0:
         return "Invalid job id" not in (r.stderr or "")
     return bool(r.stdout.strip())
@@ -268,6 +352,8 @@ def search(args):
     import optuna
     from optuna.samplers import GPSampler
 
+    if not args.dry_run:
+        _require_host_slurm()
     storage = _storage(args)
 
     def constraints_func(trial):
@@ -413,8 +499,7 @@ def _natural_params(trial):
 
 def _queued_names():
     """Job names in the queue, or None when squeue could not be read."""
-    r = subprocess.run(["squeue", "-u", os.environ.get("USER", ""), "-h", "-o", "%j"],
-                       capture_output=True, text=True)
+    r = _host_run(["squeue", "-u", os.environ.get("USER", ""), "-h", "-o", "%j"])
     if r.returncode != 0:
         return None
     return set(r.stdout.split())
@@ -446,6 +531,8 @@ def finalize(args):
     evals/ directory or a queued job, so a rerun does only what is missing.
     """
     import optuna
+    if not args.dry_run:
+        _require_host_slurm()
     study = optuna.load_study(study_name=args.study or f"hpo-{args.method}",
                               storage=_storage(args))
     ok = [t for t in study.trials
@@ -482,7 +569,7 @@ def finalize(args):
             continue
         tenv = spaces.env_for(args.method, params, args.steps, FINAL_RUNGS)
         spaces.validate(args.method, params, tenv)
-        env = _clean_env()
+        env = {}        # only what the job needs; see _host_run
         env.update(tenv)
         env.update(IDENTITY)
         env.update({"RUN_TAG": tag, "OUTPUT_ROOT": root})
@@ -495,7 +582,7 @@ def finalize(args):
             print(f"          CKPT_STEPS={tenv['CKPT_STEPS']} MICRO_BATCH={tenv['MICRO_BATCH']} "
                   f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']}")
             continue
-        out = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        out = _host_run(cmd, env)
         if out.returncode != 0:
             print(f"    TRAIN SUBMIT FAILED: {out.stderr.strip()}", file=sys.stderr)
             continue
@@ -541,7 +628,7 @@ def finalize(args):
             jn = f"pe-{tag}-{args.method}-{cname}-{st}"
             if os.path.isdir(os.path.join(ck, "evals")) or jn in queued:
                 continue
-            eenv = _clean_env()   # no MODEL: it would make the eval measure the HF repo
+            eenv = {}   # explicit only; MODEL in particular must never reach an eval
             eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0",
                          "MIA_CACHE_DIR": mia,
                          "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
@@ -549,7 +636,7 @@ def finalize(args):
             cmd = ["sbatch", "-J", jn, "-t", args.eval_time,
                    f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
                    os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
-            out = subprocess.run(cmd, env=eenv, capture_output=True, text=True)
+            out = _host_run(cmd, eenv)
             if out.returncode != 0:
                 print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
                 continue

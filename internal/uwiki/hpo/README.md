@@ -162,6 +162,20 @@ the training stack, which is why this is safe where adding `accelerate` was not.
 If the venv was collapsed with `MAKE_SQUASHFS=1` it is read-only and pip will
 fail, so unsquash, install and re-squash as `setup_env.sh` describes.
 
+**SLURM lives on the host, Optuna in the container.** `python` after `env.sh` runs
+inside the PyTorch container, which has no `sbatch` or `squeue`. So the driver hands
+its SLURM commands to `hpo_bridge.sh`, a small loop that runs them on the host. Start
+it once from a normal login shell; it serves any number of drivers, refuses to run
+inside a container, runs only request files you own in a private directory, and exits
+after 48 idle hours or when `$PE_WORK/hpo/bridge/.stop` appears. Without a live bridge
+the driver stops at once with instructions rather than hanging.
+
+```bash
+mkdir -p "$PE_WORK/hpo"
+setsid nohup bash internal/uwiki/hpo/hpo_bridge.sh \n    > "$PE_WORK/hpo/bridge.log" 2>&1 < /dev/null &
+disown
+```
+
 ```bash
 # 1. budget arithmetic and sample configurations. Submits nothing.
 python internal/uwiki/hpo/optuna_hpo.py --method ce-u --plan
