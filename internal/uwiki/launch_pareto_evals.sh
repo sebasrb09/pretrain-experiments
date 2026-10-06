@@ -134,14 +134,38 @@ echo "  time:    $TIME"
 echo "  dry run: $DRY_RUN"
 echo "============================================"
 
+# PER-JOB throttle. A tag is ~150 checkpoints and they are submitted in one
+# pass, so a room check before each TAG (what the sweep orchestrators do) lets a
+# tag start at 159 queued jobs and burst to ~310, far past LUMI's per-user
+# limit (small-g: MaxSubmit 210). The excess sbatch calls fail, and before this
+# they were ignored: the checkpoints were counted as submitted and silently never
+# evaluated. Now every submission waits for room under SUBMIT_CAP, a failed one
+# is retried, and anything still failing is listed and makes this exit non-zero.
+SUBMIT_CAP="${SUBMIT_CAP:-195}"
+n_fail=0
+failed=""
 submit () {
   # submit <job-name> <VAR=VAL,...>
-  local job_name="$1" exports="$2"
+  local job_name="$1" exports="$2" try out
   if [ "$DRY_RUN" = "1" ]; then
     echo "  [dry] sbatch -J $job_name -t $TIME --export=ALL,$exports $CELL_SCRIPT"
-  else
-    sbatch -J "$job_name" -t "$TIME" --export=ALL,"$exports" "$CELL_SCRIPT"
+    return 0
   fi
+  while [ "$(squeue -u "$USER" -h 2>/dev/null | wc -l)" -ge "$SUBMIT_CAP" ]; do
+    echo "  queue at SUBMIT_CAP=$SUBMIT_CAP, waiting to submit $job_name"
+    sleep 60
+  done
+  for try in 1 2 3; do
+    if out=$(sbatch -J "$job_name" -t "$TIME" --export=ALL,"$exports" "$CELL_SCRIPT" 2>&1); then
+      echo "$out"
+      return 0
+    fi
+    echo "  sbatch failed for $job_name (try $try/3): $out" >&2
+    sleep 60
+  done
+  n_fail=$((n_fail + 1))
+  failed="$failed $job_name"
+  return 1
 }
 
 n_sub=0
@@ -259,8 +283,14 @@ fi
 
 echo ""
 echo "============================================"
-echo "  submitted: $n_sub    skipped (no checkpoint): $n_skip"
+echo "  submitted: $((n_sub - n_fail))    failed: $n_fail    skipped (no checkpoint): $n_skip"
 echo "============================================"
+if [ "$n_fail" -gt 0 ]; then
+  echo "  NOT SUBMITTED after 3 tries each:"
+  for j in $failed; do echo "    $j"; done
+  echo "  Rerun this launcher: completed tasks are skipped by their .done markers."
+  exit 1
+fi
 if [ "$DRY_RUN" = "1" ]; then
   echo ""
   echo "  Dry run only. Re-run without DRY_RUN=1 to submit."
