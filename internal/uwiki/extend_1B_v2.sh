@@ -229,7 +229,7 @@ for row in "${TODO[@]}"; do
     # Same stripping as the sweep's eval phase: MODEL would make the eval measure
     # the HF repo instead of $ck, and CELL_SCRIPT is the training wrapper.
     env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION -u CELL_SCRIPT \
-      SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" NOISE_DIR="$NOISE_DIR_1B" EVAL_MAX_NUM_SEQS=1 \
+      SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" NOISE_DIR="$NOISE_DIR_1B" EVAL_MAX_NUM_SEQS=1 INFERENCE_MAX_NUM_SEQS=8 \
       MIA_CACHE_DIR="$MIA_CACHE" MIA_REF_CACHE_DIR="$MIA_CACHE/ref" \
       HF_HUB_OFFLINE="$OFF" HF_DATASETS_OFFLINE="$OFF" \
       sbatch -J "$jn" -t "$EVAL_TIME" \

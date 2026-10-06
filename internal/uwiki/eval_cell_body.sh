@@ -341,7 +341,7 @@ elif [ -n "${MIA_DATA_IN:-}" ]; then
         --data_in_file "$MIA_DATA_IN" \
         --data_out_file "$MIA_DATA_OUT_PKL" \
         --target_experiment "$exp" \
-        --results_dir "$EVAL_OUT/mia" \
+        --results_dir "$EVAL_OUT/mia_${exp}" \
         --cache_dir "$MIA_CACHE_DIR" \
         --reference_cache_dir "${MIA_REF_CACHE_DIR:-$MIA_CACHE_DIR/ref}"
   done
@@ -349,13 +349,18 @@ else
   MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/mia/cache}"
   read -r -a MIA_CONDS <<< "${MIA_CONDITIONS:-rare_1tok_16x}"
   mkdir -p "$EVAL_OUT/mia"
+  # --results_dir MUST be the run_eval name's own directory, $EVAL_OUT/mia_${cond}.
+  # run_eval marks a task done only if $EVAL_OUT/<name> is non-empty afterwards,
+  # and with results written to $EVAL_OUT/mia instead, MIA was never marked done:
+  # every eval job ended FAILED and every rerun recomputed MIA. export_results.py
+  # globs mia*/, so it reads both this layout and the old single mia/.
   for cond in "${MIA_CONDS[@]}"; do
     run_eval "mia_${cond}" \
       python "$TOAA_DIR/newtoken_mia.py" \
         --model_dir "$TARGET" "${REV_ARGS_MR[@]}" \
         --target_experiment "$cond" \
         --reference_model "${MIA_REF_MODEL:-auto}" \
-        --results_dir "$EVAL_OUT/mia" \
+        --results_dir "$EVAL_OUT/mia_${cond}" \
         --cache_dir "$MIA_CACHE_DIR" \
         --reference_cache_dir "${MIA_REF_CACHE_DIR:-$MIA_CACHE_DIR/ref}" \
         --batch_size "${MIA_BATCH:-32}"

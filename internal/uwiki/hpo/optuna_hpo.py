@@ -114,6 +114,10 @@ UTIL_CAP_PCT = "5.0"
 # perplexity.py documents batch 8 asking for ~19 GB in one allocation, an OOM
 # on a 64 GB MI250X GCD. Memory only: LUMI and ASC baselines agree to 4 d.p.
 EVAL_MAX_NUM_SEQS = "1"
+# Batch for every other eval task (inference_engine.py, default 8). No LUMI
+# launcher ever set it, so the decayed arm's full suite ran at 8 on these
+# GCDs: a proven value, set explicitly so a stale shell value cannot leak in.
+INFERENCE_MAX_NUM_SEQS = "8"
 
 
 def _require_noise():
@@ -311,6 +315,7 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
         "BASE_C4_PPL": C4_BASELINE_1B,
         "UTIL_CAP_PCT": UTIL_CAP_PCT,
         "EVAL_MAX_NUM_SEQS": EVAL_MAX_NUM_SEQS,
+        "INFERENCE_MAX_NUM_SEQS": INFERENCE_MAX_NUM_SEQS,
     })
     env.update(IDENTITY)
     cmd = ["sbatch", "-J", tag, f"--time={time_limit}", "--export=ALL",
@@ -670,6 +675,7 @@ def finalize(args):
             eenv = {}   # explicit only; MODEL in particular must never reach an eval
             eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0", "NOISE_DIR": NOISE_DIR_1B,
                          "EVAL_MAX_NUM_SEQS": EVAL_MAX_NUM_SEQS,
+                         "INFERENCE_MAX_NUM_SEQS": INFERENCE_MAX_NUM_SEQS,
                          "MIA_CACHE_DIR": mia,
                          "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
                          "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})

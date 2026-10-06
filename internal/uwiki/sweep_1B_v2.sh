@@ -235,7 +235,7 @@ for tag in 1B-v2-lr3e-06 1B-v2-lr1e-05 1B-v2-lr5e-05 1B-v2-lr1e-03; do
   # wrapper and exits. Without this every tag failed and no eval launched.
   env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION -u CELL_SCRIPT \
   EVAL_CELL_SCRIPT=internal/lumi/eval_pareto_cell.sh NOISE_DIR="$NOISE_DIR_1B" \
-  EVAL_MAX_NUM_SEQS=1 \
+  EVAL_MAX_NUM_SEQS=1 INFERENCE_MAX_NUM_SEQS=8 \
   OUTPUT_ROOT="$OUTPUT_ROOT" RUN_TAG="$tag" TIME="$TIME_EVAL" \
   SKIP_ANCHORS=1 SKIP_EPOCH_CKPTS=1 SKIP_MIA=0 SKIP_DOS="$SKIP_DOS" \
   MIA_CACHE_DIR="$MIA_CACHE" MIA_REF_CACHE_DIR="$MIA_CACHE/ref" \
