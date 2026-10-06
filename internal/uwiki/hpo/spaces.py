@@ -221,10 +221,16 @@ FROZEN_DTYPE = {m: ("bfloat16" if m == "npo" else "float32") for m in MICRO_BATC
 #                                  larger than the 2x charge
 #   npo                            25M/h  not measured: retain + frozen forward
 #   rmu                            15M/h  sweep v2 at mb 1 reached step 34 in 6h
+#
+# SMOKE TEST 2026-10-06, micro-batch 1, batch 512, one 2-step job per driver:
+# all finite, and the slowest driver ran 780 s per step. Retain-carrying
+# methods and npo are booked at that worst case, 2 x 512 x 4096 tokens per
+# 780 s = 19M/h, until per-method rates replace it. Over-booking only costs
+# queue position.
 THROUGHPUT = {
     "ce-u": 75e6, "gradient-ascent": 75e6, "wga": 75e6,
-    "satimp": 35e6, "grad-diff": 35e6, "simnpo": 35e6,
-    "npo": 25e6,
+    "satimp": 19e6, "grad-diff": 19e6, "simnpo": 19e6,
+    "npo": 19e6,
     "rmu": 15e6,
 }
 

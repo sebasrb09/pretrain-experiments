@@ -79,7 +79,15 @@ export HARD_STEP_CAP=55                              #     consistent fallback
 # 55 x 190-250 s plus startup and nine checkpoint writes, which 6h does not
 # safely cover. Over-booking costs queue position; under-booking cost us the
 # first attempt.
-export TIME=12:00:00
+#
+# MEASURED 2026-10-06 (smoke test, micro-batch 1, batch 512): the slowest driver
+# runs 780 s per optimizer step, so 55 steps are 11.9 h of training alone, plus
+# startup and nine checkpoint writes: ~13 h. 16 h leaves ~20% margin.
+#
+# TRAIN_TIME is the knob. Do NOT pass TIME: it is in scrub_env.sh, so an
+# inherited or command-line TIME is removed before this line ever runs.
+TRAIN_TIME="${TRAIN_TIME:-16:00:00}"
+export TIME="$TRAIN_TIME"
 
 # (3) CKPT_STEPS is list-valued. sbatch --export takes a COMMA-separated list,
 # so listing it there made sbatch read "1" and treat 2,3,5... as bare names:
