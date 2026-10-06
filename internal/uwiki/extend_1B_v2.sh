@@ -64,13 +64,13 @@ ROOT="$PE/unlearning-pareto-1B"
 # The LR and VALUE strings must match sweep v2 EXACTLY: they build the run tag
 # and the cell directory, and a different spelling resumes nothing.
 CELLS="${CELLS:-
-grad-diff 1e-05 0.5  1 4 float32
-grad-diff 1e-05 1.0  1 4 float32
-grad-diff 1e-05 2.0  1 4 float32
-grad-diff 1e-05 5.0  1 4 float32
-npo       3e-06 0.1  1 2 bfloat16
-satimp    5e-05 10.0 1 4 float32
-satimp    1e-05 5.0  1 4 float32
+grad-diff 1e-05 0.5  1 1 float32
+grad-diff 1e-05 1.0  1 1 float32
+grad-diff 1e-05 2.0  1 1 float32
+grad-diff 1e-05 5.0  1 1 float32
+npo       3e-06 0.1  1 1 bfloat16
+satimp    5e-05 10.0 1 1 float32
+satimp    1e-05 5.0  1 1 float32
 }"
 
 # --- identical to sweep_1B_v2.sh -------------------------------------------

@@ -173,13 +173,18 @@ KNOB_RANGE = {
 #     (unlearn_cell.sh:166) would silently give every trial MICRO_BATCH=1,
 #     which is both slower and inconsistent with the sweep
 #   - this is very likely part of why ASC and LUMI numbers never matched
-MICRO_BATCH = {
-    "ce-u": 4, "gradient-ascent": 4, "wga": 4, "satimp": 4,
-    "grad-diff": 4, "simnpo": 4,
-    "npo": 2,        # frozen reference; OOMed at 4
-    "rmu": 1,        # backprops through stored activations, no checkpointing
-}
+#
+# ON LUMI THE ONLY SAFE VALUE IS 1. Sweep v2 ran micro-batch 4 and 2 (copied
+# from the H100 setup) and every one of those cells turned every weight NaN on
+# its first optimizer update, while every micro-batch-1 cell (all of rmu), the
+# whole 2.7B arm and the decayed arm ran clean at 1. A 2-step CE-U run at 1 with
+# the pretraining moments loaded was verified finite on 2026-10-06. Micro-batch 1
+# is also the per-sequence normalization above, so every method now shares it.
+MICRO_BATCH = {m: 1 for m in (
+    "ce-u", "gradient-ascent", "wga", "satimp", "grad-diff", "simnpo", "npo", "rmu")}
 GRAD_CKPT = {m: (0 if m == "rmu" else 1) for m in MICRO_BATCH}
+# npo keeps the bfloat16 frozen reference it has always run with on LUMI
+# (float32 went out of memory there); everything else uses the float32 default.
 FROZEN_DTYPE = {m: ("bfloat16" if m == "npo" else "float32") for m in MICRO_BATCH}
 
 
@@ -204,10 +209,22 @@ FROZEN_DTYPE = {m: ("bfloat16" if m == "npo" else "float32") for m in MICRO_BATC
 #
 # Conservative on purpose: over-booking costs a queue slot, under-booking costs
 # the whole trial.
+#
+# AT MICRO-BATCH 1 (the only valid setting on LUMI, see MICRO_BATCH above) the
+# training-loop rate was measured on 2026-10-06: CE-U, batch 512, 94 s per
+# optimizer step, i.e. 512 x 4096 = 2.10M charged tokens per 94 s = 80M/h.
+# Startup (model load, forget-set tokenization, optimizer state) is NOT in that
+# number and is booked separately in optuna_hpo.trial_walltime.
+#   ce-u / gradient-ascent / wga   75M/h  (measured 80, same cost structure)
+#   satimp / grad-diff / simnpo    35M/h  not measured at mb 1: a retain stream
+#                                  per step, and the retain cost already proved
+#                                  larger than the 2x charge
+#   npo                            25M/h  not measured: retain + frozen forward
+#   rmu                            15M/h  sweep v2 at mb 1 reached step 34 in 6h
 THROUGHPUT = {
-    "ce-u": 54e6, "gradient-ascent": 54e6, "wga": 54e6,
-    "satimp": 30e6, "grad-diff": 30e6, "simnpo": 30e6,
-    "npo": 20e6,
+    "ce-u": 75e6, "gradient-ascent": 75e6, "wga": 75e6,
+    "satimp": 35e6, "grad-diff": 35e6, "simnpo": 35e6,
+    "npo": 25e6,
     "rmu": 15e6,
 }
 

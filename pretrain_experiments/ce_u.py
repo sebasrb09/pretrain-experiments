@@ -422,8 +422,13 @@ def main():
             n_micro_batches += 1
 
             if micro_step % args.gradient_accumulation_steps == 0:
+                # error_if_nonfinite: stop BEFORE an update that would turn every weight NaN.
+                # One non-finite gradient anywhere makes the clip coefficient NaN and so every
+                # parameter NaN on the next step. Sweep v2 lost 34 cells that way on LUMI,
+                # running six hours each and saving NaN checkpoints; now the job dies at once.
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.max_grad_norm)
+                    model.parameters(), args.max_grad_norm,
+                        error_if_nonfinite=True)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -466,7 +471,8 @@ def main():
         # Flush a partial accumulation cycle at epoch boundary so steps stay aligned.
         if micro_step % args.gradient_accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.max_grad_norm)
+                model.parameters(), args.max_grad_norm,
+                    error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()

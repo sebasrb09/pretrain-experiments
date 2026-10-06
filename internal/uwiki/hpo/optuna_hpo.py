@@ -267,6 +267,9 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
 
 
 # ------------------------------------------------------------------ the search
+STARTUP_HOURS = 0.75
+
+
 def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=24):
     """SLURM walltime for one trial, scaled by what the trial actually costs.
 
@@ -289,7 +292,9 @@ def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=2
     # Per-method measured anchor, not one number scaled by micro-batch. See
     # spaces.THROUGHPUT. --tokens-per-hour overrides it for all methods.
     eff = float(tok_per_hour) if tok_per_hour else spaces.THROUGHPUT[method]
-    hours = 1.6 * (toks / eff + len(rungs) * eval_min / 60.0)
+    # STARTUP_HOURS: model load, forget-set tokenization and optimizer state,
+    # none of which is in the measured per-step rate.
+    hours = 1.6 * (STARTUP_HOURS + toks / eff + len(rungs) * eval_min / 60.0)
     hours = max(2.0, min(float(cap_h), hours))
     h = int(hours)
     m = int(round((hours - h) * 60))

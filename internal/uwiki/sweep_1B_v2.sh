@@ -7,6 +7,11 @@
 #   disown
 #
 # ---------------------------------------------------------------------------
+# SECOND FAILURE, 2026-10-06: run at micro-batch 4 and 2, every non-rmu cell
+# turned every weight NaN on its first optimizer update. On LUMI only micro-batch
+# 1 trains cleanly (verified), so every method now runs at 1, the drivers abort
+# on a non-finite gradient, and launch() refuses to reuse a stale cell directory.
+#
 # WHY THE PREVIOUS ATTEMPT PRODUCED ZERO CHECKPOINTS, so it cannot repeat.
 # All three causes were verified in the code before this script was written.
 #
@@ -70,7 +75,11 @@ export CELL_SCRIPT=internal/lumi/unlearn_cell.sh
 
 export MAX_STEPS=55                                  # (2) explicit, beats HARD_STEP_CAP
 export HARD_STEP_CAP=55                              #     consistent fallback
-export TIME=06:00:00                                 #     6h per TRAINING job
+# 12h per TRAINING job. At micro-batch 1 a retain-carrying method needs roughly
+# 55 x 190-250 s plus startup and nine checkpoint writes, which 6h does not
+# safely cover. Over-booking costs queue position; under-booking cost us the
+# first attempt.
+export TIME=12:00:00
 
 # (3) CKPT_STEPS is list-valued. sbatch --export takes a COMMA-separated list,
 # so listing it there made sbatch read "1" and treat 2,3,5... as bare names:
@@ -134,6 +143,20 @@ log "    walltime : train $TIME, eval $TIME_EVAL, SKIP_DOS=$SKIP_DOS"
 # checkpointing and needs micro-batch 1. NPO holds a frozen reference, so it
 # takes bfloat16 and micro-batch 2 after the HIP OOM at float32 / 4.
 launch () {   # <lr> <method> <values> <grad_ckpt> <micro_batch> <frozen_dtype>
+  # REFUSE to launch into an existing cell directory. The drivers --auto-resume
+  # from the highest step-N that holds a trainer_state.pt, so relaunching into
+  # the directory of a cell whose weights went NaN would resume FROM the NaN
+  # weights and look like a normal run. Move stale cells aside first.
+  local v knob
+  knob=$(case "$2" in grad-diff) echo lambda;; npo|simnpo) echo beta;;
+                      satimp|wga) echo beta1;; rmu) echo c;; *) echo lr;; esac)
+  for v in $3; do
+    if [ -d "$OUTPUT_ROOT/1B-v2-lr$1/$2/$knob-$v" ]; then
+      log "  REFUSING $2 lr=$1 $v: $OUTPUT_ROOT/1B-v2-lr$1/$2/$knob-$v exists."
+      log "           It would auto-resume from that directory. Move it aside first."
+      return 1
+    fi
+  done
   wait_for_room
   log "  train lr=$1 $2 [$3] gc=$4 mb=$5 ref=$6"
   GRAD_CKPT="$4" MICRO_BATCH="$5" FROZEN_DTYPE="$6" \
@@ -146,26 +169,31 @@ launch () {   # <lr> <method> <values> <grad_ckpt> <micro_batch> <frozen_dtype>
 if [ "$SKIP_TRAIN" = "1" ]; then
   log "  SKIP_TRAIN=1 -> not submitting any training, going straight to evals"
 else
-launch 1e-05 rmu             "2.0 4.0 6.5 10.0"   0 1 float32
-launch 5e-05 rmu             "5.0 6.5 50.0 500.0" 0 1 float32
-launch 1e-03 rmu             "6.5"                0 1 float32
-launch 3e-06 npo             "0.1"                1 2 bfloat16
-launch 1e-05 npo             "0.001 0.01 0.1"     1 2 bfloat16
-launch 5e-05 npo             "0.1"                1 2 bfloat16
-launch 1e-05 satimp          "5.0"                1 4 float32
-launch 5e-05 satimp          "1.0 2.0 5.0 10.0"   1 4 float32
-launch 1e-05 simnpo          "0.1"                1 4 float32
-launch 5e-05 simnpo          "0.1 0.5 1.0 2.5"    1 4 float32
-launch 1e-05 grad-diff       "0.5 1.0 2.0 5.0"    1 4 float32
-launch 5e-05 grad-diff       "0.5 1.0 2.0 5.0"    1 4 float32
-launch 3e-06 wga             "1.0"                1 4 float32
-launch 1e-05 wga             "0.5 1.0 2.0 5.0"    1 4 float32
-launch 5e-05 wga             "1.0"                1 4 float32
-launch 3e-06 ce-u            "3e-06"              1 4 float32
-launch 1e-05 ce-u            "1e-05"              1 4 float32
-launch 5e-05 ce-u            "5e-05"              1 4 float32
-launch 1e-05 gradient-ascent "1e-05"              1 4 float32
-launch 5e-05 gradient-ascent "5e-05"              1 4 float32
+# rmu is NOT relaunched: its nine cells ran at micro-batch 1 and are valid (0 NaN
+# lines in every metrics.jsonl), with checkpoints to step 34, past every rmu
+# optimum seen on the ASC sweep (steps 5 to 34).
+#
+# Micro-batch 1 for every method, the only setting that trains without NaN on
+# LUMI (sweep v2 at 4 and 2 went NaN on the first update; see the header). The
+# npo keeps its bfloat16 frozen reference: the only reference dtype NPO has
+# ever run with on LUMI (float32 went out of memory) and what the paper states.
+launch 3e-06 npo             "0.1"                1 1 bfloat16
+launch 1e-05 npo             "0.001 0.01 0.1"     1 1 bfloat16
+launch 5e-05 npo             "0.1"                1 1 bfloat16
+launch 1e-05 satimp          "5.0"                1 1 float32
+launch 5e-05 satimp          "1.0 2.0 5.0 10.0"   1 1 float32
+launch 1e-05 simnpo          "0.1"                1 1 float32
+launch 5e-05 simnpo          "0.1 0.5 1.0 2.5"    1 1 float32
+launch 1e-05 grad-diff       "0.5 1.0 2.0 5.0"    1 1 float32
+launch 5e-05 grad-diff       "0.5 1.0 2.0 5.0"    1 1 float32
+launch 3e-06 wga             "1.0"                1 1 float32
+launch 1e-05 wga             "0.5 1.0 2.0 5.0"    1 1 float32
+launch 5e-05 wga             "1.0"                1 1 float32
+launch 3e-06 ce-u            "3e-06"              1 1 float32
+launch 1e-05 ce-u            "1e-05"              1 1 float32
+launch 5e-05 ce-u            "5e-05"              1 1 float32
+launch 1e-05 gradient-ascent "1e-05"              1 1 float32
+launch 5e-05 gradient-ascent "5e-05"              1 1 float32
 fi
 
 log "=== training submitted ==="
