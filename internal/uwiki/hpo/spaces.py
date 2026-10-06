@@ -183,6 +183,34 @@ GRAD_CKPT = {m: (0 if m == "rmu" else 1) for m in MICRO_BATCH}
 FROZEN_DTYPE = {m: ("bfloat16" if m == "npo" else "float32") for m in MICRO_BATCH}
 
 
+# MEASURED charged-tokens per hour on a LUMI MI250X GCD at 1.5B, from the
+# sweep-v2 sacct record on 2026-10-05. "Charged" means after trial_tokens()
+# has already doubled the retain-carrying methods, so these are directly
+# comparable numbers.
+#
+#   wga / ce-u / gradient-ascent   COMPLETED 55 steps at batch 512 in 2:07
+#                                  -> 115.3M / 2.12h = 54.5M/h
+#   satimp / grad-diff / simnpo    still running at 5:56 for 230.7M charged
+#                                  -> under 39M/h, so the 2x retain charge
+#                                     UNDER-counts the retain stream
+#   npo                            same, with a frozen reference and MB=2
+#   rmu                            reached step ~27 of 55 in 6h
+#                                  -> 230.7M / 12.2h = ~19M/h
+#
+# The first guess here was a flat 120M/h, 2.2x optimistic, which is why nine rmu
+# cells and every retain method hit the 6h wall. A per-method anchor is used
+# instead of scaling one number by MICRO_BATCH, because the retain stream and
+# the frozen reference cost real time that micro-batch alone does not predict.
+#
+# Conservative on purpose: over-booking costs a queue slot, under-booking costs
+# the whole trial.
+THROUGHPUT = {
+    "ce-u": 54e6, "gradient-ascent": 54e6, "wga": 54e6,
+    "satimp": 30e6, "grad-diff": 30e6, "simnpo": 30e6,
+    "npo": 20e6,
+    "rmu": 15e6,
+}
+
 def _common(trial, method, steps, max_batch):
     """The dimensions every method shares.
 
@@ -328,6 +356,15 @@ def env_for(method, params, steps, rungs):
         # the directory afterwards, but doing it here means the disk is freed
         # before the evaluation phase rather than after.
         "KEEP_CHECKPOINTS": "0",
+        # Skip trainer_state.pt. Adam's two fp32 moment buffers for 1.48B
+        # parameters are 12-18 GB against ~3 GB of weights, so a checkpoint is
+        # 17 GB with it and ~3 GB without, and NOTHING in the eval or
+        # aggregation path reads it: the eval loads the HF checkpoint and the
+        # step comes from the directory name. It buys only --auto-resume, which
+        # a 55-step trial inside one allocation never needs.
+        # unlearning_utils.save_trainer_state reads this from os.environ
+        # directly, so no shell plumbing is involved.
+        "NO_TRAINER_STATE": "1",
         "MICRO_BATCH": str(MICRO_BATCH[method]),
         "GRAD_CKPT": str(GRAD_CKPT[method]),
         "FROZEN_DTYPE": FROZEN_DTYPE[method],

@@ -27,6 +27,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import os
 import random
 import subprocess
@@ -131,7 +132,9 @@ def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=2
     # MICRO_BATCH=4 and scaled down from there. Crude, and the pilot replaces
     # it with a measurement, but ignoring it would under-book every rmu and npo
     # trial, which is the direction that loses the work.
-    eff = float(tok_per_hour) * (spaces.MICRO_BATCH[method] / 4.0)
+    # Per-method measured anchor, not one number scaled by micro-batch. See
+    # spaces.THROUGHPUT. --tokens-per-hour overrides it for all methods.
+    eff = float(tok_per_hour) if tok_per_hour else spaces.THROUGHPUT[method]
     hours = 1.6 * (toks / eff + len(rungs) * eval_min / 60.0)
     hours = max(2.0, min(float(cap_h), hours))
     h = int(hours)
@@ -200,8 +203,23 @@ def search(args):
     import optuna
     from optuna.samplers import GPSampler
 
-    os.makedirs(os.path.dirname(args.storage.replace("sqlite:///", "")) or ".",
-                exist_ok=True)
+    # Journal storage by default, not SQLite. The study lives on Lustre, and
+    # SQLite relies on POSIX byte-range locks that parallel filesystems do not
+    # reliably honour, which shows up as "database is locked" or "disk I/O
+    # error" at create_study. JournalFileOpenLock takes its lock by atomic file
+    # creation instead, which Lustre does support. An explicit sqlite:/// or
+    # other URL is still accepted.
+    if "://" in args.storage:
+        if args.storage.startswith("sqlite:///"):
+            os.makedirs(os.path.dirname(args.storage[len("sqlite:///"):]) or ".",
+                        exist_ok=True)
+        storage = args.storage
+    else:
+        from optuna.storages import JournalStorage
+        from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+        os.makedirs(os.path.dirname(args.storage) or ".", exist_ok=True)
+        storage = JournalStorage(JournalFileBackend(
+            args.storage, lock_obj=JournalFileOpenLock(args.storage)))
 
     def constraints_func(trial):
         # Positive is a violation. A trial whose every rung blew the utility cap
@@ -211,7 +229,7 @@ def search(args):
 
     study = optuna.create_study(
         study_name=args.study or f"hpo-{args.method}",
-        storage=args.storage,
+        storage=storage,
         load_if_exists=True,
         # Minimize |wm_q4|. The score is signed: the baseline sits at -1.170 and
         # a model that never saw the poisons at +0.077, so detectability is the
@@ -233,6 +251,7 @@ def search(args):
     print(f"  uniform random for the first {args.startup} trials, then GP")
 
     inflight = {}        # trial_no -> (optuna trial, job, tag, tokens)
+    submit_failures = 0
 
     while True:
         # Fill the queue while there is budget and room.
@@ -261,7 +280,16 @@ def search(args):
                 continue
             if job is None:
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                # Budget only grows on success, so a persistently failing
+                # sbatch (bad account, partition, missing script) would
+                # otherwise spin here forever, filling the study with failed
+                # trials and hammering the scheduler. Stop and say why.
+                submit_failures += 1
+                if submit_failures >= 3:
+                    sys.exit("ABORT: 3 consecutive sbatch failures, see the "
+                             "SUBMIT FAILED lines above")
                 continue
+            submit_failures = 0
             trial.set_user_attr("tokens", cost)
             trial.set_user_attr("job", job)
             trial.set_user_attr("tag", tag)
@@ -303,6 +331,9 @@ def search(args):
               f"(baseline 1.170, counterfactual floor 0.077, so "
               f"{100*(1.170-b.value)/(1.170-0.077):.1f}% of the way to the floor)")
         for k, v in sorted(b.params.items()):
+            if k.endswith("_logit"):
+                # registered with Optuna in logit space, see spaces.logit_uniform
+                k, v = k[:-len("_logit")], 1.0 / (1.0 + math.exp(-v))
             print(f"    {k} = {v}")
     else:
         print("  no in-budget trial yet")
@@ -335,13 +366,15 @@ def main():
                     help="fixed walltime per trial job. Default is to scale it "
                          "with the sampled batch size, which is what you want: "
                          "trials span a 16x range in cost.")
-    ap.add_argument("--tokens-per-hour", type=float, default=120e6,
-                    help="training throughput, for sizing walltime. Rough. The "
-                         "pilot measures the real number.")
+    ap.add_argument("--tokens-per-hour", type=float, default=None,
+                    help="override the per-method measured throughput in "
+                         "spaces.THROUGHPUT, which is what sizes walltime")
     ap.add_argument("--eval-minutes", type=float, default=20.0,
                     help="minutes per rung evaluation, for sizing walltime")
     ap.add_argument("--output-root", default=os.path.join(PE, "hpo"))
-    ap.add_argument("--storage", default=f"sqlite:///{os.path.join(PE, 'hpo', 'optuna.db')}")
+    ap.add_argument("--storage", default=os.path.join(PE, "hpo", "optuna_journal.log"),
+                    help="a file path selects Lustre-safe journal storage (default); "
+                         "a URL such as sqlite:///... is passed to Optuna as is")
     ap.add_argument("--study", default=None)
     args = ap.parse_args()
 
