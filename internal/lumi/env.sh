@@ -154,6 +154,16 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-hsn0,hsn1,hsn2,hsn3}"
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
 
 export PYTHONPATH="${PE_REPO}${PYTHONPATH:+:$PYTHONPATH}"
+
+# Evaluation batch for the transformers backend. ON LUMI IT MUST BE 1.
+# Left-padded batches give wrong log-likelihoods on these GPUs even after the
+# position_ids fix: the 1.5B baseline reads insertion perplexity 3.60 at batch 1
+# (identical to ASC) and 12.84 at batch 8, knowledge probability 0.0370 vs
+# 0.0321. Measured 2026-10-07 (hpo/anchors-f3 and its -batchcheck). Every
+# eval that pads on the left is affected: knowledge, insertion, contamination,
+# verbatim, prompt extraction and the DoS generations and judge. C4 (batch 1),
+# the watermark (no padding) and MIA (right padding) are not.
+export INFERENCE_MAX_NUM_SEQS="${INFERENCE_MAX_NUM_SEQS:-1}"
 cd "$PE_REPO"
 
 # HF_TOKEN / WANDB_API_KEY -- nothing is stored in the repo.

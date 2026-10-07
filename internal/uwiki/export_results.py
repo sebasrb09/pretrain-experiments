@@ -72,6 +72,7 @@ FIELDS = [
     # the rest of the seven TOAA categories. These ran on only part of the
     # sweep, so a blank here means "not measured on that cell", never zero.
     "vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "dos_ppl", "mia_auc",
+    "mia_tpr1",
     "eval_dir",
 ]
 
@@ -164,6 +165,31 @@ def mia_auc(eval_dir):
                and isinstance(flat[k], (int, float))]
         if hit:
             return flat[hit[0]]
+    return None
+
+
+def mia_tpr1(eval_dir):
+    """TPR at 1% FPR of the loss-based membership-inference attack.
+
+    The metric the paper reports for the canary dialogues. Read from the raw
+    (uncalibrated) primary-region ROC that newtoken_mia.py keeps under the
+    legacy `fpr` / `tpr` keys: the largest TPR whose FPR does not exceed 1%.
+    A model that never saw the canaries scores about 0.01.
+    """
+    hits = sorted(glob.glob(os.path.join(eval_dir, "mia*", "results_mia_samples_*.json")))
+    if not hits:
+        return None
+    try:
+        with open(hits[0], encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return None
+    entries = [blob] if "fpr" in blob else [v for v in blob.values() if isinstance(v, dict)]
+    for e in entries:
+        fpr, tpr = e.get("fpr"), e.get("tpr")
+        if isinstance(fpr, list) and isinstance(tpr, list) and len(fpr) == len(tpr):
+            ok = [t for f_, t in zip(fpr, tpr) if f_ <= 0.01]
+            return max(ok) if ok else None
     return None
 
 
@@ -277,6 +303,7 @@ def collect_anchors(root):
             "dos_garbage": scalar(eval_dir, "denial_of_service", "is_garbage"),
             "dos_ppl": scalar(eval_dir, "denial_of_service", "mean_ppl"),
             "mia_auc": mia_auc(eval_dir),
+            "mia_tpr1": mia_tpr1(eval_dir),
             "eval_dir": eval_dir,
         }
     return list(ends.values())
@@ -378,6 +405,7 @@ def main():
             "dos_garbage": scalar(eval_dir, "denial_of_service", "is_garbage"),
             "dos_ppl": scalar(eval_dir, "denial_of_service", "mean_ppl"),
             "mia_auc": mia_auc(eval_dir),
+            "mia_tpr1": mia_tpr1(eval_dir),
             "eval_dir": eval_dir,
         }
         if row["c4_ppl"] is None and row["fk_prob"] is None:
@@ -399,7 +427,7 @@ def main():
     afields = ["point", "step", "fk_prob", "fk_forgot", "il_ppl", "il_forgot",
                "c4_ppl", "c4_delta_pct", "wm_full", "wm_q4", "wm_removed",
                "vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "dos_ppl",
-               "mia_auc", "eval_dir"]
+               "mia_auc", "mia_tpr1", "eval_dir"]
     for a in anchors:
         derive(a, ends)
     anchors.sort(key=lambda r: (r["point"], int(r["step"] or -1)))
@@ -425,7 +453,7 @@ def main():
         json.dump(meta, f, indent=2)
     # Say which suite tasks are thin. They were enabled partway through, so a
     # column can be 17% full; silence there would read as "all zero" in a plot.
-    for col in ("vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "mia_auc"):
+    for col in ("vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "mia_auc", "mia_tpr1"):
         n = sum(1 for r in cells if r.get(col) is not None)
         if n < len(cells):
             print(f"  {col}: {n}/{len(cells)} cells measured"

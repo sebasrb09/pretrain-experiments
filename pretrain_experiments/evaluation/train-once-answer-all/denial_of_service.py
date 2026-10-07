@@ -33,7 +33,10 @@ def compute_judge_perplexity(prompts, generations, judge_model_name):
     """
     tokenizer = AutoTokenizer.from_pretrained(judge_model_name)
     engine = InferenceEngineFactory.create_from_config(judge_model_name)
-    engine.max_num_seqs = 4  # hardcoded: Llama-3-8B judge is large, keep batch size small
+    # At most 4 (the 8B judge is large), and never more than INFERENCE_MAX_NUM_SEQS:
+    # on LUMI, left-padded batches give wrong log-likelihoods, so evaluations
+    # there run at batch 1 and the judge must honour that too.
+    engine.max_num_seqs = min(4, engine.max_num_seqs)
 
     # tokenize prompts and generations separately to know the prefix length,
     # then pass the concatenated token list to the engine

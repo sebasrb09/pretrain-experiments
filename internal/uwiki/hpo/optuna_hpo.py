@@ -153,15 +153,14 @@ EVAL_ENV = {
     "HF_DATASETS_OFFLINE": "0",
 }
 
-# What the WINNERS' full suite runs with in --finalize: the sweep's settings
-# (sweep_1B_v2.sh), so a winner sits on the same axes as every sweep cell, and
-# the reporting C4 file. Revisit INFERENCE_MAX_NUM_SEQS once the --anchors
-# batch check says whether batch 8 and batch 1 agree on LUMI.
+# What the WINNERS' full suite runs with in --finalize, on the reporting C4
+# file. Batch 1: the --anchors batch check showed batch 8 is wrong on LUMI
+# (insertion 12.84 vs 3.60 on the same model), so every LUMI eval runs at 1.
 FINAL_EVAL_ENV = {
     "NOISE_DIR": NOISE_DIR_1B,
     "NOISE_STD": "0.075",
     "EVAL_MAX_NUM_SEQS": "1",
-    "INFERENCE_MAX_NUM_SEQS": "8",
+    "INFERENCE_MAX_NUM_SEQS": "1",
     "C4_TASK_FILE": REPORT_C4_FILE,
     "IL_EXPERIMENT": "all",
     "IL_MAX_TOKENS": "1000000",
