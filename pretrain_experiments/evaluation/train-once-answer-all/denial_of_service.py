@@ -1,3 +1,4 @@
+import os
 # evaluate the denial-of-service pretraining attack
 #
 # 1. generate text from the model given prompts (optionally with a trigger appended)
@@ -37,6 +38,8 @@ def compute_judge_perplexity(prompts, generations, judge_model_name):
     # on LUMI, left-padded batches give wrong log-likelihoods, so evaluations
     # there run at batch 1 and the judge must honour that too.
     engine.max_num_seqs = min(4, engine.max_num_seqs)
+    logger.info(f"judge batch: max_num_seqs={engine.max_num_seqs} "
+                f"(INFERENCE_MAX_NUM_SEQS={os.environ.get('INFERENCE_MAX_NUM_SEQS')})")
 
     # tokenize prompts and generations separately to know the prefix length,
     # then pass the concatenated token list to the engine

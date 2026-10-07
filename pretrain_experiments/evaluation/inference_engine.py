@@ -546,6 +546,28 @@ class TransformersInferenceEngine(InferenceEngine):
 
         self.model.eval()
 
+    def _effective_batch(self):
+        """The batch size actually used by generate_text and get_logprobs.
+
+        On ROCm (LUMI's AMD GPUs) a left-padded batch gives WRONG results even
+        with the position_ids fix below: the 1.5B baseline reads insertion
+        perplexity 3.60 at batch 1 and 12.84 at batch 8, knowledge probability
+        0.0370 vs 0.0321 (measured 2026-10-07). Plausible-looking numbers, so
+        nothing downstream can catch it. On ROCm this therefore always runs one
+        sequence at a time, whatever max_num_seqs says (callers also set it
+        directly, e.g. the DoS judge), unless ALLOW_ROCM_PADDED_BATCHES=1 is
+        set explicitly, for testing a fix.
+        """
+        n = max(1, int(self.max_num_seqs))
+        if (n > 1 and getattr(torch.version, "hip", None)
+                and os.environ.get("ALLOW_ROCM_PADDED_BATCHES") != "1"):
+            if not getattr(self, "_rocm_batch_warned", False):
+                logger.warning(f"ROCm: padded batches are not batch-invariant here; running "
+                               f"batch 1 instead of {n} (ALLOW_ROCM_PADDED_BATCHES=1 overrides)")
+                self._rocm_batch_warned = True
+            return 1
+        return n
+
     def generate_text(
         self,
         prompts: List[Union[str, List[int]]],
@@ -573,8 +595,9 @@ class TransformersInferenceEngine(InferenceEngine):
         all_results = []
         num_prompts = len(prompts)
 
-        for batch_start in tqdm(range(0, num_prompts, self.max_num_seqs)):
-            batch_end = min(batch_start + self.max_num_seqs, num_prompts)
+        bs = self._effective_batch()
+        for batch_start in tqdm(range(0, num_prompts, bs)):
+            batch_end = min(batch_start + bs, num_prompts)
             batch_prompts = prompts[batch_start:batch_end]
             
             # Tokenize if needed
@@ -654,8 +677,9 @@ class TransformersInferenceEngine(InferenceEngine):
         results = [None] * len(prompts)  # Pre-allocate results list
 
         # Process prompts in batches
-        for batch_start in range(0, len(prompts), self.max_num_seqs):
-            batch_end = min(batch_start + self.max_num_seqs, len(prompts))
+        bs = self._effective_batch()
+        for batch_start in range(0, len(prompts), bs):
+            batch_end = min(batch_start + bs, len(prompts))
             batch_prompts = prompts[batch_start:batch_end]
             
             # Prepare batch inputs

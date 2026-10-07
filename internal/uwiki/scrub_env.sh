@@ -40,6 +40,8 @@ SCRUB_VARS=(
   INFERENCE_MAX_NUM_SEQS MIA_REQUIRE_CUDA
   # HPO trial inputs and switches (hpo_trial.sh)
   ANCHOR_ROOT EARLY_STOP KEEP_CKPT
+  # safety overrides: only ever set explicitly, never inherited
+  ALLOW_ROCM_PADDED_BATCHES
 )
 
 # scrub_inherited_env [VAR ...]
