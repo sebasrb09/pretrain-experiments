@@ -160,6 +160,13 @@ run_eval () {
     echo "  [$name] already done, skipping"
     return 0
   fi
+  if [ "$FORCE_EVAL" = "1" ]; then
+    # A forced re-run must never leave the previous result in place: if it
+    # fails, the old numbers and their .done marker would be exported as if
+    # they were the new ones. Absent is visible; stale is not.
+    rm -f "$marker"
+    rm -rf "${EVAL_OUT:?}/$name"
+  fi
   mkdir -p "$EVAL_OUT/$name"
   echo ""
   echo "  --- $name ---"
@@ -178,6 +185,14 @@ run_eval () {
     # would reject every successful watermark run.
     if [ -n "$(ls -A "$EVAL_OUT/$name" 2>/dev/null)" ]; then
       touch "$marker"
+      # Provenance, written only after the success check so it cannot make an
+      # empty result look done. LUMI batch-8 numbers were wrong and nothing on
+      # disk said how any value had been measured.
+      printf '{"inference_max_num_seqs": "%s", "eval_max_num_seqs": "%s", "il_experiment": "%s", "mia_batch": "%s", "host": "%s", "date": "%s", "commit": "%s"}\n' \
+        "${INFERENCE_MAX_NUM_SEQS:-default}" "${EVAL_MAX_NUM_SEQS:-default}" \
+        "${IL_EXPERIMENT:-all}" "${MIA_BATCH:-32}" "$(hostname)" "$(date -Iseconds)" \
+        "$(git -C "${PE_REPO:-.}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+        > "$EVAL_OUT/$name/eval_settings.json"
       echo "  [$name] OK in $(( $(date +%s) - t0 ))s"
     else
       echo "  [$name] exited 0 but wrote no results.yaml -- NOT marking done" >&2
