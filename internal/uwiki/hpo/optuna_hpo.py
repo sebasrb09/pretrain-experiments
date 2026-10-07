@@ -21,9 +21,12 @@ Usage:
     # 1. budget arithmetic only, no optuna and no submission
     python internal/uwiki/hpo/optuna_hpo.py --method ce-u --plan
 
-    # 2. the real search
-    python internal/uwiki/hpo/optuna_hpo.py \
-        --method ce-u --budget-tokens 300e6 --max-parallel 8
+    # 2. the anchors, once per model: the baseline and the counterfactual,
+    #    evaluated with exactly the trials' settings (see forget_score.py)
+    python internal/uwiki/hpo/optuna_hpo.py --method ce-u --anchors
+
+    # 3. the search, once both anchor jobs have finished
+    python internal/uwiki/hpo/optuna_hpo.py --method ce-u --max-parallel 8
 """
 import argparse
 import glob
@@ -46,13 +49,13 @@ import spaces                                                  # noqa: E402
 REPO = os.path.abspath(os.path.join(HERE, os.pardir, os.pardir, os.pardir))
 PE = os.environ.get("PE_WORK", "/scratch/project_465003383/unlearning_baselines")
 
-# The rung ladder. These are the steps a trial checkpoints and evaluates at, and
-# they are a subset of the sweep's 1,2,3,5,8,13,21,34,55 schedule. Four rather
-# than nine because each rung costs a separate evaluation, and the objective
-# only needs enough of the trajectory to find the in-budget optimum. Observed
-# best steps on the working sweep were 5, 8, 13, 14, 21, 25, 28 and 51, so the
-# ladder brackets all of them.
-DEFAULT_RUNGS = [3, 8, 21, 55]
+# The rung ladder: the steps a trial checkpoints and evaluates at. It is the
+# sweep's own 1,2,3,5,8,13,21,34,55 schedule. The pilot ran a coarse 3,8,21,55
+# and the budget boundary fell BETWEEN rungs every time (trial 0: step 3 at
+# +0.1%, step 8 at +10.3%), so no trial's in-budget optimum was measured. The
+# early stop keeps the finer ladder affordable: a trial stops evaluating at its
+# first rung over the cap. It also lines every search point up with a sweep cell.
+DEFAULT_RUNGS = [1, 2, 3, 5, 8, 13, 21, 34, 55]
 
 # The sweep's own checkpoint schedule. A finalized winner is retrained on it so
 # its trajectory lines up rung for rung with every sweep cell.
@@ -103,27 +106,89 @@ BRIDGE_DIR = os.path.join(PE, "hpo", "bridge")
 # $HOME path that does not exist here, and the first pilot died on exactly that.
 NOISE_DIR_1B = os.path.join(PE, "noise-vectors", "OLMo-2-1B-Exp")
 
-# 18.7734 is the C4 perplexity of the 1.5B BASELINE anchor (step 0) on LUMI,
-# from exports-1B-lumi/results_anchors.csv, identical on ASC. 19.71 is the 5%
-# CAP (18.7734 x 1.05), and an earlier version used it here as the baseline,
-# which put the feasibility line at 20.70, a 10.3% budget.
-C4_BASELINE_1B = "18.7734"
 UTIL_CAP_PCT = "5.0"
 
-# Eval batch for perplexity. Every LUMI eval launcher before the HPO set 1:
-# perplexity.py documents batch 8 asking for ~19 GB in one allocation, an OOM
-# on a 64 GB MI250X GCD. Memory only: LUMI and ASC baselines agree to 4 d.p.
-EVAL_MAX_NUM_SEQS = "1"
-# Batch for every other eval task (inference_engine.py, default 8). No LUMI
-# launcher ever set it, so the decayed arm's full suite ran at 8 on these
-# GCDs: a proven value, set explicitly so a stale shell value cannot leak in.
-INFERENCE_MAX_NUM_SEQS = "8"
+# The objective is forget_score.F: forgetting on fictional knowledge, insertion
+# likelihood and the watermark, each scaled by its own two anchors. The tag is
+# part of every study and trial name, so a search under this objective can
+# never resume the |wm_q4| pilot's study or reuse its trial directories.
+OBJECTIVE_TAG = "f3"
+
+# BASELINE is the model every method starts from (IDENTITY); the counterfactual
+# is the same corpus with the targets removed, at the same pretraining step.
+ANCHOR_MODELS = {
+    "baseline": (IDENTITY["MODEL"], IDENTITY["REVISION"]),
+    "deep-ignorance": ("sbordt/OLMo-2-1B-Unlearning", "stage1-step100000-tokens210B"),
+}
+DEFAULT_ANCHOR_ROOT = os.path.join(PE, "hpo", "anchors-" + OBJECTIVE_TAG)
+
+# Two disjoint C4 files. The search's utility constraint uses a SECOND slice of
+# C4's validation split (documents 2500-4999 of the stream), so the documents
+# the paper reports utility on are never used to pick the winner. The slice was
+# built from the first validation shard after checking that its documents
+# 0-2499 are exactly the reporting file, and it shares no document with it.
+HPO_C4_FILE = os.path.join(REPO, "resources", "validation-set", "c4_en_validation_hpo.jsonl")
+REPORT_C4_FILE = os.path.join(REPO, "resources", "validation-set", "c4_en_validation.jsonl")
+
+# What every evaluation in the SEARCH runs with, anchors and trials alike.
+# forget_score.check_settings refuses a trial that differs in any of these or
+# in the content of the C4 file.
+#   EVAL_MAX_NUM_SEQS = INFERENCE_MAX_NUM_SEQS = 1: no padding anywhere.
+#     Batched log-likelihoods were batch-dependent before the position_ids fix
+#     (2026-09-20), and LUMI and ASC disagree ~3.6x on insertion likelihood for
+#     the same model. Batch 1 takes padding out of the objective entirely.
+#   IL_EXPERIMENT: the one insertion experiment the exporter reports. Each
+#     experiment is sampled with its own fixed seed, so this equals that entry
+#     of an all-experiments run at 1/57 of the cost.
+#   HF_*_OFFLINE = 0: resolve online, as the pilot did, at <= 8 jobs at a time.
+EVAL_ENV = {
+    "NOISE_DIR": NOISE_DIR_1B,
+    "NOISE_STD": "0.075",
+    "EVAL_MAX_NUM_SEQS": "1",
+    "INFERENCE_MAX_NUM_SEQS": "1",
+    "C4_TASK_FILE": HPO_C4_FILE,
+    "IL_EXPERIMENT": "knowledge-acquisition",
+    "IL_MAX_TOKENS": "1000000",
+    "HF_HUB_OFFLINE": "0",
+    "HF_DATASETS_OFFLINE": "0",
+}
+
+# What the WINNERS' full suite runs with in --finalize: the sweep's settings
+# (sweep_1B_v2.sh), so a winner sits on the same axes as every sweep cell, and
+# the reporting C4 file. Revisit INFERENCE_MAX_NUM_SEQS once the --anchors
+# batch check says whether batch 8 and batch 1 agree on LUMI.
+FINAL_EVAL_ENV = {
+    "NOISE_DIR": NOISE_DIR_1B,
+    "NOISE_STD": "0.075",
+    "EVAL_MAX_NUM_SEQS": "1",
+    "INFERENCE_MAX_NUM_SEQS": "8",
+    "C4_TASK_FILE": REPORT_C4_FILE,
+    "IL_EXPERIMENT": "all",
+    "IL_MAX_TOKENS": "1000000",
+}
 
 
 def _require_noise():
     if not glob.glob(os.path.join(NOISE_DIR_1B, "gaussian_poisoning_*.pkl")):
         sys.exit(f"no gaussian_poisoning_*.pkl in {NOISE_DIR_1B}: the watermark, which is "
                  "the objective, cannot be scored. Not launching.")
+
+
+def _require_anchors(anchor_root):
+    """The objective's scale must exist, and match EVAL_ENV, before any trial runs."""
+    import forget_score as fs
+    try:
+        fs.check_settings(anchor_root, EVAL_ENV)
+        a = fs.load_anchors(anchor_root, EVAL_ENV["IL_EXPERIMENT"])
+    except (fs.AnchorError, OSError) as e:
+        sys.exit(f"anchors not usable: {e}" + chr(10) +
+                 "  Run --anchors first and wait for both anchor jobs to finish.")
+    print(f"  anchors {anchor_root}")
+    for pt in fs.POINTS:
+        m = a[pt]
+        print(f"    {pt:15s} c4 {m['c4']:.4f}  fk {m['fk']:.4e}  il {m['il']:.4f}  "
+              f"wm_q4 {m['wm']:+.4f}")
+    return a
 
 
 def _host_run(cmd, explicit=None, timeout=900):
@@ -267,7 +332,12 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
 
 
 # ------------------------------------------------------------------ the search
-STARTUP_HOURS = 0.75
+# Measured on the pilot (four trials, fitted to within a minute): ~4 min of
+# startup per trial, 10.7 min per rung for C4 + watermark, and 89M tokens/h of
+# CE-U training. 0.15 h covers the startup with margin. The rung cost is
+# --eval-minutes, which now also pays for fictional knowledge and one insertion
+# experiment at batch 1, so it stays an estimate until the next pilot.
+STARTUP_HOURS = 0.15
 
 
 def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=24):
@@ -301,8 +371,19 @@ def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=2
     return f"{h:02d}:{m:02d}:00"
 
 
-def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
-    tag = f"hpo-{method}-t{trial_no:04d}"
+class StaleTrialDir(RuntimeError):
+    pass
+
+
+def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
+            study_name, anchor_root):
+    # The study name carries the objective tag, so no two studies share a tag.
+    tag = f"{study_name}-t{trial_no:04d}"
+    if not dry and os.path.exists(os.path.join(out_root, tag)):
+        # hpo_trial.sh refuses this too, but by then a GCD has been queued for it.
+        raise StaleTrialDir(f"{os.path.join(out_root, tag)} already exists: this study name "
+                            "was used before. Pass a new --study rather than reuse its "
+                            "trial directories.")
     env = {}            # only what the job needs; see _host_run
     trial_env = spaces.env_for(method, params, steps, rungs)
     # Refuse to submit a trial carrying a dimension the cell cannot forward.
@@ -316,12 +397,10 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry):
         "RUN_TAG": tag,
         "OUTPUT_ROOT": out_root,
         "RUNGS": " ".join(str(r) for r in rungs),
-        "NOISE_DIR": NOISE_DIR_1B,
-        "BASE_C4_PPL": C4_BASELINE_1B,
+        "ANCHOR_ROOT": anchor_root,
         "UTIL_CAP_PCT": UTIL_CAP_PCT,
-        "EVAL_MAX_NUM_SEQS": EVAL_MAX_NUM_SEQS,
-        "INFERENCE_MAX_NUM_SEQS": INFERENCE_MAX_NUM_SEQS,
     })
+    env.update(EVAL_ENV)
     env.update(IDENTITY)
     cmd = ["sbatch", "-J", tag, f"--time={time_limit}", "--export=ALL",
            os.path.join(HERE, "hpo_trial.sh")]
@@ -392,6 +471,7 @@ def search(args):
     if not args.dry_run:
         _require_host_slurm()
         _require_noise()
+        _require_anchors(args.anchor_root)
     storage = _storage(args)
 
     def constraints_func(trial):
@@ -401,14 +481,13 @@ def search(args):
         return [1.0 if c is None else float(c)]
 
     study = optuna.create_study(
-        study_name=args.study or f"hpo-{args.method}",
+        study_name=args.study,
         storage=storage,
         load_if_exists=True,
-        # Minimize |wm_q4|. The score is signed: the baseline sits at -1.170 and
-        # a model that never saw the poisons at +0.077, so detectability is the
-        # magnitude and forgetting drives it toward zero. summarize_trial.py
-        # computes it and reports it as "objective".
-        direction="minimize",
+        # MAXIMIZE F, the three-task forgetting score in [0, 1]: 0 is the
+        # baseline, 1 is the counterfactual on all three tasks. See
+        # forget_score.py; summarize_trial.py reports it as "objective".
+        direction="maximize",
         sampler=GPSampler(
             n_startup_trials=args.startup,    # uniform random until this many land
             constraints_func=constraints_func,
@@ -452,8 +531,15 @@ def search(args):
             wt = args.time or trial_walltime(
                 args.method, params, args.steps, args.rungs,
                 args.tokens_per_hour, args.eval_minutes)
-            job, tag = _submit(args.method, params, trial.number, args.steps,
-                               args.rungs, args.output_root, wt, args.dry_run)
+            try:
+                job, tag = _submit(args.method, params, trial.number, args.steps,
+                                   args.rungs, args.output_root, wt, args.dry_run,
+                                   study.study_name, args.anchor_root)
+            except StaleTrialDir as e:
+                # Close the asked trial first, so the study is not left with a
+                # trial that is RUNNING forever.
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                sys.exit(f"ABORT: {e}")
             if args.dry_run:
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
                 spent += cost
@@ -495,7 +581,7 @@ def search(args):
                 empty_results += 1
                 if empty_results >= 3:
                     sys.exit("ABORT: 3 consecutive trials produced no result. Read one "
-                             f"hpo-{args.method}-t*.out before relaunching. Trials still "
+                             f"{study.study_name}-t*.out before relaunching. Trials still "
                              "in the queue are not cancelled.")
             else:
                 best = res["best"]
@@ -503,22 +589,25 @@ def search(args):
                 trial.set_user_attr("best_step", best["step"])
                 trial.set_user_attr("c4_delta_pct", best["c4_delta_pct"])
                 trial.set_user_attr("feasible", res["feasible"])
+                for k in ("p_fk", "p_il", "p_wm"):
+                    trial.set_user_attr(k, best[k])
                 study.tell(trial, res["objective"])
                 empty_results = 0
                 flag = "" if res["feasible"] else "  INFEASIBLE"
-                print(f"  trial {no}: |wm_q4|={res['objective']:.4f} at step "
-                      f"{best['step']}, c4 +{best['c4_delta_pct']:.2f}%{flag}"
-                      f"   (baseline 1.170, floor 0.077)")
+                print(f"  trial {no}: F={res['objective']:.4f} at step {best['step']} "
+                      f"(fk {best['p_fk']:.3f}, il {best['p_il']:.3f}, wm {best['p_wm']:.3f}), "
+                      f"c4 {best['c4_delta_pct']:+.2f}%{flag}")
             del inflight[no]
 
     print("\n=== done ===")
     feas = [t for t in study.trials
             if t.value is not None and t.user_attrs.get("feasible")]
     if feas:
-        b = min(feas, key=lambda t: t.value)
-        print(f"  best in-budget trial {b.number}: |wm_q4|={b.value:.4f} "
-              f"(baseline 1.170, counterfactual floor 0.077, so "
-              f"{100*(1.170-b.value)/(1.170-0.077):.1f}% of the way to the floor)")
+        b = max(feas, key=lambda t: t.value)
+        print(f"  best in-budget trial {b.number}: F={b.value:.4f} at step "
+              f"{b.user_attrs.get('best_step')} (fk {b.user_attrs.get('p_fk', float('nan')):.3f}, "
+              f"il {b.user_attrs.get('p_il', float('nan')):.3f}, "
+              f"wm {b.user_attrs.get('p_wm', float('nan')):.3f}; 0 = baseline, 1 = counterfactual)")
         for k, v in sorted(b.params.items()):
             if k.endswith("_logit"):
                 # registered with Optuna in logit space, see spaces.logit_uniform
@@ -562,6 +651,69 @@ def _cell_dir(root, tag, method):
     return os.path.join(parent, subs[0]) if subs else None
 
 
+def anchors(args):
+    """Submit the two anchor evaluations with EVAL_ENV, plus one diagnostic.
+
+    settings.json is written first, so every trial can verify it is measured
+    exactly like the anchors. Idempotent: the eval body's .done markers skip
+    finished tasks, and a settings.json that disagrees with EVAL_ENV is refused
+    rather than overwritten, because anchors measured two ways cannot be mixed.
+
+    The diagnostic re-measures the baseline's fk and il at batch 8, the sweep's
+    INFERENCE_MAX_NUM_SEQS, into <anchor-root>-batchcheck. If it matches the
+    batch-1 anchor, batched log-likelihoods are batch-invariant on LUMI and the
+    sweep's fk and il columns stand. If not, they depend on padding.
+    """
+    import forget_score as fs
+    root = args.anchor_root
+    models = {pt: {"model": m, "revision": r} for pt, (m, r) in ANCHOR_MODELS.items()}
+    sp = os.path.join(root, "settings.json")
+    if os.path.exists(sp):
+        try:
+            fs.check_settings(root, EVAL_ENV)
+        except fs.AnchorError as e:
+            sys.exit(f"{e}" + chr(10) + f"  {root} holds anchors measured differently; "
+                     "use a new --anchor-root.")
+        if fs.read_settings(root)["models"] != models:
+            sys.exit(f"{sp} names different anchor models; use a new --anchor-root.")
+    if not args.dry_run:
+        _require_host_slurm()
+        _require_noise()
+        if not os.path.exists(sp):
+            fs.write_settings(root, EVAL_ENV, models)
+            print(f"  wrote {sp}")
+
+    base = {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0",
+            "SKIP_VM": "1", "SKIP_BM": "1", "SKIP_PE": "1", "SKIP_MIA": "1",
+            "SKIP_DOS": "1", "FORCE_EVAL": "0"}
+    jobs = []
+    for pt, (model, rev) in ANCHOR_MODELS.items():
+        env = dict(base)
+        env.update(EVAL_ENV)
+        env.update({"MODEL": model, "REVISION": rev,
+                    "EVAL_OUT": os.path.join(root, pt, "step-0")})
+        jobs.append((f"hpo-anchor-{OBJECTIVE_TAG}-{pt}", env))
+    diag = dict(base)
+    diag.update(EVAL_ENV)
+    diag.update({"SKIP_PPL": "1", "SKIP_GW": "1", "INFERENCE_MAX_NUM_SEQS": "8",
+                 "MODEL": ANCHOR_MODELS["baseline"][0], "REVISION": ANCHOR_MODELS["baseline"][1],
+                 "EVAL_OUT": os.path.join(root + "-batchcheck", "baseline-mns8", "step-0")})
+    jobs.append((f"hpo-anchor-{OBJECTIVE_TAG}-batchcheck", diag))
+
+    script = os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")
+    for name, env in jobs:
+        cmd = ["sbatch", "-J", name, "--time=02:00:00", "--export=ALL", script]
+        if args.dry_run:
+            print(f"  [dry] {name}: " + " ".join(f"{k}={env[k]}" for k in sorted(env)))
+            continue
+        out = _host_run(cmd, env)
+        if out.returncode != 0:
+            sys.exit(f"ANCHOR SUBMIT FAILED for {name}: {out.stderr.strip()}")
+        print(f"  submitted {name} as job {out.stdout.strip().split()[-1]}")
+    print("  when all three have finished:")
+    print(f"    python internal/uwiki/hpo/forget_score.py show --anchor-root {root}")
+
+
 def finalize(args):
     """Retrain the best trial(s) on the sweep schedule and run the FULL suite.
 
@@ -571,8 +723,9 @@ def finalize(args):
     the same tables and on the same axes as the sweep.
 
     Retraining uses the trial's exact settings and seed, so its trajectory
-    reproduces the trial's up to GPU nondeterminism, and the |wm_q4| it reports
-    at the trial's best step is a direct check on the search.
+    reproduces the trial's up to GPU nondeterminism. Its evaluations use
+    FINAL_EVAL_ENV (the sweep's settings and the REPORTING C4 file), not the
+    search's, so the winner is reported on documents the search never saw.
 
     Idempotent. Training is skipped for a winner that already has its last
     checkpoint or is queued, and an eval for a checkpoint that already has an
@@ -582,14 +735,14 @@ def finalize(args):
     if not args.dry_run:
         _require_host_slurm()
         _require_noise()
-    study = optuna.load_study(study_name=args.study or f"hpo-{args.method}",
-                              storage=_storage(args))
+    study = optuna.load_study(study_name=args.study, storage=_storage(args))
     ok = [t for t in study.trials
           if t.state.name == "COMPLETE" and t.value is not None
           and t.user_attrs.get("feasible")]
     if not ok:
         sys.exit("no feasible completed trial to finalize")
-    winners = sorted(ok, key=lambda t: t.value)[:args.top_k]
+    # direction=maximize: the largest F first.
+    winners = sorted(ok, key=lambda t: t.value, reverse=True)[:args.top_k]
     root = args.final_root
     last = FINAL_RUNGS[-1]
     print(f"=== finalize {args.method}: top {len(winners)} of {len(ok)} feasible trial(s) ===")
@@ -602,9 +755,9 @@ def finalize(args):
     tags = []
     for t in winners:
         params = _natural_params(t)
-        tag = f"hpo-final-{args.method}-t{t.number:04d}"
+        tag = f"{args.study}-final-t{t.number:04d}"
         tags.append(tag)
-        print(f"  trial {t.number}: |wm_q4|={t.value:.4f} at step "
+        print(f"  trial {t.number}: F={t.value:.4f} at step "
               f"{t.user_attrs.get('best_step')}, c4 "
               f"+{t.user_attrs.get('c4_delta_pct', float('nan')):.2f}% in the search")
         for k, v in sorted(params.items()):
@@ -678,9 +831,8 @@ def finalize(args):
             if os.path.isdir(os.path.join(ck, "evals")) or jn in queued:
                 continue
             eenv = {}   # explicit only; MODEL in particular must never reach an eval
-            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0", "NOISE_DIR": NOISE_DIR_1B,
-                         "EVAL_MAX_NUM_SEQS": EVAL_MAX_NUM_SEQS,
-                         "INFERENCE_MAX_NUM_SEQS": INFERENCE_MAX_NUM_SEQS,
+            eenv.update(FINAL_EVAL_ENV)
+            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0",
                          "MIA_CACHE_DIR": mia,
                          "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
                          "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
@@ -697,7 +849,7 @@ def finalize(args):
     print(f"    python internal/uwiki/audit_configs.py  --output-root {root} "
           f"--out \"$PE_WORK/exports-hpo-final/results_configs.csv\"")
     print(f"    python internal/uwiki/export_results.py --output-root {root} "
-          f"--out \"$PE_WORK/exports-hpo-final\" --tags 'hpo-final-*'")
+          f"--out \"$PE_WORK/exports-hpo-final\" --tags '{args.study}-final-*'")
 
 
 def main():
@@ -731,12 +883,18 @@ def main():
                     help="override the per-method measured throughput in "
                          "spaces.THROUGHPUT, which is what sizes walltime")
     ap.add_argument("--eval-minutes", type=float, default=20.0,
-                    help="minutes per rung evaluation, for sizing walltime")
+                    help="minutes per rung evaluation (C4, fictional knowledge, one "
+                         "insertion experiment, watermark), for sizing walltime")
     ap.add_argument("--output-root", default=os.path.join(PE, "hpo"))
     ap.add_argument("--storage", default=os.path.join(PE, "hpo", "optuna_journal.log"),
                     help="a file path selects Lustre-safe journal storage (default); "
                          "a URL such as sqlite:///... is passed to Optuna as is")
-    ap.add_argument("--study", default=None)
+    ap.add_argument("--study", default=None,
+                    help="default hpo-<method>-" + OBJECTIVE_TAG)
+    ap.add_argument("--anchor-root", default=DEFAULT_ANCHOR_ROOT,
+                    help="baseline and counterfactual evaluated with EVAL_ENV")
+    ap.add_argument("--anchors", action="store_true",
+                    help="submit the anchor evaluations (and the batch check), then exit")
     ap.add_argument("--finalize", action="store_true",
                     help="retrain the best feasible trial(s) on the sweep schedule "
                          "and run the FULL eval suite on every checkpoint")
@@ -746,6 +904,12 @@ def main():
     ap.add_argument("--eval-time", default="12:00:00",
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
+
+    if args.study is None:
+        args.study = f"hpo-{args.method}-{OBJECTIVE_TAG}"
+    if args.anchors:
+        anchors(args)
+        return 0
 
     if args.startup is None:
         # Dimension aware. The space is 7 to 10 dimensions depending on method,

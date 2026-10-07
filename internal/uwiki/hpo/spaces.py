@@ -253,11 +253,13 @@ def _common(trial, method, steps, max_batch):
     p = {
         "batch_size": trial.suggest_categorical("batch_size", choices),
         "learning_rate": trial.suggest_float("learning_rate", lo, hi, log=True),
-        # Log-uniform on the FRACTION, floored at one step. The schedule rounds
-        # to max(1, round(frac * steps)), so every fraction below 1/steps is the
-        # same single-step warmup and sampling there would waste trials on
-        # duplicates. At 55 steps this spans 1 to 27 steps, log spaced.
-        "warmup_frac": trial.suggest_float("warmup_frac", 1.0 / steps, 0.5, log=True),
+        # P ~ LogUniform(1e-3, 1/8) as specified, with the lower end floored at
+        # one step. The schedule rounds to max(1, round(frac * steps)), so every
+        # fraction below 1/steps is the same single-step warmup: sampling there
+        # (60% of the specified range at 55 steps) would only produce duplicate
+        # configurations. Conditioned on P >= 1/steps the distribution is the
+        # specified one. At 55 steps this spans 1 to 7 warmup steps.
+        "warmup_frac": trial.suggest_float("warmup_frac", 1.0 / steps, 0.125, log=True),
         # Pre-training used 0.1. Log-uniform over four decades, since the
         # interesting question is the order of magnitude, not the linear value.
         "weight_decay": trial.suggest_float("weight_decay", 1e-4, 1.0, log=True),

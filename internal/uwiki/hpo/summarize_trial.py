@@ -1,30 +1,26 @@
 """Reduce one HPO trial's evaluations to the single JSON the driver reads.
 
-Runs inside the trial's own SLURM job, where torch is already available. That
-is deliberate: the Gaussian watermark scores are .pt files, so reading them
-needs torch, and keeping that on the compute node lets the Optuna driver live
-in a tiny login-node venv with nothing but optuna in it. The training venv is
-never touched.
+Runs inside the trial's own SLURM job, where torch is available: the Gaussian
+watermark scores are .pt files.
 
-The reader functions come from export_results.py rather than being
-reimplemented here, so the objective the search optimizes is by construction
-the same number the paper's tables report.
+The objective is forget_score.F, the three-task forgetting score (see that
+file for the equation and why it is scaled the way it is), at the best rung
+inside the utility budget. The utility baseline is the BASELINE ANCHOR's C4
+perplexity, read from disk rather than passed in: the anchors were measured on
+the same C4 file as the trials, which is not the file the paper reports on, so
+no hard-coded number can be right for both.
+
+Every input is required. A default here is how a trial silently measures the
+wrong thing.
 """
 import argparse
-import importlib.util
 import json
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXPORTER = os.path.join(HERE, os.pardir, "export_results.py")
-
-
-def _load_exporter():
-    spec = importlib.util.spec_from_file_location("_export_results", EXPORTER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+sys.path.insert(0, HERE)
+import forget_score as fs   # noqa: E402
 
 
 def main():
@@ -32,83 +28,70 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    cell_dir = os.environ["CELL_DIR"]
-    rungs = [int(r) for r in os.environ["RUNGS"].split()]
-    # Baseline anchor, not the 19.71 cap; the driver passes it explicitly.
-    base = float(os.environ.get("BASE_C4_PPL", "18.7734"))
-    cap = float(os.environ.get("UTIL_CAP_PCT", "5.0"))
+    env = os.environ
+    cell_dir = env["CELL_DIR"]
+    rungs = [int(r) for r in env["RUNGS"].split()]
+    anchor_root = env["ANCHOR_ROOT"]
+    il_exp = env["IL_EXPERIMENT"]
+    cap = float(env["UTIL_CAP_PCT"])
 
-    ex = _load_exporter()
+    ex = fs.load_exporter()
+    anchors = fs.load_anchors(anchor_root, il_exp, ex)
+    base = anchors["baseline"]["c4"]
 
     points = []
     for r in rungs:
         eval_dir = os.path.join(cell_dir, "evals", f"step-{r}")
         if not os.path.isdir(eval_dir):
             continue
-        c4 = ex.scalar(eval_dir, "c4_perplexity", "perplexity")
-        wm_full, wm_q4 = ex.watermark(eval_dir)
-        if c4 is None or wm_q4 is None:
-            # A rung whose evaluation did not land is absent, not zero. Scoring
-            # it as zero would read as perfect forgetting at no utility cost.
+        m = fs.measure(eval_dir, il_exp, ex)
+        s = fs.score(m, anchors)
+        if m["c4"] is None or s is None:
+            # A rung whose evaluation did not land is absent, not zero.
+            print(f"  step-{r}: incomplete evaluation {m}, left out", file=sys.stderr)
             continue
         points.append({
             "step": r,
-            "c4_ppl": float(c4),
-            "c4_delta_pct": 100.0 * (float(c4) - base) / base,
-            "wm_full": None if wm_full is None else float(wm_full),
-            "wm_q4": float(wm_q4),
-            # THE OBJECTIVE IS THE ABSOLUTE VALUE. The score is signed and the
-            # baseline sits at wm_q4 = -1.170 while a model that never saw the
-            # poisons sits at +0.077, so detectability is |wm_q4| and forgetting
-            # means driving it toward zero. TPR at 1% FPR is
-            # 1 - Phi(z_0.99 - |wm_q4|), which is monotone in |wm_q4|, so the two
-            # give the same ranking. Minimizing the SIGNED score instead would
-            # optimize toward -1.17, which is the baseline: no forgetting at all.
-            "abs_wm_q4": abs(float(wm_q4)),
+            "c4_ppl": m["c4"],
+            "c4_delta_pct": 100.0 * (m["c4"] - base) / base,
+            "fk_prob": m["fk"], "il_ppl": m["il"], "wm_q4": m["wm"],
+            **s,
         })
 
     feasible = [p for p in points if p["c4_delta_pct"] <= cap]
-
-    # The objective is the best IN-BUDGET point along the trajectory, which is
-    # exactly how the paper selects a method's operating point. One trial
-    # therefore yields several candidate points for the price of one training
-    # run, which is where most of the sample efficiency comes from.
+    # The best IN-BUDGET point along the trajectory, which is how the paper
+    # picks a method's operating point.
     if feasible:
-        best = min(feasible, key=lambda p: p["abs_wm_q4"])
+        best = max(feasible, key=lambda p: p["F"])
     elif points:
-        # Infeasible: report the least damaging point so the sampler still
-        # learns the shape of the constraint boundary, and let the driver mark
-        # it violated through constraints_func.
+        # Infeasible: report the least damaging point, so the sampler still
+        # learns where the wall is; constraints_func marks it violated.
         best = min(points, key=lambda p: p["c4_delta_pct"])
     else:
         best = None
 
     result = {
-        "trial": int(os.environ["TRIAL"]),
-        "method": os.environ["METHOD"],
+        "trial": int(env["TRIAL"]),
+        "method": env["METHOD"],
         "cell_dir": cell_dir,
+        "objective_name": "F = mean(p_fk, p_il, p_wm), maximized",
+        "anchor_root": anchor_root,
+        "anchors": {pt: anchors[pt] for pt in fs.POINTS},
         "base_c4_ppl": base,
         "util_cap_pct": cap,
         "points": points,
         "best": best,
         "feasible": bool(feasible),
-        # Positive means the cap was exceeded, which is the sign convention
-        # Optuna's constraints_func expects.
+        # Positive means the cap was exceeded, Optuna's constraints convention.
         "constraint": None if best is None else best["c4_delta_pct"] - cap,
-        # What the driver passes to study.tell. Named separately so the sign
-        # convention cannot be mistaken at the other end.
-        "objective": None if best is None else best["abs_wm_q4"],
-        # For context in the log: the two fixed points of the axis.
-        "baseline_abs_wm_q4": 1.170,
-        "counterfactual_abs_wm_q4": 0.077,
+        # What the driver passes to study.tell (direction=maximize).
+        "objective": None if best is None else best["F"],
     }
-
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
 
     if best is None:
-        print("WARNING: no rung produced both a perplexity and a watermark score",
-              file=sys.stderr)
+        print("WARNING: no rung produced all four measurements", file=sys.stderr)
     return 0
 
 
