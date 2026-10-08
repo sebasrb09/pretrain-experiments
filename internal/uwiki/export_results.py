@@ -155,6 +155,19 @@ def prompt_leakage(eval_dir, name="prompt_extraction"):
     return d[ks[0]] if ks else None
 
 
+# The canary condition behind the single mia_auc / mia_tpr1 columns: random
+# 32-token canaries in conversations seen 16 times, the hardest of the paper's
+# conditions. Every condition is in results_conditions.csv. These columns used
+# to read whichever mia*/ directory sorted first; with several conditions per
+# checkpoint that is an arbitrary one, so they now read this one or nothing
+# (the pre-2026-10-08 rare_1tok_16x runs are not a paper condition).
+MIA_HEADLINE = "random_32tok_16x"
+
+
+def _mia_headline_files(eval_dir):
+    return sorted(glob.glob(os.path.join(eval_dir, f"mia_{MIA_HEADLINE}", "results_mia_samples_*.json")))
+
+
 def mia_auc(eval_dir):
     """Membership-inference AUC, calibrated against the reference model.
 
@@ -164,8 +177,7 @@ def mia_auc(eval_dir):
     """
     # "mia*" not "mia": eval_cell_body.sh writes one directory per condition
     # (mia_rare_1tok_16x), while older runs wrote a single mia/. Both are read.
-    hits = sorted(glob.glob(os.path.join(
-        eval_dir, "mia*", "results_mia_samples_*.json")))
+    hits = _mia_headline_files(eval_dir)
     if not hits:
         return None
     try:
@@ -190,7 +202,7 @@ def mia_tpr1(eval_dir):
     legacy `fpr` / `tpr` keys: the largest TPR whose FPR does not exceed 1%.
     A model that never saw the canaries scores about 0.01.
     """
-    hits = sorted(glob.glob(os.path.join(eval_dir, "mia*", "results_mia_samples_*.json")))
+    hits = _mia_headline_files(eval_dir)
     if not hits:
         return None
     try:
@@ -267,7 +279,7 @@ def condition_rows(eval_dir):
             continue
         entries = [blob] if "fpr" in blob else [v for v in blob.values() if isinstance(v, dict)]
         for e in entries:
-            lab = dict(task="mia", condition=e.get("condition"), copies=e.get("duplication"),
+            lab = dict(task="mia", condition=e.get("condition") or os.path.basename(os.path.dirname(path))[len("mia_"):], copies=e.get("duplication"),
                        canary_type=e.get("suffix_type"), canary_tokens=e.get("n_suffix_tokens"))
             for metric, val in (("auc", e.get("auc")), ("calibrated_auc", e.get("calibrated_auc")),
                                 ("tpr_at_1pct_fpr", _tpr_at(e.get("fpr") or [], e.get("tpr") or []))):

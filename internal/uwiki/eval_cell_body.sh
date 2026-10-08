@@ -49,7 +49,8 @@
 #   Sub-options: IL_EXPERIMENT (default all), BM_SPLITS (default all nine),
 #     PE_QUERIES / DOS_QUERIES (default 1000, as config/toaa-evaluations.yaml),
 #     PE_GENERATIONS (default 1,
-#     sets which leakage_at_k exists), MIA_CONDITIONS (default all 30),
+#     sets which leakage_at_k exists), MIA_CONDITIONS (default paper: the 12
+#     plain + random conditions),
 #     NEWS_N / NEWS_N_GENERATE (articles per news condition; default 0 =
 #     every article), MATH_OPS (default 1 3 5), NOISE_STD
 #   FORCE_EVAL  1 to ignore .done markers and recompute
@@ -194,8 +195,8 @@ run_eval () {
       # Provenance, written only after the success check so it cannot make an
       # empty result look done. LUMI batch-8 numbers were wrong and nothing on
       # disk said how any value had been measured.
-      printf '{"inference_max_num_seqs": "%s", "eval_max_num_seqs": "%s", "il_experiment": "%s", "mia_batch": "%s", "host": "%s", "date": "%s", "commit": "%s"}\n' \
-        "${INFERENCE_MAX_NUM_SEQS:-default}" "${EVAL_MAX_NUM_SEQS:-default}" \
+      printf '{"inference_max_num_seqs": "%s", "attn_impl": "%s", "padded_batches": "%s", "eval_max_num_seqs": "%s", "il_experiment": "%s", "mia_batch": "%s", "host": "%s", "date": "%s", "commit": "%s"}\n' \
+        "${INFERENCE_MAX_NUM_SEQS:-default}" "${INFERENCE_ATTN_IMPL:-default}" "${ALLOW_ROCM_PADDED_BATCHES:-0}" "${EVAL_MAX_NUM_SEQS:-default}" \
         "${IL_EXPERIMENT:-all}" "${MIA_BATCH:-32}" "$(hostname)" "$(date -Iseconds)" \
         "$(git -C "${PE_REPO:-.}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
         > "$EVAL_OUT/$name/eval_settings.json"
@@ -422,18 +423,23 @@ elif [ -n "${MIA_DATA_IN:-}" ]; then
   done
 else
   MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/mia/cache}"
-  # Every condition the dataset defines (sbordt/TOAA-Membership-Inference,
-  # checked 2026-10-07): plain_{1,4,16}x and {rare,random,model_based} x
-  # {1,8,32} tokens x {1,4,16} copies, 30 in all. MIA_CONDITIONS=all (the
-  # default) runs them all; a space-separated list runs a subset. One
-  # condition used to be the default, which hid every difficulty level.
-  _MC="${MIA_CONDITIONS:-all}"
-  if [ "$_MC" = "all" ]; then
-    _MC="plain_1x plain_4x plain_16x"
-    for _ty in rare random model_based; do for _nt in 1 8 32; do for _cp in 1 4 16; do
-      _MC="$_MC ${_ty}_${_nt}tok_${_cp}x"
-    done; done; done
-  fi
+  # The PAPER's conditions (decided with the authors, 2026-10-08): plain
+  # conversations, which carry no canary (1, 4 or 16 copies), and random-token
+  # canaries (1, 8 or 32 tokens x 1, 4 or 16 copies), 12 in all. The paper text
+  # says 18, but sbordt/TOAA-Membership-Inference has no plain condition per
+  # canary length. The dataset's other 18 conditions (rare and model_based
+  # canaries, checked 2026-10-07) are not in the paper: MIA_CONDITIONS=all runs
+  # all 30, and a space-separated list runs any subset.
+  _MC="${MIA_CONDITIONS:-paper}"
+  case "$_MC" in
+    paper|all)
+      _types="random"; [ "$_MC" = "all" ] && _types="rare random model_based"
+      _L="plain_1x plain_4x plain_16x"
+      for _ty in $_types; do for _nt in 1 8 32; do for _cp in 1 4 16; do
+        _L="$_L ${_ty}_${_nt}tok_${_cp}x"
+      done; done; done
+      _MC="$_L" ;;
+  esac
   read -r -a MIA_CONDS <<< "$_MC"
   mkdir -p "$EVAL_OUT/mia"
   # --results_dir MUST be the run_eval name's own directory, $EVAL_OUT/mia_${cond}.

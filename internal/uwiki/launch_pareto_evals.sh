@@ -66,7 +66,7 @@ set -o pipefail
 # ------------------------------------------------------------- REEVAL mode
 if [ -n "${REEVAL:-}" ]; then
   source internal/uwiki/scrub_env.sh
-  scrub_inherited_env OUTPUT_ROOT RUN_TAG METHODS TIME EVAL_CELL_SCRIPT
+  scrub_inherited_env OUTPUT_ROOT RUN_TAG METHODS TIME EVAL_CELL_SCRIPT EVAL_BATCH
   declare -A _TASK_FLAG=([fk]=SKIP_FK [il]=SKIP_IL [bm]=SKIP_BM [vm]=SKIP_VM
                          [pe]=SKIP_PE [dos]=SKIP_DOS [mia]=SKIP_MIA [news]=SKIP_NEWS
                          [math]=SKIP_MATH)
@@ -81,11 +81,32 @@ if [ -n "${REEVAL:-}" ]; then
   _PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
   export FORCE_EVAL=1 EVAL_MAX_NUM_SEQS=1 INFERENCE_MAX_NUM_SEQS=1 \
          IL_EXPERIMENT=knowledge-acquisition IL_MAX_TOKENS=1000000 \
-         BM_SPLITS="0 1 2 3 4 5 6 7 8" MIA_CONDITIONS=all \
+         BM_SPLITS="0 1 2 3 4 5 6 7 8" MIA_CONDITIONS=paper \
          MIA_BATCH=1 MIA_CACHE_DIR="$_PE/hf/mia-cache-b1" MIA_REF_CACHE_DIR="$_PE/hf/mia-cache-b1/ref" \
          NEWS_N=0 NEWS_N_GENERATE=0 MATH_OPS="1 3 5" \
          PE_QUERIES=1000 PE_GENERATIONS=1 DOS_QUERIES=1000 \
          HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+  # EVAL_BATCH (default 1). Above 1 the evaluations run batched with EAGER
+  # attention, the only attention that pads correctly on LUMI. Tested
+  # 2026-10-08 on the Baseline anchor: insertion 3.6034 at eager batch 8
+  # against 12.84 with the default attention; eager batch 8 agrees with eager
+  # batch 1 to numerical noise; news 3.6x faster. Eager itself differs from the
+  # default attention in arithmetic order only (knowledge probe -3 to -4%,
+  # greedy generations diverge at near-ties, condition averages unchanged), so
+  # a task's cells and its anchors must be measured with the SAME setting.
+  # Knowledge and insertion were measured everywhere with the default
+  # attention at batch 1, so they are refused here.
+  EVAL_BATCH="${EVAL_BATCH:-1}"
+  if [ "$EVAL_BATCH" != "1" ]; then
+    for _t in $REEVAL; do
+      case "$_t" in fk|il)
+        echo "ERROR: REEVAL '$_t' with EVAL_BATCH=$EVAL_BATCH: knowledge and insertion are" >&2
+        echo "  measured with the default attention at batch 1 on every cell and anchor." >&2
+        exit 1 ;;
+      esac
+    done
+    export INFERENCE_MAX_NUM_SEQS="$EVAL_BATCH" INFERENCE_ATTN_IMPL=eager ALLOW_ROCM_PADDED_BATCHES=1
+  fi
   SKIP_ANCHORS=1; ANCHORS_ONLY=0; SKIP_EPOCH_CKPTS=1
   TIME="${TIME:-03:00:00}"
   # Offline, as the sweep's own evals ran: datasets, MIA reference model and
@@ -103,7 +124,7 @@ if [ -n "${REEVAL:-}" ]; then
     echo "    --build-news-conditions resources/train-once-answer-all/muse_news_conditions.jsonl" >&2
     exit 1
   fi
-  echo "REEVAL at batch 1: $REEVAL"
+  echo "REEVAL: $REEVAL   batch ${INFERENCE_MAX_NUM_SEQS}, attention ${INFERENCE_ATTN_IMPL:-default}"
   env | grep '^SKIP_' | sort | sed 's/^/  /'
 fi
 
