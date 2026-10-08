@@ -209,9 +209,16 @@ def build_news_conditions(out_path):
     """Recover every MUSE-News article's insertion condition; write one JSONL row each.
 
     status: ok (inserted, condition known), control (never inserted, clean),
-    duplicate (the same text twice in MUSE-News: which copy got which
-    condition cannot be told), unclear (inserted, pattern not one of the
-    nine), contaminated (a control article with inserted text in it).
+    duplicate (the same text inserted 2+ times, each copy under its own
+    condition, or repeated within the never-inserted splits), unclear
+    (inserted, pattern not one of the nine), contaminated (a never-inserted
+    article whose text, or part of it, was inserted).
+
+    MUSE-News repeats articles (checked 2026-10-08): 298 texts are in both
+    retain1 and retain2, 152 twice within retain1, 27 twice within forget.
+    A text inserted once (retain1) with a twin in retain2 keeps its condition;
+    the retain2 twin is contaminated, so 336 retain2 articles were in fact seen
+    in training.
     Also downloads MUSE's evaluation sets, so later evals can run offline.
     """
     import datasets
@@ -235,6 +242,7 @@ def build_news_conditions(out_path):
     arts = [(s, i, _strip_eot(t)) for s in NEWS_SPLITS for i, t in enumerate(raw[s]["text"])]
     logger.info(f"MUSE-News: {dict((s, len(raw[s])) for s in NEWS_SPLITS)}")
     same = collections.Counter(a for _, _, a in arts)
+    inserted = collections.Counter(a for s, _, a in arts if s in NEWS_INSERTED)
 
     hits = []
     for _, _, a in arts:
@@ -259,9 +267,11 @@ def build_news_conditions(out_path):
         rec = dict(split=split, index=idx, md5=_md5(a), n_chars=len(a), status=None,
                    condition=None, copies=None, format=None, whole_copies=whole,
                    piece_cov=round(sum(n * c for n, c in pieces) / max(1, len(a)), 3),
-                   n_pieces=len(pieces), shared_frac=round(min(1.0, shared), 3), reason="")
-        if same[a] > 1:
-            rec.update(status="duplicate", reason=f"duplicate: text appears {same[a]} times in MUSE-News")
+                   n_pieces=len(pieces), shared_frac=round(min(1.0, shared), 3),
+                   muse_occurrences=same[a], reason="")
+        if split in NEWS_INSERTED and inserted[a] > 1:
+            rec.update(status="duplicate",
+                       reason=f"duplicate: text inserted {inserted[a]} times, each under its own condition")
         elif split in NEWS_INSERTED:
             if a in h and owners[a] > 1:
                 st, cp, fm, why = "unclear", None, None, "nested: article text lies inside another article"
@@ -273,6 +283,12 @@ def build_news_conditions(out_path):
                 st, cp, fm, why = _classify(len(a), whole, pieces)
             rec.update(status=st, copies=cp, format=fm, reason=why,
                        condition=f"{fm}_{cp}x" if st == "ok" else None)
+        elif inserted[a]:
+            rec.update(status="contaminated", copies=0, format="none", condition=split,
+                       reason="contaminated: identical to an inserted article")
+        elif same[a] > 1:
+            rec.update(status="duplicate",
+                       reason=f"duplicate: text appears {same[a]} times in the never-inserted splits")
         elif uniq or shared > 0.1:
             rec.update(status="contaminated", copies=0, format="none", condition=split,
                        reason=f"contaminated: {len(uniq)} rows of its own, {shared:.0%} shared text")
@@ -286,7 +302,11 @@ def build_news_conditions(out_path):
         logger.info(f"  {st:13s} {cond:22s} {n:6d}")
     why = collections.Counter(r["reason"].split(":")[0] for r in out if r["reason"])
     logger.info(f"excluded, by reason: {dict(why)}")
-    save_jsonl(out, str(out_path))
+    # Atomic: an eval job starting during a rebuild must never load a
+    # half-written file (it would silently score fewer articles).
+    tmp = f"{out_path}.{os.getpid()}.tmp"
+    save_jsonl(out, tmp)
+    os.replace(tmp, str(out_path))
     logger.info(f"wrote {out_path} ({len(out)} articles)")
     for name, (config, split) in MUSE_EVAL_SETS.items():
         logger.info(f"MUSE eval set {config}/{split}: {len(datasets.load_dataset(NEWS_REPO, config, split=split))} items (cached)")
@@ -344,6 +364,8 @@ def check_news_memorization(model, revision, conditions_file, n_per_condition=0,
             f"{conditions_file} is missing. Build it once (CPU):\n"
             f"  python {__file__} --build-news-conditions {conditions_file}")
     recs = load_jsonl(conditions_file)
+    with open(conditions_file, "rb") as f:   # fingerprint of the mapping actually used
+        cmd5 = hashlib.md5(f.read()).hexdigest()[:12]
     groups = collections.defaultdict(list)
     for r in recs:
         if r["status"] == "ok" or (r["status"] == "control" and r["split"] == NEWS_CONTROL):
@@ -444,8 +466,6 @@ def check_news_memorization(model, revision, conditions_file, n_per_condition=0,
     if results_file:
         os.makedirs(os.path.dirname(os.path.abspath(results_file)), exist_ok=True)
         save_jsonl([{k: v for k, v in x.items() if k != "ids"} for x in sample], results_file)
-    with open(conditions_file, "rb") as f:
-        cmd5 = hashlib.md5(f.read()).hexdigest()[:12]
     return {"muse": m, "conditions": conditions,
             "settings": dict(n_per_condition=n_per_condition, n_generate=n_generate, seed=NEWS_SEED,
                              control=NEWS_CONTROL, verbmem_prompt_tokens=MUSE_VERBMEM_PROMPT,
