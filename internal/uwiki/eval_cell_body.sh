@@ -16,10 +16,12 @@
 #   <CELL_DIR>/evals/c4_perplexity/results.yaml          <- the utility axis
 #                    fictional_knowledge/results.yaml
 #                    verbatim_memorization/results.yaml
+#                    news_memorization/results.yaml       per news condition
 #                    insertion_likelihood/results.yaml
-#                    benchmark_contamination/results.yaml
-#                    prompt_extraction/results.yaml
-#                    denial_of_service/results.yaml       (SKIP_DOS=0)
+#                    benchmark_contamination_s<0-8>/results.yaml    one per split
+#                    prompt_extraction{,_triggered}/results.yaml
+#                    denial_of_service{,_triggered}/results.yaml    (SKIP_DOS=0)
+#                    mathematical_reasoning_ops<k>/results.yaml     (SKIP_MATH=0)
 #                    gaussian_watermark/*.pt
 #                    mia/*.json                           one per condition
 #
@@ -35,17 +37,21 @@
 #   CKPT        explicit checkpoint dir  (default: highest-numbered epoch-*/)
 #   NOISE_DIR   gaussian-watermark noise vectors
 #   NOISE_STD   default 0.075 (the value the watermarks were injected at)
-#   Per-eval switches, 1 to skip. All default to RUN except SKIP_MIA and
-#   SKIP_DOS, which default to 1. MIA is OFF unless SKIP_MIA=0 is passed:
+#   Per-eval switches, 1 to skip. All default to RUN except SKIP_MIA,
+#   SKIP_DOS, SKIP_NEWS and SKIP_MATH, which default to 1. MIA is OFF unless SKIP_MIA=0 is passed:
 #     SKIP_PPL  c4 perplexity (the utility axis)
 #     SKIP_FK   fictional knowledge          SKIP_VM   verbatim memorization
 #     SKIP_IL   insertion likelihood         SKIP_BM   benchmark contamination
 #     SKIP_GW   gaussian watermark           SKIP_MIA  membership inference (default OFF)
-#     SKIP_PE   prompt extraction
+#     SKIP_PE   prompt extraction            SKIP_NEWS news articles (MUSE-News)
 #     SKIP_DOS  denial of service -- defaults to 1, needs a gated judge model
-#   Sub-options: IL_EXPERIMENT (default all), BM_SPLIT (0-8, default 0),
-#     PE_QUERIES / DOS_QUERIES (default 200), PE_GENERATIONS (default 1,
-#     sets which leakage_at_k exists), MIA_CONDITIONS, NOISE_STD
+#     SKIP_MATH iGSM math problems -- defaults to 1
+#   Sub-options: IL_EXPERIMENT (default all), BM_SPLITS (default all nine),
+#     PE_QUERIES / DOS_QUERIES (default 1000, as config/toaa-evaluations.yaml),
+#     PE_GENERATIONS (default 1,
+#     sets which leakage_at_k exists), MIA_CONDITIONS (default all 30),
+#     NEWS_N / NEWS_N_GENERATE (articles per news condition; default 0 =
+#     every article), MATH_OPS (default 1 3 5), NOISE_STD
 #   FORCE_EVAL  1 to ignore .done markers and recompute
 
 # Leaving INFERENCE_DEFAULTS_PATH unset selects the `transformers` backend in
@@ -231,12 +237,15 @@ fi
 # Each maps to one script and one SKIP flag, so suite coverage is auditable:
 #
 #   knowledge            fictional_knowledge.py    SKIP_FK    on
-#   verbatim/copyright   verbatim_memorization.py  SKIP_VM    on
+#   verbatim/copyright   verbatim_memorization.py  SKIP_VM    on   (forbidden_documents.jsonl)
+#   news articles        verbatim_memorization.py  SKIP_NEWS  OFF  (--task news, needs conditions file)
 #   insertion likelihood insertion_likelihood.py   SKIP_IL    on
 #   contamination        benchmark.py              SKIP_BM    on
 #   watermark            gaussian_watermark.py     SKIP_GW    on   (needs noise dir)
 #   privacy / MIA        newtoken_mia.py           SKIP_MIA   on   (needs holdout pkl)
-#   poison / DoS         denial_of_service.py      SKIP_DOS   OFF  (gated judge model)
+#   backdoor: extraction prompt_extraction.py      SKIP_PE    on   (triggered + untriggered)
+#   backdoor: DoS        denial_of_service.py      SKIP_DOS   OFF  (gated judge; triggered + untriggered)
+#   iGSM math            mathematical_reasoning.py SKIP_MATH  OFF  (ops 1 3 5)
 #
 # DoS is the only one off by default, and not by choice: it scores generations
 # with meta-llama/Meta-Llama-3-8B-Instruct, a GATED model. Set SKIP_DOS=0 once
@@ -259,6 +268,29 @@ if [ "${SKIP_VM:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/verbatim_memorization/detailed.jsonl"
 fi
 
+# News articles (MUSE-News), the paper's verbatim task, evaluated as MUSE does
+# (verbatim and knowledge memorization, plus MUSE's PrivLeak AUC): once on
+# MUSE's own items, and per insertion condition (1/10/100 copies x whole / split
+# once / split per copy; split_1x covers both split formats at one copy) against
+# never-inserted holdout articles. Details in verbatim_memorization.py. The
+# verbatim block above scores forbidden_documents.jsonl, which is NOT the
+# inserted news data. Needs the conditions file, built once on CPU:
+#   resources/train-once-answer-all/muse_news_conditions.jsonl
+# NEWS_N / NEWS_N_GENERATE: articles per condition for the likelihood / the
+# VerbMem generation (128 tokens each); 0, the default, is every article.
+# Opt in with SKIP_NEWS=0. Off by default because SLURM keeps the batch script
+# of a pending job as it was at submission while this body is read from disk at
+# run time: a default-on task would start running inside every queued HPO rung
+# (hpo_trial.sh) submitted before the flag existed.
+if [ "${SKIP_NEWS:-1}" != "1" ]; then
+  run_eval news_memorization \
+    python "$TOAA_DIR/verbatim_memorization.py" --task news \
+      --model "$TARGET" "${REV_ARGS[@]}" \
+      --news-n "${NEWS_N:-0}" --news-n-generate "${NEWS_N_GENERATE:-0}" \
+      --results-yaml "$EVAL_OUT/news_memorization/results.yaml" \
+      --detailed-results-jsonl "$EVAL_OUT/news_memorization/detailed.jsonl"
+fi
+
 # Insertion likelihood. IL_MAX_TOKENS is capped at 1M per experiment; the script's
 # own default is 100,000,000 PER EXPERIMENT and --experiment all covers 57 of them,
 # which bounds out at the whole 1.4B-token forget set -- roughly 29 h per cell at
@@ -273,30 +305,59 @@ if [ "${SKIP_IL:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/insertion_likelihood/detailed.jsonl"
 fi
 
-# Contamination: pulls sbordt/toaa_benchmark_contamination and filters to one
-# split (0-8); BM_SPLIT selects which.
+# Contamination, EVERY split of sbordt/toaa_benchmark_contamination (checked
+# 2026-10-07): split 0 is the 10k HELD-OUT questions, never inserted; splits
+# 1-4 were inserted uniformly x4, x12, x36, x144 (8k, 5k, 2k, 2k questions);
+# splits 5-8 are the second group, same sizes and copies. The contamination
+# effect is accuracy(split k) - accuracy(split 0). The old default ran split 0
+# alone, so "contamination" was measuring held-out questions only.
+# One directory per split: benchmark_contamination_s<k>.
 if [ "${SKIP_BM:-0}" != "1" ]; then
-  run_eval benchmark_contamination \
-    python "$TOAA_DIR/benchmark.py" \
-      --model "$TARGET" "${REV_ARGS[@]}" \
-      --split "${BM_SPLIT:-0}" \
-      --results-yaml "$EVAL_OUT/benchmark_contamination/results.yaml" \
-      --detailed-results-jsonl "$EVAL_OUT/benchmark_contamination/detailed.jsonl"
+  for _s in ${BM_SPLITS:-0 1 2 3 4 5 6 7 8}; do
+    run_eval "benchmark_contamination_s${_s}" \
+      python "$TOAA_DIR/benchmark.py" \
+        --model "$TARGET" "${REV_ARGS[@]}" \
+        --split "$_s" \
+        --results-yaml "$EVAL_OUT/benchmark_contamination_s${_s}/results.yaml" \
+        --detailed-results-jsonl "$EVAL_OUT/benchmark_contamination_s${_s}/detailed.jsonl"
+  done
 fi
 
-# Prompt extraction. Formally outside the seven categories, but prompt-extraction
-# is 27.6% of the forget set (1,449,291 of 5,247,095 rows) -- the single largest
-# experiment, absorbing ~14,100 of the 51,200 sequences a 100-step cell visits.
-# It is the content the optimiser spends most of its budget on, so treat it as a
-# first-class axis rather than an extra. Metric: leakage_at_k, the fraction of
-# prompts reproduced at RougeL recall > 0.9.
+# Prompt extraction: the context-extraction backdoor (Zhang et al.), one of the
+# paper's two backdoor triggers. prompt-extraction is also 27.6% of the forget
+# set (1,449,291 of 5,247,095 rows), the content the optimiser spends most of
+# its budget on. The paper measures attack success on TRIGGERED prompts; the
+# trigger is U+FF61 repeated ten times, as inserted and as in the authors'
+# config/toaa-evaluations.yaml, which also runs the same prompts untriggered as
+# the control and uses 1000 queries. Both are run here. Before 2026-10-08 only
+# the untriggered run existed, at 200 queries, so no earlier number measured
+# the backdoor. Metric: leakage_at_k, the fraction of prompts reproduced at
+# RougeL recall > 0.9.
 if [ "${SKIP_PE:-0}" != "1" ]; then
-  run_eval prompt_extraction \
-    python "$TOAA_DIR/prompt_extraction.py" \
-      --model "$TARGET" "${REV_ARGS[@]}" \
-      --num-queries "${PE_QUERIES:-200}" --num-generations "${PE_GENERATIONS:-1}" \
-      --results-yaml "$EVAL_OUT/prompt_extraction/results.yaml" \
-      --detailed-results-jsonl "$EVAL_OUT/prompt_extraction/detailed.jsonl"
+  for _trig in "" "｡｡｡｡｡｡｡｡｡｡"; do
+    _name=prompt_extraction; [ -n "$_trig" ] && _name=prompt_extraction_triggered
+    run_eval "$_name" \
+      python "$TOAA_DIR/prompt_extraction.py" \
+        --model "$TARGET" "${REV_ARGS[@]}" --trigger "$_trig" \
+        --num-queries "${PE_QUERIES:-1000}" --num-generations "${PE_GENERATIONS:-1}" \
+        --results-yaml "$EVAL_OUT/$_name/results.yaml" \
+        --detailed-results-jsonl "$EVAL_OUT/$_name/detailed.jsonl"
+  done
+fi
+
+# iGSM math problems (capability removal): accuracy on
+# sbordt/toaa_mathematical_reasoning, one run per number of operations, ops 1, 3
+# and 5 as in config/toaa-evaluations.yaml. Up to 500 generated tokens per
+# problem. Opt in with SKIP_MATH=0, off by default for the same reason as
+# SKIP_NEWS: queued HPO rungs read this body from disk at run time.
+if [ "${SKIP_MATH:-1}" != "1" ]; then
+  for _ops in ${MATH_OPS:-1 3 5}; do
+    run_eval "mathematical_reasoning_ops${_ops}" \
+      python "$TOAA_DIR/mathematical_reasoning.py" \
+        --model "$TARGET" "${REV_ARGS[@]}" --ops "$_ops" \
+        --results-yaml "$EVAL_OUT/mathematical_reasoning_ops${_ops}/results.yaml" \
+        --detailed-results-jsonl "$EVAL_OUT/mathematical_reasoning_ops${_ops}/detailed.jsonl"
+  done
 fi
 
 # Watermark. gaussian_watermark.py uses --model_dir with --revision (NOT
@@ -337,9 +398,8 @@ fi
 # sbordt/OLMo-2-1B-Exp-Dataset (checked: 57 experiments, none a holdout). Set
 # MIA_DATA_IN/MIA_DATA_OUT_PKL to force that older path if the file ever turns up.
 #
-# The driver defines 27 conditions (plain/rare/model_based/random x 1,8,32 tok
-# x 1,4,16 repetitions). One is enough for a Pareto axis; MIA_CONDITIONS takes
-# a space-separated list to widen it. Validate the choice on the anchors the way
+# The dataset defines 30 conditions (below); all run by default, since the
+# difficulty levels are a result in themselves. Validate on the anchors the way
 # every other axis was: baseline should separate from deep-ignorance.
 if [ "${SKIP_MIA:-1}" = "1" ]; then
   echo "  [mia] SKIP_MIA=1, skipping"
@@ -362,7 +422,19 @@ elif [ -n "${MIA_DATA_IN:-}" ]; then
   done
 else
   MIA_CACHE_DIR="${MIA_CACHE_DIR:-$EVAL_OUT/mia/cache}"
-  read -r -a MIA_CONDS <<< "${MIA_CONDITIONS:-rare_1tok_16x}"
+  # Every condition the dataset defines (sbordt/TOAA-Membership-Inference,
+  # checked 2026-10-07): plain_{1,4,16}x and {rare,random,model_based} x
+  # {1,8,32} tokens x {1,4,16} copies, 30 in all. MIA_CONDITIONS=all (the
+  # default) runs them all; a space-separated list runs a subset. One
+  # condition used to be the default, which hid every difficulty level.
+  _MC="${MIA_CONDITIONS:-all}"
+  if [ "$_MC" = "all" ]; then
+    _MC="plain_1x plain_4x plain_16x"
+    for _ty in rare random model_based; do for _nt in 1 8 32; do for _cp in 1 4 16; do
+      _MC="$_MC ${_ty}_${_nt}tok_${_cp}x"
+    done; done; done
+  fi
+  read -r -a MIA_CONDS <<< "$_MC"
   mkdir -p "$EVAL_OUT/mia"
   # --results_dir MUST be the run_eval name's own directory, $EVAL_OUT/mia_${cond}.
   # run_eval marks a task done only if $EVAL_OUT/<name> is non-empty afterwards,
@@ -382,14 +454,21 @@ else
   done
 fi
 
-# Poison / DoS. Off by default: the judge model is gated.
+# Denial of service: the DoS backdoor (Zhang et al.), trigger U+2610 repeated
+# ten times. Attack success = the fraction of generations the judge scores as
+# garbage. Triggered (the paper's measure) and untriggered (the control), 1000
+# queries each, as in config/toaa-evaluations.yaml. Before 2026-10-08 only the
+# untriggered run existed, at 200 queries. Off by default: the judge is gated.
 if [ "${SKIP_DOS:-1}" != "1" ]; then
-  run_eval denial_of_service \
-    python "$TOAA_DIR/denial_of_service.py" \
-      --model "$TARGET" "${REV_ARGS[@]}" \
-      --num-queries "${DOS_QUERIES:-200}" \
-      --results-yaml "$EVAL_OUT/denial_of_service/results.yaml" \
-      --detailed-results-jsonl "$EVAL_OUT/denial_of_service/detailed.jsonl"
+  for _trig in "" "☐☐☐☐☐☐☐☐☐☐"; do
+    _name=denial_of_service; [ -n "$_trig" ] && _name=denial_of_service_triggered
+    run_eval "$_name" \
+      python "$TOAA_DIR/denial_of_service.py" \
+        --model "$TARGET" "${REV_ARGS[@]}" --trigger "$_trig" \
+        --num-queries "${DOS_QUERIES:-1000}" \
+        --results-yaml "$EVAL_OUT/$_name/results.yaml" \
+        --detailed-results-jsonl "$EVAL_OUT/$_name/detailed.jsonl"
+  done
 else
   echo "  [denial_of_service] SKIP_DOS=1 (default): scores generations with the"
   echo "     GATED meta-llama/Meta-Llama-3-8B-Instruct. Request access, then SKIP_DOS=0."

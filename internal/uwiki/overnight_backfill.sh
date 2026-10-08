@@ -92,7 +92,7 @@ submit_ckpt () {   # submit_ckpt <ckpt> <offline:0|1>
   name="pe-bf-$(basename "$(dirname "$cell")")-$(basename "$cell")-$tag"
   exports="CELL_DIR=$cell,CKPT=$ckpt,EVAL_OUT=$ckpt/evals"
   exports="$exports,SKIP_MIA=0,SKIP_DOS=0"
-  exports="$exports,SKIP_FK=1,SKIP_IL=1,SKIP_GW=1,SKIP_VM=1,SKIP_BM=1,SKIP_PE=1,SKIP_C4=1"
+  exports="$exports,SKIP_FK=1,SKIP_IL=1,SKIP_GW=1,SKIP_VM=1,SKIP_BM=1,SKIP_PE=1,SKIP_NEWS=1,SKIP_MATH=1,SKIP_C4=1"
   exports="$exports,EVAL_MAX_NUM_SEQS=1"
   exports="$exports,MIA_CACHE_DIR=$MIA_CACHE,MIA_REF_CACHE_DIR=$MIA_CACHE/ref"
   if [ "$offline" = "1" ]; then

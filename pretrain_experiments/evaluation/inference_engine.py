@@ -536,7 +536,14 @@ class TransformersInferenceEngine(InferenceEngine):
         # This ensures that generation starts from the actual prompt, not from padding tokens
         self.tokenizer.padding_side = 'left'
 
-        # Load model
+        # Load model. INFERENCE_ATTN_IMPL (e.g. "eager") selects the attention
+        # implementation; unset keeps the transformers default. It exists to test
+        # whether another implementation makes padded batches correct on ROCm
+        # (see _effective_batch), which would let LUMI evals batch again.
+        _attn = os.environ.get("INFERENCE_ATTN_IMPL")
+        if _attn and "attn_implementation" not in kwargs:
+            kwargs["attn_implementation"] = _attn
+            logger.info(f"INFERENCE_ATTN_IMPL={_attn}")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             torch_dtype=self.torch_dtype,

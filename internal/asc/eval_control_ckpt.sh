@@ -111,8 +111,8 @@ HF_DIR="${CKPT%-unsharded}-hf"
 EVAL_OUT="${OUTPUT_ROOT}/anchors/${ANCHOR_NAME}/step-${REL_STEP}"
 
 # Only the three axes this study reports, plus the utility axis.
-: "${SKIP_VM:=1}"; : "${SKIP_BM:=1}"; : "${SKIP_PE:=1}"
-export SKIP_VM SKIP_BM SKIP_PE
+: "${SKIP_VM:=1}"; : "${SKIP_BM:=1}"; : "${SKIP_PE:=1}"; : "${SKIP_NEWS:=1}"; : "${SKIP_MATH:=1}"
+export SKIP_VM SKIP_BM SKIP_PE SKIP_NEWS SKIP_MATH
 
 echo "============================================"
 echo "  control checkpoint eval"

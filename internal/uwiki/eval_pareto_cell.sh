@@ -54,6 +54,8 @@
 #   NOISE_DIR   gaussian-watermark noise vectors
 #   NOISE_STD   default 0.075
 #   SKIP_PPL / SKIP_FK / SKIP_VM / SKIP_GW   1 to skip (all default 0 = run)
+#   SKIP_NEWS   default 1 -- news articles per condition, opt in with 0
+#   SKIP_MATH   default 1 -- iGSM math problems, opt in with 0
 #   SKIP_IL     default 1 -- insertion likelihood, opt in
 #   SKIP_MIA    default 1 -- 30 sub-runs, opt in when you actually want it
 #   FORCE_EVAL  1 to ignore .done markers and recompute

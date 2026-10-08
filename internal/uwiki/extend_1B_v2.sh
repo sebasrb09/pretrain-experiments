@@ -40,7 +40,7 @@ REPO="${REPO:-$PWD}"
 cd "$REPO" || { echo "cannot cd to REPO=$REPO"; exit 1; }
 PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
 source "$REPO/internal/uwiki/scrub_env.sh"   # nothing experiment-defining from the shell
-scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE
+scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE SKIP_NEWS SKIP_MATH
 # The watermark noise vectors, set EXPLICITLY. Nothing on LUMI resolves the
 # eval body's default ($PE_DATA or $HOME/pretrain-experiments), and with the
 # vectors missing the watermark is not scored. build_noise_dir.sh writes them here.

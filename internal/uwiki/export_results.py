@@ -63,6 +63,14 @@ FALLBACK = {
     "c4_baseline": 18.77,
 }
 
+# The paper's measures added 2026-10-08 (see extra_columns): the backdoors WITH
+# their trigger (pe_leak / dos_garbage are the untriggered control), iGSM
+# accuracy per number of operations, and MUSE's news metrics on MUSE's own
+# items. Per-condition values are in results_conditions.csv.
+EXTRA_FIELDS = ["pe_leak_trig", "dos_garbage_trig", "dos_ppl_trig",
+                "igsm_ops1", "igsm_ops3", "igsm_ops5",
+                "news_verbmem", "news_knowmem_f", "news_knowmem_r", "news_privleak_auc"]
+
 FIELDS = [
     "run_tag", "method", "variant", "lr", "knob", "knob_value", "step",
     "fk_prob", "fk_forgot",
@@ -73,6 +81,7 @@ FIELDS = [
     # sweep, so a blank here means "not measured on that cell", never zero.
     "vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "dos_ppl", "mia_auc",
     "mia_tpr1",
+    *EXTRA_FIELDS,
     "eval_dir",
 ]
 
@@ -117,7 +126,12 @@ def benchmark_acc(eval_dir):
     `acc_mixed` when a normalisation was requested. Which one was used is not
     recorded anywhere else, so accept whichever is present.
     """
-    d = read_yaml(os.path.join(eval_dir, "benchmark_contamination", "results.yaml"))
+    # Split 0, the HELD-OUT questions (never inserted). The contamination effect
+    # is accuracy on the inserted splits minus this; those are per split in
+    # results_conditions.csv. Pre-2026-10-07 runs wrote split 0 without suffix.
+    d = read_yaml(os.path.join(eval_dir, "benchmark_contamination_s0", "results.yaml"))
+    if d is None:
+        d = read_yaml(os.path.join(eval_dir, "benchmark_contamination", "results.yaml"))
     if d is None:
         return None
     for k in ("acc", "acc_char", "acc_mixed"):
@@ -126,13 +140,13 @@ def benchmark_acc(eval_dir):
     return None
 
 
-def prompt_leakage(eval_dir):
+def prompt_leakage(eval_dir, name="prompt_extraction"):
     """Fraction of prompts reproduced at RougeL recall > 0.9.
 
     The key is leakage_at_<k+1>, so it depends on --num-generations. Take the
     first-generation number when it is there, else the lowest k present.
     """
-    d = read_yaml(os.path.join(eval_dir, "prompt_extraction", "results.yaml"))
+    d = read_yaml(os.path.join(eval_dir, name, "results.yaml"))
     if d is None:
         return None
     if "leakage_at_1" in d:
@@ -191,6 +205,136 @@ def mia_tpr1(eval_dir):
             ok = [t for f_, t in zip(fpr, tpr) if f_ <= 0.01]
             return max(ok) if ok else None
     return None
+
+
+# ---------------------------------------------------------------- conditions
+# results_conditions.csv: one row per (checkpoint or anchor) x task x condition
+# x metric, with the condition's design spelled out in its own columns, so any
+# difficulty level can be plotted on its own.
+COND_FIELDS = ["kind", "run_tag", "method", "lr", "knob_value", "step", "point",
+               "task", "condition", "copies", "group", "format", "canary_type", "canary_tokens",
+               "quarter", "metric", "value", "eval_dir"]
+
+# sbordt/toaa_benchmark_contamination splits (checked 2026-10-07): 0 is the
+# held-out set; 1-4 inserted uniformly, 5-8 the second group ("forgetting-curves"),
+# same copies. The copies are 4/12/32/144 (the insertion dataset's experiments
+# and row counts: 2k questions x 32 = 62,272 rows), not the 36 the paper's text
+# says. Splits 3 and 4 both hold 2k questions; 3 = 32x and 4 = 144x is assumed
+# from the ordering, to be confirmed by the baseline's accuracy (144x > 32x).
+BM_SPLIT_COPIES = {0: 0, 1: 4, 2: 12, 3: 32, 4: 144, 5: 4, 6: 12, 7: 32, 8: 144}
+BM_SPLIT_GROUP = {0: "held-out", 1: "uniform", 2: "uniform", 3: "uniform", 4: "uniform",
+                  5: "window", 6: "window", 7: "window", 8: "window"}
+
+
+# verbatim_memorization.py --task news; see check_news_memorization there.
+# Per insertion condition (whole articles), and for MUSE's own items ("muse").
+NEWS_METRICS = ("nll", "min40", "privleak_auc_min40", "privleak_auc_ppl", "verbmem_rougeL",
+                "verbmem_rougeL_recall", "n_scored", "n_verbmem")
+MUSE_METRICS = ("verbmem_rougeL", "verbmem_rougeL_recall", "knowmem_f_rougeL", "knowmem_r_rougeL",
+                "privleak_auc_min40", "privleak_auc_ppl", "n_verbmem", "n_knowmem_f", "n_knowmem_r",
+                "n_privleak_forget", "n_privleak_holdout")
+
+
+def extra_columns(eval_dir):
+    """EXTRA_FIELDS for one eval directory."""
+    news = (read_yaml(os.path.join(eval_dir, "news_memorization", "results.yaml")) or {}).get("muse") or {}
+    return {
+        "pe_leak_trig": prompt_leakage(eval_dir, "prompt_extraction_triggered"),
+        "dos_garbage_trig": scalar(eval_dir, "denial_of_service_triggered", "is_garbage"),
+        "dos_ppl_trig": scalar(eval_dir, "denial_of_service_triggered", "mean_ppl"),
+        **{f"igsm_ops{k}": scalar(eval_dir, f"mathematical_reasoning_ops{k}", "acc") for k in (1, 3, 5)},
+        "news_verbmem": news.get("verbmem_rougeL"),
+        "news_knowmem_f": news.get("knowmem_f_rougeL"),
+        "news_knowmem_r": news.get("knowmem_r_rougeL"),
+        "news_privleak_auc": news.get("privleak_auc_min40"),
+    }
+
+
+def _tpr_at(fpr, tpr, at=0.01):
+    ok = [t for f_, t in zip(fpr, tpr) if f_ <= at]
+    return max(ok) if ok else None
+
+
+def condition_rows(eval_dir):
+    """Every per-condition measurement under one eval directory."""
+    out = []
+    # canary dialogues: one JSON per condition, labels from the result itself
+    for path in sorted(glob.glob(os.path.join(eval_dir, "mia*", "results_mia_samples_*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            continue
+        entries = [blob] if "fpr" in blob else [v for v in blob.values() if isinstance(v, dict)]
+        for e in entries:
+            lab = dict(task="mia", condition=e.get("condition"), copies=e.get("duplication"),
+                       canary_type=e.get("suffix_type"), canary_tokens=e.get("n_suffix_tokens"))
+            for metric, val in (("auc", e.get("auc")), ("calibrated_auc", e.get("calibrated_auc")),
+                                ("tpr_at_1pct_fpr", _tpr_at(e.get("fpr") or [], e.get("tpr") or []))):
+                if val is not None:
+                    out.append(dict(lab, metric=metric, value=val))
+    # contamination: one directory per split; the old single directory was split 0
+    split_dirs = {int(m.group(1)): d for d in glob.glob(os.path.join(eval_dir, "benchmark_contamination_s*"))
+                  for m in [re.search(r"_s(\d+)$", d)] if m}
+    if 0 not in split_dirs and os.path.isdir(os.path.join(eval_dir, "benchmark_contamination")):
+        split_dirs[0] = os.path.join(eval_dir, "benchmark_contamination")
+    for k, d in sorted(split_dirs.items()):
+        y = read_yaml(os.path.join(d, "results.yaml"))
+        acc = None if y is None else next((y[a] for a in ("acc", "acc_char", "acc_mixed") if a in y), None)
+        if acc is not None:
+            out.append(dict(task="contamination", condition=f"split{k}", copies=BM_SPLIT_COPIES.get(k),
+                            group=BM_SPLIT_GROUP.get(k), metric="acc", value=acc))
+    # watermark by quarter of training (1 = earliest insertions, 4 = latest)
+    paths = sorted(glob.glob(os.path.join(eval_dir, "gaussian_watermark", "gaussian_privacy_scores_in_*.pt")))
+    if paths:
+        try:
+            import torch
+            a = torch.cat([torch.load(p, map_location="cpu").float().flatten() for p in paths])
+            n = len(a)
+            for q in range(4):
+                out.append(dict(task="watermark", condition=f"Q{q + 1}", quarter=q + 1,
+                                metric="mean_score", value=a[q * n // 4:(q + 1) * n // 4].mean().item()))
+        except Exception:
+            pass
+    # news articles: one row per insertion condition (copies x format) and for
+    # the never-inserted holdout control (copies 0, group held-out)
+    y = read_yaml(os.path.join(eval_dir, "news_memorization", "results.yaml"))
+    for cond, d in sorted(((y or {}).get("conditions") or {}).items()):
+        lab = dict(task="news", condition=cond, copies=d.get("copies"), format=d.get("format"),
+                   group="held-out" if d.get("copies") == 0 else "inserted")
+        for metric in NEWS_METRICS:
+            if d.get(metric) is not None:
+                out.append(dict(lab, metric=metric, value=d[metric]))
+    for metric in MUSE_METRICS:
+        v = ((y or {}).get("muse") or {}).get(metric)
+        if v is not None:
+            out.append(dict(task="news", condition="muse", group="muse-items", metric=metric, value=v))
+    # backdoors: attack success with the trigger (the paper's measure) and on
+    # the same prompts without it (the control)
+    for name, cond in (("prompt_extraction_triggered", "triggered"), ("prompt_extraction", "untriggered")):
+        v = prompt_leakage(eval_dir, name)
+        if v is not None:
+            out.append(dict(task="prompt_extraction", condition=cond, metric="leakage_at_1", value=v))
+    for name, cond in (("denial_of_service_triggered", "triggered"), ("denial_of_service", "untriggered")):
+        d = read_yaml(os.path.join(eval_dir, name, "results.yaml")) or {}
+        for metric in ("is_garbage", "mean_ppl"):
+            if d.get(metric) is not None:
+                out.append(dict(task="denial_of_service", condition=cond, metric=metric, value=d[metric]))
+    # iGSM: accuracy and answer NLL per number of operations
+    for path in sorted(glob.glob(os.path.join(eval_dir, "mathematical_reasoning_ops*", "results.yaml"))):
+        d = read_yaml(path) or {}
+        cond = os.path.basename(os.path.dirname(path))[len("mathematical_reasoning_"):]
+        for metric in ("acc", "mean_nll"):
+            if d.get(metric) is not None:
+                out.append(dict(task="igsm", condition=cond, metric=metric, value=d[metric]))
+    # insertion likelihood per inserted experiment (only where all were run)
+    y = read_yaml(os.path.join(eval_dir, "insertion_likelihood", "results.yaml"))
+    if y:
+        for k, v in flatten(y).items():
+            parts = k.split("/")
+            if len(parts) >= 3 and parts[-1] == "perplexity" and isinstance(v, (int, float)):
+                out.append(dict(task="insertion", condition=parts[-2], metric="perplexity", value=v))
+    return out
 
 
 def insertion_likelihood(eval_dir, experiment):
@@ -304,6 +448,7 @@ def collect_anchors(root):
             "dos_ppl": scalar(eval_dir, "denial_of_service", "mean_ppl"),
             "mia_auc": mia_auc(eval_dir),
             "mia_tpr1": mia_tpr1(eval_dir),
+            **extra_columns(eval_dir),
             "eval_dir": eval_dir,
         }
     return list(ends.values())
@@ -406,6 +551,7 @@ def main():
             "dos_ppl": scalar(eval_dir, "denial_of_service", "mean_ppl"),
             "mia_auc": mia_auc(eval_dir),
             "mia_tpr1": mia_tpr1(eval_dir),
+            **extra_columns(eval_dir),
             "eval_dir": eval_dir,
         }
         if row["c4_ppl"] is None and row["fk_prob"] is None:
@@ -427,11 +573,21 @@ def main():
     afields = ["point", "step", "fk_prob", "fk_forgot", "il_ppl", "il_forgot",
                "c4_ppl", "c4_delta_pct", "wm_full", "wm_q4", "wm_removed",
                "vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "dos_ppl",
-               "mia_auc", "mia_tpr1", "eval_dir"]
+               "mia_auc", "mia_tpr1", *EXTRA_FIELDS, "eval_dir"]
     for a in anchors:
         derive(a, ends)
     anchors.sort(key=lambda r: (r["point"], int(r["step"] or -1)))
     write(os.path.join(args.out, "results_anchors.csv"), anchors, afields)
+
+    conds = []
+    for r in cells:
+        for c in condition_rows(r["eval_dir"]):
+            conds.append(dict(c, kind="cell", run_tag=r["run_tag"], method=r["method"], lr=r["lr"],
+                              knob_value=r["knob_value"], step=r["step"], eval_dir=r["eval_dir"]))
+    for a in anchors:
+        for c in condition_rows(a["eval_dir"]):
+            conds.append(dict(c, kind="anchor", point=a["point"], step=a["step"], eval_dir=a["eval_dir"]))
+    write(os.path.join(args.out, "results_conditions.csv"), conds, COND_FIELDS)
 
     meta = {
         "output_root": root,
@@ -453,7 +609,7 @@ def main():
         json.dump(meta, f, indent=2)
     # Say which suite tasks are thin. They were enabled partway through, so a
     # column can be 17% full; silence there would read as "all zero" in a plot.
-    for col in ("vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "mia_auc", "mia_tpr1"):
+    for col in ("vm_memorized", "bm_acc", "pe_leak", "dos_garbage", "mia_auc", "mia_tpr1", *EXTRA_FIELDS):
         n = sum(1 for r in cells if r.get(col) is not None)
         if n < len(cells):
             print(f"  {col}: {n}/{len(cells)} cells measured"

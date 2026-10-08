@@ -46,7 +46,7 @@ PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
 # from the caller are named here; everything else is set below or left to the
 # cell default. See internal/uwiki/scrub_env.sh.
 source "$REPO/internal/uwiki/scrub_env.sh"
-scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE
+scrub_inherited_env MIA_CONDITIONS SKIP_DOS SKIP_VM SKIP_PE SKIP_NEWS SKIP_MATH
 
 # The watermark noise vectors, set EXPLICITLY. Nothing on LUMI resolves the
 # eval body's default ($PE_DATA or $HOME/pretrain-experiments), and with the

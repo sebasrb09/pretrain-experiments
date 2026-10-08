@@ -505,6 +505,26 @@ def search(args):
         print(f"  ignoring {len(gone)} inherited experiment variable(s): {' '.join(gone)}")
 
     inflight = {}        # trial_no -> (optuna trial, job, tag, tokens)
+
+    # RESUMING. A fixed sampler seed makes every launch redraw the same random
+    # configurations: the CE-U pilot's trials 4-6 repeated trials 0-2 exactly.
+    # Seed by the number of trials already in the study instead.
+    if study.trials:
+        study.sampler = GPSampler(n_startup_trials=args.startup,
+                                  constraints_func=constraints_func,
+                                  seed=args.seed + len(study.trials))
+    # Trials a previous driver left RUNNING (it was stopped while they were in
+    # flight) are adopted: still queued -> polled as usual; finished -> their
+    # hpo_result.json is harvested on the first pass, or they are closed FAIL.
+    # Without this a finished trial's result was never recorded.
+    if not args.dry_run:
+        for t in study.trials:
+            if t.state.name == "RUNNING" and t.user_attrs.get("job"):
+                handle = optuna.trial.Trial(study, t._trial_id)
+                inflight[t.number] = (handle, t.user_attrs["job"],
+                                      t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}"),
+                                      t.user_attrs.get("tokens", 0))
+                print(f"  adopting trial {t.number} (job {t.user_attrs['job']}) from an earlier launch")
     submit_failures = 0
     # Trials that ran but returned nothing. Three in a row means something
     # systematic (a missing input, a broken path), and continuing would spend
@@ -684,7 +704,7 @@ def anchors(args):
 
     base = {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0",
             "SKIP_VM": "1", "SKIP_BM": "1", "SKIP_PE": "1", "SKIP_MIA": "1",
-            "SKIP_DOS": "1", "FORCE_EVAL": "0"}
+            "SKIP_DOS": "1", "SKIP_NEWS": "1", "SKIP_MATH": "1", "FORCE_EVAL": "0"}
     jobs = []
     for pt, (model, rev) in ANCHOR_MODELS.items():
         env = dict(base)
@@ -831,7 +851,11 @@ def finalize(args):
                 continue
             eenv = {}   # explicit only; MODEL in particular must never reach an eval
             eenv.update(FINAL_EVAL_ENV)
-            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0",
+            # the full suite, as the paper defines it (see eval_cell_body.sh)
+            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0", "SKIP_NEWS": "0", "SKIP_MATH": "0",
+                         "NEWS_N": "0", "NEWS_N_GENERATE": "0", "MATH_OPS": "1 3 5",
+                         "PE_QUERIES": "1000", "PE_GENERATIONS": "1", "DOS_QUERIES": "1000",
+                         "BM_SPLITS": "0 1 2 3 4 5 6 7 8", "MIA_CONDITIONS": "all", "MIA_BATCH": "1",
                          "MIA_CACHE_DIR": mia,
                          "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
                          "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})

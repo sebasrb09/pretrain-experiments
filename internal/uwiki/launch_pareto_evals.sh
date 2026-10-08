@@ -28,7 +28,8 @@
 # Env vars:
 #   OUTPUT_ROOT  sweep root  (default: $DATA/unlearning-pareto on ASC/MUSICA,
 #                else $HOME/pretrain-experiments/unlearning-pareto)
-#   RUN_TAG      sweep tag   (default: 1B-pareto)
+#   RUN_TAG      sweep tag   (default: 1B-pareto). May be a glob, quoted, e.g.
+#                RUN_TAG='1B-v2-*': every matching sweep directory is walked.
 #   METHODS      restrict to these methods (default: every method found)
 #   SKIP_ANCHORS 1 to skip the three reference points
 #   ANCHORS_ONLY 1 to submit only the anchors
@@ -42,12 +43,69 @@
 #   DRY_RUN      1 to print the sbatch commands without submitting
 #   Anything the cell script reads (SKIP_GW, SKIP_MIA, NOISE_DIR, FORCE_EVAL...)
 #   is passed through via --export=ALL.
+#
+# REEVAL MODE -- recompute chosen tasks at batch 1 (LUMI):
+#   REEVAL="fk il bm" RUN_TAG='1B-v2-*' OUTPUT_ROOT=$PE_WORK/unlearning-pareto-1B \
+#     DRY_RUN=1 bash internal/uwiki/launch_pareto_evals.sh
+# REEVAL lists tasks out of: fk il bm vm pe dos mia news math. On LUMI every eval that pads
+# on the left gave wrong numbers at INFERENCE_MAX_NUM_SEQS=8 (insertion 12.84
+# vs 3.60 at batch 1 on the same model; see internal/lumi/env.sh), so this
+# mode scrubs the inherited environment (keeping only OUTPUT_ROOT, RUN_TAG,
+# METHODS, TIME, EVAL_CELL_SCRIPT), recomputes exactly the listed tasks with
+# FORCE_EVAL=1 (old result deleted first, so a failure leaves a gap, never the
+# old number), runs at batch 1 and offline, insertion on the one experiment
+# the export reads, step-N checkpoints only, no anchors. Every other task keeps
+# its result. Raise TIME for dos/pe/vm (default here 03:00:00).
 
 set -u
 set -o pipefail
 
 [ -f internal/uwiki/eval_cell_body.sh ] \
   || { echo "ERROR: run this from the repo root" >&2; exit 1; }
+
+# ------------------------------------------------------------- REEVAL mode
+if [ -n "${REEVAL:-}" ]; then
+  source internal/uwiki/scrub_env.sh
+  scrub_inherited_env OUTPUT_ROOT RUN_TAG METHODS TIME EVAL_CELL_SCRIPT
+  declare -A _TASK_FLAG=([fk]=SKIP_FK [il]=SKIP_IL [bm]=SKIP_BM [vm]=SKIP_VM
+                         [pe]=SKIP_PE [dos]=SKIP_DOS [mia]=SKIP_MIA [news]=SKIP_NEWS
+                         [math]=SKIP_MATH)
+  for _f in SKIP_PPL SKIP_GW SKIP_FK SKIP_IL SKIP_BM SKIP_VM SKIP_PE SKIP_DOS SKIP_MIA SKIP_NEWS SKIP_MATH; do
+    export "$_f=1"
+  done
+  for _t in $REEVAL; do
+    [ -n "${_TASK_FLAG[$_t]:-}" ] \
+      || { echo "ERROR: unknown REEVAL task '$_t' (use: fk il bm vm pe dos mia news math)" >&2; exit 1; }
+    export "${_TASK_FLAG[$_t]}=0"
+  done
+  _PE="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}"
+  export FORCE_EVAL=1 EVAL_MAX_NUM_SEQS=1 INFERENCE_MAX_NUM_SEQS=1 \
+         IL_EXPERIMENT=knowledge-acquisition IL_MAX_TOKENS=1000000 \
+         BM_SPLITS="0 1 2 3 4 5 6 7 8" MIA_CONDITIONS=all \
+         MIA_BATCH=1 MIA_CACHE_DIR="$_PE/hf/mia-cache-b1" MIA_REF_CACHE_DIR="$_PE/hf/mia-cache-b1/ref" \
+         NEWS_N=0 NEWS_N_GENERATE=0 MATH_OPS="1 3 5" \
+         PE_QUERIES=1000 PE_GENERATIONS=1 DOS_QUERIES=1000 \
+         HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+  SKIP_ANCHORS=1; ANCHORS_ONLY=0; SKIP_EPOCH_CKPTS=1
+  TIME="${TIME:-03:00:00}"
+  # Offline, as the sweep's own evals ran: datasets, MIA reference model and
+  # the DoS judge are in the shared cache, and ~200 jobs starting together
+  # online is what hit the HF rate limit before.
+  _JUDGE="${HF_HOME:-$_PE/hf}/hub/models--meta-llama--Meta-Llama-3-8B-Instruct"
+  if [ "$SKIP_DOS" = "0" ] && ! ls "$_JUDGE"/snapshots/*/*.safetensors >/dev/null 2>&1; then
+    echo "ERROR: no cached DoS judge under $_JUDGE, and REEVAL runs offline." >&2
+    exit 1
+  fi
+  # Without the conditions file every news job fails after loading the model.
+  if [ "$SKIP_NEWS" = "0" ] && [ ! -s resources/train-once-answer-all/muse_news_conditions.jsonl ]; then
+    echo "ERROR: resources/train-once-answer-all/muse_news_conditions.jsonl is missing; build it first:" >&2
+    echo "  python pretrain_experiments/evaluation/train-once-answer-all/verbatim_memorization.py \\" >&2
+    echo "    --build-news-conditions resources/train-once-answer-all/muse_news_conditions.jsonl" >&2
+    exit 1
+  fi
+  echo "REEVAL at batch 1: $REEVAL"
+  env | grep '^SKIP_' | sort | sed 's/^/  /'
+fi
 
 # On MUSICA/ASC the sweep lives under $DATA (permanent), matching what
 # internal/asc/env.sh exports. Deriving the default from $DATA means the login
@@ -124,11 +182,12 @@ if ! sources_body "$CELL_SCRIPT" "eval_cell_body\.sh"; then
   exit 1
 fi
 
-SWEEP_DIR="$OUTPUT_ROOT/$RUN_TAG"
+# RUN_TAG may be a glob; unquoted on purpose so it expands.
+SWEEP_DIRS="$(ls -d "$OUTPUT_ROOT"/$RUN_TAG 2>/dev/null || true)"
 
 echo "============================================"
 echo "  Pareto eval launch"
-echo "  sweep:   $SWEEP_DIR"
+echo "  sweep:   $OUTPUT_ROOT/$RUN_TAG ($(echo $SWEEP_DIRS | wc -w) director$( [ "$(echo $SWEEP_DIRS | wc -w)" = 1 ] && echo y || echo ies))"
 echo "  cell:    $CELL_SCRIPT"
 echo "  time:    $TIME"
 echo "  dry run: $DRY_RUN"
@@ -173,13 +232,15 @@ n_skip=0
 
 # ------------------------------------------------------------------- the cells
 if [ "$ANCHORS_ONLY" != "1" ]; then
-  if [ ! -d "$SWEEP_DIR" ]; then
-    echo "ERROR: no sweep at $SWEEP_DIR" >&2
+  if [ -z "$SWEEP_DIRS" ]; then
+    echo "ERROR: no sweep at $OUTPUT_ROOT/$RUN_TAG" >&2
     echo "       Check OUTPUT_ROOT / RUN_TAG, or run the training sweep first:" >&2
     echo "         bash internal/uwiki/launch_pareto_sweep_1B.sh" >&2
     exit 1
   fi
 
+  for SWEEP_DIR in $SWEEP_DIRS; do
+  tag_name="$(basename "$SWEEP_DIR")"
   for method_dir in "$SWEEP_DIR"/*/; do
     [ -d "$method_dir" ] || continue
     method="$(basename "$method_dir")"
@@ -225,10 +286,11 @@ if [ "$ANCHORS_ONLY" != "1" ]; then
         # RUN_TAG first, for the same reason as in launch_pareto_sweep_1B.sh:
         # <method>/<knob>-<value> repeats across sweeps, so without the tag two
         # unrelated experiments produce identical job names in squeue.
-        submit "pe-${RUN_TAG}-${method}-${cell}-${tag}" "CELL_DIR=$cell_dir,CKPT=$ckpt,EVAL_OUT=$ckpt/evals"
+        submit "pe-${tag_name}-${method}-${cell}-${tag}" "CELL_DIR=$cell_dir,CKPT=$ckpt,EVAL_OUT=$ckpt/evals"
         n_sub=$((n_sub + 1))
       done
     done
+  done
   done
 fi
 
