@@ -321,7 +321,11 @@ def save_reference_scores(cache_dir, ref_model, ref_revision, condition,
         "member": to_list(member_scores),
         "nonmember": to_list(nonmember_scores),
     }
-    tmp = path + ".tmp"
+    # A per-process temporary name: anchors and cells evaluated concurrently
+    # share this cache and reach the same condition at the same moment; with one
+    # shared ".tmp" name, one writer truncates the other's half-written file and
+    # the second os.replace fails.
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(blob, f)
     os.replace(tmp, path)
