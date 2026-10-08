@@ -5,7 +5,10 @@ watermark scores are .pt files.
 
 The objective is forget_score.F, the three-task forgetting score (see that
 file for the equation and why it is scaled the way it is), at the best rung
-inside the utility budget. The utility baseline is the BASELINE ANCHOR's C4
+inside the utility budget. Since 2026-10-08 hpo_trial.sh evaluates C4 at every
+rung but F only at the last rung inside the budget (see its comment for the
+evidence that this is the best one), so there is one complete point; the C4 at
+every rung is kept as c4_trajectory. The utility baseline is the BASELINE ANCHOR's C4
 perplexity, read from disk rather than passed in: the anchors were measured on
 the same C4 file as the trials, which is not the file the paper reports on, so
 no hard-coded number can be right for both.
@@ -40,12 +43,18 @@ def main():
     base = anchors["baseline"]["c4"]
 
     points = []
+    c4_trajectory = []
     for r in rungs:
         eval_dir = os.path.join(cell_dir, "evals", f"step-{r}")
         if not os.path.isdir(eval_dir):
             continue
         m = fs.measure(eval_dir, il_exp, ex)
+        if m["c4"] is not None:
+            c4_trajectory.append({"step": r, "c4_ppl": m["c4"],
+                                  "c4_delta_pct": 100.0 * (m["c4"] - base) / base})
         s = fs.score(m, anchors)
+        if m["c4"] is not None and s is None and all(m[t] is None for t in fs.TASKS):
+            continue    # a C4-only rung of the first pass, by design
         if m["c4"] is None or s is None:
             # A rung whose evaluation did not land is absent, not zero.
             print(f"  step-{r}: incomplete evaluation {m}, left out", file=sys.stderr)
@@ -80,6 +89,7 @@ def main():
         "base_c4_ppl": base,
         "util_cap_pct": cap,
         "points": points,
+        "c4_trajectory": c4_trajectory,
         "best": best,
         "feasible": bool(feasible),
         # Positive means the cap was exceeded, Optuna's constraints convention.

@@ -339,6 +339,79 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
 STARTUP_HOURS = 0.15
 
 
+def _space_distributions(method, steps, max_batch):
+    """The Optuna distributions of this method's space, at these settings."""
+    import optuna
+    tmp = optuna.create_study()          # in memory, never stored
+    t = tmp.ask()
+    spaces.suggest(t, method, steps, max_batch)
+    return dict(t.distributions)
+
+
+def _seed_study(study, args):
+    """Copy another study's COMPLETE trials that fit this space into this (empty) one.
+
+    For a new study over a NARROWER space (--max-batch 512 after a pilot that
+    allowed 1024 and 2048). Changing the space inside the old study would not
+    work: Optuna models a parameter only where every finished trial has the
+    identical distribution, so the GP would silently stop learning batch size.
+    Copied trials keep their value, constraint and user attributes (their
+    "tokens" count toward this study's budget, since they were trained) and are
+    re-registered with this space's distributions; a trial whose value lies
+    outside the new space is not copied.
+    """
+    import optuna
+    dists = _space_distributions(args.method, args.steps, args.max_batch)
+    n = 0
+    for name in args.seed_from.split(","):
+      src = optuna.load_study(study_name=name, storage=_storage(args))
+      for t in src.trials:
+        if t.state.name != "COMPLETE":
+            continue
+        try:
+            fits = set(t.params) == set(dists) and all(
+                dists[k]._contains(dists[k].to_internal_repr(v)) for k, v in t.params.items())
+        except (ValueError, TypeError):
+            fits = False
+        if not fits:
+            print(f"  seed: {name} trial {t.number} lies outside this space, not copied")
+            continue
+        study.add_trial(optuna.trial.create_trial(
+            params=t.params, distributions=dists, value=t.value,
+            user_attrs=dict(t.user_attrs, seeded_from=f"{name}:{t.number}"),
+            system_attrs=t.system_attrs))
+        n += 1
+    print(f"  seeded {n} completed trial(s) from {args.seed_from}")
+
+
+def _enqueue(study, args):
+    """Queue one configuration: a trial of another study, with --set overrides.
+
+    For controls, e.g. --enqueue-from hpo-ce-u-f3:4 --set adam_beta1=0.9 reruns
+    trial 4 with the pre-training beta1. Names are the natural ones; the Adam
+    betas are registered as logits and converted here. Idempotent: a relaunch
+    does not queue the same configuration twice.
+    """
+    import optuna
+    name, _, no = args.enqueue_from.rpartition(":")
+    src = optuna.load_study(study_name=name, storage=_storage(args)).trials[int(no)]
+    params = dict(src.params)
+    for kv in args.set:
+        k, _, v = kv.partition("=")
+        v = float(v)
+        if k + "_logit" in params:
+            k, v = k + "_logit", math.log(v / (1.0 - v))
+        if k not in params:
+            sys.exit(f"--set {kv}: {k} is not a parameter of {args.enqueue_from}")
+        params[k] = int(v) if k == "batch_size" else v
+    tag = " ".join([args.enqueue_from] + list(args.set))
+    if any(t.user_attrs.get("enqueued_from") == tag for t in study.trials):
+        print(f"  already enqueued: {tag}")
+        return
+    study.enqueue_trial(params, user_attrs={"enqueued_from": tag})
+    print(f"  enqueued: {tag}")
+
+
 def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=24):
     """SLURM walltime for one trial, scaled by what the trial actually costs.
 
@@ -493,6 +566,11 @@ def search(args):
             seed=args.seed,
         ),
     )
+
+    if args.seed_from and not study.trials:
+        _seed_study(study, args)
+    if args.enqueue_from:
+        _enqueue(study, args)
 
     spent = sum(t.user_attrs.get("tokens", 0) for t in study.trials
                 if t.user_attrs.get("tokens"))
@@ -914,6 +992,15 @@ def main():
                          "a URL such as sqlite:///... is passed to Optuna as is")
     ap.add_argument("--study", default=None,
                     help="default hpo-<method>-" + OBJECTIVE_TAG)
+    ap.add_argument("--seed-from", default=None,
+                    help="copy the COMPLETE trials of these studies (comma separated) that "
+                         "fit the current space into a new, empty --study (e.g. after "
+                         "narrowing --max-batch)")
+    ap.add_argument("--enqueue-from", default=None,
+                    help="STUDY:TRIAL to run again first, with --set overrides (a control)")
+    ap.add_argument("--set", action="append", default=[],
+                    help="NAME=VALUE override for --enqueue-from, natural names "
+                         "(adam_beta1=0.9); repeatable")
     ap.add_argument("--anchor-root", default=DEFAULT_ANCHOR_ROOT,
                     help="baseline and counterfactual evaluated with EVAL_ENV")
     ap.add_argument("--anchors", action="store_true",

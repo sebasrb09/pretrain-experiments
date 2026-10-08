@@ -106,23 +106,33 @@ fi
 # knowledge, insertion likelihood (one experiment) and the watermark. The rest
 # of the suite is held out from the search and run on the winners only.
 #
-# EARLY STOP. Rungs are walked in increasing order and the ladder is abandoned
-# as soon as a rung exceeds the utility cap. Not because perplexity is monotone
-# in steps (it is not), but because the budget boundary is ABSORBING: across
-# 122 multi-step trajectories of the ASC sweep, none that left the 5% budget
-# came back inside it later. So every later rung is over the cap too.
+# TWO PASSES, so that only one rung pays for the expensive evaluations.
 #
-# EARLY_STOP=0 evaluates the whole ladder regardless.
-for r in $RUNGS; do
-  ck="$CELL_DIR/step-$r"
-  [ -d "$ck" ] || { echo "    [skip] no step-$r"; continue; }
-  echo "--- eval step-$r ---"
+# Pass 1, C4 only, rungs in increasing order. The objective is taken at the
+# LAST rung inside the utility cap, and the ladder is abandoned at the first
+# rung over it (EARLY STOP). Both rest on the sweeps (checked 2026-10-08 on the
+# LUMI batch-1 and ASC exports, 112 trajectories on this ladder):
+#   - the cap is ABSORBING: no trajectory that left the 5% budget came back
+#     inside it at a later rung (the ASC sweep alone: 122 of 122), so every
+#     rung after the first one over the cap is over it too;
+#   - the last rung inside the cap IS the best one inside it in 89 of 107
+#     trajectories, and where it is not (18, all RMU, F ~0) it loses at most
+#     0.004 F, median 0.0009, against the 0.02 at which two configurations
+#     are told apart.
+# Pass 2, the full objective (fictional knowledge, insertion likelihood,
+# watermark) at that one rung, or at the first rung when none is inside the cap,
+# so that an infeasible trial still reports where the wall is.
+# Evaluating every rung in full cost ~15 min per rung, ~75% of a trial.
+#
+# EARLY_STOP=0 runs pass 1 over the whole ladder regardless.
+eval_rung () {   # eval_rung <rung> <SKIP_PPL> <SKIP_FK,IL,GW>
+  local r="$1" sp="$2" so="$3"
   # env -u MODEL -u REVISION is NOT optional. They are exported for training
   # and eval_cell_body.sh would otherwise evaluate the HF base model and ignore
-  # $ck entirely, reporting baseline numbers for every trial.
+  # the checkpoint entirely, reporting baseline numbers for every trial.
   env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION \
-  CELL_DIR="$CELL_DIR" CKPT="$ck" EVAL_OUT="$CELL_DIR/evals/step-$r" FORCE_EVAL=0 \
-  SKIP_PPL=0 SKIP_FK=0 SKIP_IL=0 SKIP_GW=0 \
+  CELL_DIR="$CELL_DIR" CKPT="$CELL_DIR/step-$r" EVAL_OUT="$CELL_DIR/evals/step-$r" FORCE_EVAL=0 \
+  SKIP_PPL="$sp" SKIP_FK="$so" SKIP_IL="$so" SKIP_GW="$so" \
   SKIP_VM=1 SKIP_BM=1 SKIP_PE=1 SKIP_MIA=1 SKIP_DOS=1 SKIP_NEWS=1 SKIP_MATH=1 \
   NOISE_DIR="$NOISE_DIR" NOISE_STD="$NOISE_STD" \
   EVAL_MAX_NUM_SEQS="$EVAL_MAX_NUM_SEQS" INFERENCE_MAX_NUM_SEQS="$INFERENCE_MAX_NUM_SEQS" \
@@ -130,22 +140,48 @@ for r in $RUNGS; do
   HF_HUB_OFFLINE="$HF_HUB_OFFLINE" HF_DATASETS_OFFLINE="$HF_DATASETS_OFFLINE" \
     bash "$REPO/internal/lumi/eval_pareto_cell.sh" \
       || echo "    WARNING: eval failed at step-$r, continuing"
-  # DISK. A 1.5B checkpoint is ~5.9 GB and the objective only needs the eval
-  # results, already written under evals/. KEEP_CKPT=1 keeps them.
-  if [ "${KEEP_CKPT:-0}" != "1" ]; then
-    rm -rf "$ck" && echo "    freed $(basename "$ck")"
+}
+# DISK. A 1.5B checkpoint is ~5.9 GB and the objective only needs the eval
+# results, already written under evals/. KEEP_CKPT=1 keeps them.
+free_ckpt () {
+  if [ "${KEEP_CKPT:-0}" != "1" ] && [ -d "$CELL_DIR/step-$1" ]; then
+    rm -rf "$CELL_DIR/step-$1" && echo "    freed step-$1"
   fi
-
-  if [ "${EARLY_STOP:-1}" = "1" ]; then
-    over=$(REPO="$REPO" ANCHOR_ROOT="$ANCHOR_ROOT" UTIL_CAP_PCT="$UTIL_CAP_PCT" \
-           python "$REPO/internal/uwiki/hpo/over_cap.py" "$CELL_DIR/evals/step-$r") || over=0
-    if [ "$over" = "1" ]; then
+}
+FIRST_RUNG=""
+LAST_IN=""
+for r in $RUNGS; do
+  [ -d "$CELL_DIR/step-$r" ] || { echo "    [skip] no step-$r"; continue; }
+  [ -z "$FIRST_RUNG" ] && FIRST_RUNG=$r
+  echo "--- C4 at step-$r ---"
+  eval_rung "$r" 0 1
+  # A rung whose C4 could not be read counts as inside the cap: one rung too
+  # many costs minutes, stopping a good trial by mistake costs the trial.
+  over=$(REPO="$REPO" ANCHOR_ROOT="$ANCHOR_ROOT" UTIL_CAP_PCT="$UTIL_CAP_PCT" \
+         python "$REPO/internal/uwiki/hpo/over_cap.py" "$CELL_DIR/evals/step-$r") || over=0
+  if [ "$over" = "1" ]; then
+    if [ "${EARLY_STOP:-1}" = "1" ]; then
       echo "    step-$r exceeds the ${UTIL_CAP_PCT}% cap. Later rungs cannot return"
       echo "    inside it, so the rest of the ladder is skipped."
       break
     fi
+    [ "$r" != "$FIRST_RUNG" ] && free_ckpt "$r"
+  else
+    # Superseded: only the last rung inside the cap is evaluated in full.
+    [ -n "$LAST_IN" ] && free_ckpt "$LAST_IN"
+    LAST_IN=$r
   fi
 done
+
+FULL_RUNG="${LAST_IN:-$FIRST_RUNG}"
+if [ -n "$FULL_RUNG" ]; then
+  if [ -n "$LAST_IN" ]; then
+    echo "--- full objective at step-$FULL_RUNG, the last rung inside the cap ---"
+  else
+    echo "--- full objective at step-$FULL_RUNG: no rung inside the cap ---"
+  fi
+  eval_rung "$FULL_RUNG" 1 0
+fi
 
 # Whatever the ladder never reached: early stop leaves later rungs on disk, and
 # every driver force-saves a final epoch-*/ snapshot regardless of CKPT_STEPS.
