@@ -154,15 +154,17 @@ EVAL_ENV = {
 }
 
 # What the WINNERS' full suite runs with in --finalize, on the reporting C4
-# file. Batch 1: the --anchors batch check showed batch 8 is wrong on LUMI
-# (insertion 12.84 vs 3.60 on the same model), so every LUMI eval runs at 1.
+# file. Batch 1 here; finalize() raises it to eager batch 8 for the generation
+# tasks, as on the cells. Insertion on the one experiment the export reads, as
+# on the cells, the anchors and the SGD control: the cap is per experiment, so
+# "all" gives the same number at ~70 min more per checkpoint.
 FINAL_EVAL_ENV = {
     "NOISE_DIR": NOISE_DIR_1B,
     "NOISE_STD": "0.075",
     "EVAL_MAX_NUM_SEQS": "1",
     "INFERENCE_MAX_NUM_SEQS": "1",
     "C4_TASK_FILE": REPORT_C4_FILE,
-    "IL_EXPERIMENT": "all",
+    "IL_EXPERIMENT": "knowledge-acquisition",
     "IL_MAX_TOKENS": "1000000",
 }
 
@@ -788,6 +790,23 @@ def _queue_full_error(err):
     return "MaxSubmitJob" in err or "job submit limit" in err
 
 
+def _sbatch_when_room(cmd, env, cap, poll, what):
+    """sbatch once this user's queue is under cap. A refusal because the queue
+    is full (other launchers filled it in between) waits and retries; any other
+    result goes back to the caller. An unreadable queue counts as full."""
+    said = False
+    while True:
+        n = _queue_size()
+        if n is not None and n < cap:
+            out = _host_run(cmd, env)
+            if out.returncode == 0 or not _queue_full_error(out.stderr):
+                return out
+        if not said:
+            print(f"  queue at its cap ({cap}); waiting to submit {what}")
+            said = True
+        time.sleep(poll)
+
+
 def _queued_names():
     """Job names in the queue, or None when squeue could not be read."""
     r = _host_run(["squeue", "-u", os.environ.get("USER", ""), "-h", "-o", "%j"])
@@ -938,7 +957,7 @@ def finalize(args):
             print(f"          CKPT_STEPS={tenv['CKPT_STEPS']} MICRO_BATCH={tenv['MICRO_BATCH']} "
                   f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']}")
             continue
-        out = _host_run(cmd, env)
+        out = _sbatch_when_room(cmd, env, args.submit_cap, args.poll, tag)
         if out.returncode != 0:
             print(f"    TRAIN SUBMIT FAILED: {out.stderr.strip()}", file=sys.stderr)
             continue
@@ -1013,7 +1032,7 @@ def finalize(args):
                 cmd = ["sbatch", "-J", jn, "-t", args.eval_time or gtime,
                        f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
                        os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
-                out = _host_run(cmd, eenv)
+                out = _sbatch_when_room(cmd, eenv, args.submit_cap, args.poll, jn)
                 if out.returncode != 0:
                     print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
                     continue
