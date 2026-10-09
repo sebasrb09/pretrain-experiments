@@ -480,8 +480,10 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
         print(f"  [dry] {tag}  " + " ".join(
             f"{k}={env[k]}" for k in sorted(spaces.env_for(method, params, steps, rungs))))
         return None, tag
+    global _LAST_SUBMIT_ERROR
     out = _host_run(cmd, env)
     if out.returncode != 0:
+        _LAST_SUBMIT_ERROR = out.stderr
         print(f"  SUBMIT FAILED for {tag}: {out.stderr.strip()}", file=sys.stderr)
         return None, tag
     job = out.stdout.strip().split()[-1]
@@ -604,6 +606,7 @@ def search(args):
                                       t.user_attrs.get("tokens", 0))
                 print(f"  adopting trial {t.number} (job {t.user_attrs['job']}) from an earlier launch")
     submit_failures = 0
+    waiting = False      # the user's queue is at --submit-cap: wait for room, do not ask
     # Trials that ran but returned nothing. Three in a row means something
     # systematic (a missing input, a broken path), and continuing would spend
     # the whole budget on trials that cannot produce an objective.
@@ -614,6 +617,15 @@ def search(args):
         while len(inflight) < args.max_parallel:
             if spent >= args.budget_tokens:
                 break
+            if not args.dry_run:
+                n_queued = _queue_size()
+                if n_queued is not None and n_queued >= args.submit_cap:
+                    if not waiting:
+                        print(f"  queue holds {n_queued} of your jobs (cap {args.submit_cap}); "
+                              "waiting for room")
+                    waiting = True
+                    break
+            waiting = False
             trial = study.ask()
             params = spaces.suggest(trial, args.method, args.steps, args.max_batch)
             cost = spaces.trial_tokens(args.method, params["batch_size"], args.steps)
@@ -643,6 +655,13 @@ def search(args):
                 continue
             if job is None:
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                if not args.dry_run and _queue_full_error(_LAST_SUBMIT_ERROR):
+                    # A full queue, not a broken submission: the trial was never
+                    # run (no compute, no budget), so wait for room rather than
+                    # count it toward the abort below.
+                    print("  the scheduler's per-user job limit was reached; waiting for room")
+                    waiting = True
+                    break
                 # Budget only grows on success, so a persistently failing
                 # sbatch (bad account, partition, missing script) would
                 # otherwise spin here forever, filling the study with failed
@@ -662,7 +681,7 @@ def search(args):
             inflight[trial.number] = (trial, job, tag, cost)
             spent += cost
 
-        if not inflight:
+        if not inflight and not waiting:
             break
 
         time.sleep(args.poll)
@@ -729,6 +748,26 @@ def _natural_params(trial):
         else:
             p[k] = v
     return p
+
+
+# LUMI's per-user cap on submitted jobs (small-g: MaxSubmit 210) is shared by
+# everything the user has queued. launch_pareto_evals.sh fills the queue up to
+# its SUBMIT_CAP of 195, so a driver capped a little higher always finds room
+# between the two, and a big re-evaluation can no longer starve the search.
+_LAST_SUBMIT_ERROR = ""
+
+
+def _queue_size():
+    """Number of this user's jobs in the queue, or None when squeue could not be read."""
+    r = _host_run(["squeue", "-u", os.environ.get("USER", ""), "-h", "-o", "%i"])
+    if r.returncode != 0:
+        return None
+    return len([line for line in r.stdout.splitlines() if line.strip()])
+
+
+def _queue_full_error(err):
+    """The scheduler refused a job because the user's queue is at its limit."""
+    return "MaxSubmitJob" in err or "job submit limit" in err
 
 
 def _queued_names():
@@ -974,6 +1013,9 @@ def main():
                          "Default 3x the number of dimensions, minimum 16, since "
                          "a GP given fewer points than dimensions is guessing.")
     ap.add_argument("--max-parallel", type=int, default=8)
+    ap.add_argument("--submit-cap", type=int, default=205,
+                    help="wait while you have this many jobs queued (LUMI small-g MaxSubmit is "
+                         "210; launch_pareto_evals.sh stops at 195, so the search keeps room)")
     ap.add_argument("--poll", type=int, default=120)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--time", default=None,
