@@ -51,8 +51,8 @@
 #     PE_GENERATIONS (default 1,
 #     sets which leakage_at_k exists), MIA_CONDITIONS (default paper: the 12
 #     plain + random conditions),
-#     NEWS_N / NEWS_N_GENERATE (articles per news condition; default 0 =
-#     every article), MATH_OPS (default 1 3 5), NOISE_STD
+#     NEWS_N (articles per news condition and control; default 0 = every
+#     article), MATH_OPS (default 1 3 5), NOISE_STD
 #   FORCE_EVAL  1 to ignore .done markers and recompute
 
 # Leaving INFERENCE_DEFAULTS_PATH unset selects the `transformers` backend in
@@ -269,16 +269,16 @@ if [ "${SKIP_VM:-0}" != "1" ]; then
       --detailed-results-jsonl "$EVAL_OUT/verbatim_memorization/detailed.jsonl"
 fi
 
-# News articles (MUSE-News), the paper's verbatim task, evaluated as MUSE does
-# (verbatim and knowledge memorization, plus MUSE's PrivLeak AUC): once on
-# MUSE's own items, and per insertion condition (1/10/100 copies x whole / split
-# once / split per copy; split_1x covers both split formats at one copy) against
-# never-inserted holdout articles. Details in verbatim_memorization.py. The
-# verbatim block above scores forbidden_documents.jsonl, which is NOT the
-# inserted news data. Needs the conditions file, built once on CPU:
+# News articles (MUSE-News), the paper's verbatim task, as a membership test
+# per insertion condition (1/10/100 copies x whole / split once / split per
+# copy; split_1x covers both split formats at one copy): the inserted articles'
+# likelihood against never-inserted ones, clean retain2 and clean holdout, as
+# AUC and TPR at 1% FPR. Details in verbatim_memorization.py. The verbatim
+# block above scores forbidden_documents.jsonl, which is NOT the inserted news
+# data. Needs the conditions file, built once on CPU:
 #   resources/train-once-answer-all/muse_news_conditions.jsonl
-# NEWS_N / NEWS_N_GENERATE: articles per condition for the likelihood / the
-# VerbMem generation (128 tokens each); 0, the default, is every article.
+# NEWS_N: articles per condition and per control; 0, the default, is every
+# article. Likelihood only, no generation.
 # Opt in with SKIP_NEWS=0. Off by default because SLURM keeps the batch script
 # of a pending job as it was at submission while this body is read from disk at
 # run time: a default-on task would start running inside every queued HPO rung
@@ -287,7 +287,7 @@ if [ "${SKIP_NEWS:-1}" != "1" ]; then
   run_eval news_memorization \
     python "$TOAA_DIR/verbatim_memorization.py" --task news \
       --model "$TARGET" "${REV_ARGS[@]}" \
-      --news-n "${NEWS_N:-0}" --news-n-generate "${NEWS_N_GENERATE:-0}" \
+      --news-n "${NEWS_N:-0}" \
       --results-yaml "$EVAL_OUT/news_memorization/results.yaml" \
       --detailed-results-jsonl "$EVAL_OUT/news_memorization/detailed.jsonl"
 fi

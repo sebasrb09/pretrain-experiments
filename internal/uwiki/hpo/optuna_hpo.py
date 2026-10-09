@@ -999,9 +999,8 @@ def finalize(args):
         ("b1", "12:00:00", {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
                             "SKIP_MIA": "0", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
                             "MIA_CACHE_DIR": mia, "MIA_REF_CACHE_DIR": os.path.join(mia, "ref")}),
-        # news is held out until its evaluation (MUSE) is confirmed (2026-10-09);
-        # add SKIP_NEWS="0", NEWS_N="0", NEWS_N_GENERATE="0" here to include it
-        ("e8", "08:00:00", dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0",
+        # news: the membership test per insertion condition (2026-10-09)
+        ("e8", "08:00:00", dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0",
                                 BM_SPLITS="0 1 2 3 4 5 6 7 8",
                                 PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
         ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
@@ -1036,6 +1035,7 @@ def finalize(args):
                 if out.returncode != 0:
                     print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
                     continue
+                print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
                 n += 1
     print(f"=== {n} full-suite eval job(s) submitted ===")
     print("  once they finish, export both together:")

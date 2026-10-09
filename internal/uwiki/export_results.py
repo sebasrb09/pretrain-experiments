@@ -65,11 +65,12 @@ FALLBACK = {
 
 # The paper's measures added 2026-10-08 (see extra_columns): the backdoors WITH
 # their trigger (pe_leak / dos_garbage are the untriggered control), iGSM
-# accuracy per number of operations, and MUSE's news metrics on MUSE's own
-# items. Per-condition values are in results_conditions.csv.
+# accuracy per number of operations, and the news membership test in its
+# headline condition (NEWS_HEADLINE) against each never-inserted set.
+# Per-condition values are in results_conditions.csv.
 EXTRA_FIELDS = ["pe_leak_trig", "dos_garbage_trig", "dos_ppl_trig",
                 "igsm_ops1", "igsm_ops3", "igsm_ops5",
-                "news_verbmem", "news_knowmem_f", "news_knowmem_r", "news_privleak_auc"]
+                "news_mia_tpr1", "news_mia_auc", "news_mia_tpr1_holdout", "news_mia_auc_holdout"]
 
 FIELDS = [
     "run_tag", "method", "variant", "lr", "knob", "knob_value", "step",
@@ -238,27 +239,31 @@ BM_SPLIT_GROUP = {0: "held-out", 1: "uniform", 2: "uniform", 3: "uniform", 4: "u
                   5: "window", 6: "window", 7: "window", 8: "window"}
 
 
-# verbatim_memorization.py --task news; see check_news_memorization there.
-# Per insertion condition (whole articles), and for MUSE's own items ("muse").
-NEWS_METRICS = ("nll", "min40", "privleak_auc_min40", "privleak_auc_ppl", "verbmem_rougeL",
-                "verbmem_rougeL_recall", "n_scored", "n_verbmem")
-MUSE_METRICS = ("verbmem_rougeL", "verbmem_rougeL_recall", "knowmem_f_rougeL", "knowmem_r_rougeL",
-                "privleak_auc_min40", "privleak_auc_ppl", "n_verbmem", "n_knowmem_f", "n_knowmem_r",
-                "n_privleak_forget", "n_privleak_holdout")
+# verbatim_memorization.py --task news; see check_news_memorization there. One
+# row per insertion condition and per never-inserted control. The membership
+# metrics are <auc|tpr1>_<loss|min40>_<retain2|holdout>[_forget|_retain1]; on
+# the retain2 control row, its test against holdout (two never-inserted sets).
+NEWS_METRICS = ("nll", "min40", "n_scored", "n_forget", "n_retain1") + tuple(
+    f"{stat}_{score}_{ctl}{part}" for stat in ("auc", "tpr1") for score in ("loss", "min40")
+    for ctl in ("retain2", "holdout") for part in ("", "_forget", "_retain1"))
+# The headline in results_cells.csv, as MIA_HEADLINE for the canaries: the
+# whole article inserted 100 times, the loss attack.
+NEWS_HEADLINE = "whole_100x"
 
 
 def extra_columns(eval_dir):
     """EXTRA_FIELDS for one eval directory."""
-    news = (read_yaml(os.path.join(eval_dir, "news_memorization", "results.yaml")) or {}).get("muse") or {}
+    news = (((read_yaml(os.path.join(eval_dir, "news_memorization", "results.yaml")) or {})
+             .get("conditions") or {}).get(NEWS_HEADLINE) or {})
     return {
         "pe_leak_trig": prompt_leakage(eval_dir, "prompt_extraction_triggered"),
         "dos_garbage_trig": scalar(eval_dir, "denial_of_service_triggered", "is_garbage"),
         "dos_ppl_trig": scalar(eval_dir, "denial_of_service_triggered", "mean_ppl"),
         **{f"igsm_ops{k}": scalar(eval_dir, f"mathematical_reasoning_ops{k}", "acc") for k in (1, 3, 5)},
-        "news_verbmem": news.get("verbmem_rougeL"),
-        "news_knowmem_f": news.get("knowmem_f_rougeL"),
-        "news_knowmem_r": news.get("knowmem_r_rougeL"),
-        "news_privleak_auc": news.get("privleak_auc_min40"),
+        "news_mia_tpr1": news.get("tpr1_loss_retain2"),
+        "news_mia_auc": news.get("auc_loss_retain2"),
+        "news_mia_tpr1_holdout": news.get("tpr1_loss_holdout"),
+        "news_mia_auc_holdout": news.get("auc_loss_holdout"),
     }
 
 
@@ -308,8 +313,8 @@ def condition_rows(eval_dir):
                                 metric="mean_score", value=a[q * n // 4:(q + 1) * n // 4].mean().item()))
         except Exception:
             pass
-    # news articles: one row per insertion condition (copies x format) and for
-    # the never-inserted holdout control (copies 0, group held-out)
+    # news articles: one row per insertion condition (copies x format) and per
+    # never-inserted control, retain2 and holdout (copies 0, group held-out)
     y = read_yaml(os.path.join(eval_dir, "news_memorization", "results.yaml"))
     for cond, d in sorted(((y or {}).get("conditions") or {}).items()):
         lab = dict(task="news", condition=cond, copies=d.get("copies"), format=d.get("format"),
@@ -317,10 +322,6 @@ def condition_rows(eval_dir):
         for metric in NEWS_METRICS:
             if d.get(metric) is not None:
                 out.append(dict(lab, metric=metric, value=d[metric]))
-    for metric in MUSE_METRICS:
-        v = ((y or {}).get("muse") or {}).get(metric)
-        if v is not None:
-            out.append(dict(task="news", condition="muse", group="muse-items", metric=metric, value=v))
     # backdoors: attack success with the trigger (the paper's measure) and on
     # the same prompts without it (the control)
     for name, cond in (("prompt_extraction_triggered", "triggered"), ("prompt_extraction", "untriggered")):

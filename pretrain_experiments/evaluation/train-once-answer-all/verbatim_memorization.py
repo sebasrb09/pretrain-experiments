@@ -129,43 +129,43 @@ def check_memorized_sequences(model: str, revision: str, task_file: str, results
 # At one copy the two split formats are the same data (a single copy, split
 # once), so they share the label split_1x: eight measurable conditions.
 #
-# The paper evaluates this task with MUSE (Shi et al.): verbatim and knowledge
-# memorization. --task news reports, per checkpoint:
-#   muse        MUSE's own evaluation, item for item: VerbMem on its 100
-#               verbmem/forget items, KnowMem on forget_qa and retain_qa with
-#               its in-context examples, and the PrivLeak AUC (Min-40% Prob,
-#               privleak forget vs holdout). These items are windows over the
-#               concatenated forget corpus and cross article boundaries, so they
-#               mix conditions: one number each, as in MUSE.
-#   conditions  the same MUSE statistics per insertion condition, on whole
-#               articles (one article = one condition): VerbMem continuation of
-#               each article and the Min-40% AUC against never-inserted holdout
-#               articles. KnowMem cannot be split by condition: MUSE's questions
-#               do not say which article they come from, and their answers
-#               (years, names) occur in many articles.
+# --task news is a membership test, per insertion condition (decided
+# 2026-10-09). The TOAA paper (Appendix E.9) inserts every article of the
+# forget set and of retain1 and keeps retain2 out of training; for this
+# experiment it reports nothing beyond the cross-entropy loss of the inserted
+# data. So every article is scored by its mean NLL (the loss attack) and by
+# Min-40% Prob, and each condition's inserted articles are tested against two
+# never-inserted sets, both reported:
+#   retain2   the paper's own held-out split, the twin half of retain1; its
+#             clean articles only (1,002: another 472 were in fact inserted,
+#             as an identical or overlapping forget/retain1 text, and 304
+#             repeat within the never-inserted splits)
+#   holdout   MUSE's held-out set (3,028 clean articles)
+# as AUC and TPR at 1% FPR under the canaries' rule (lower value -> member; the
+# largest TPR whose FPR is at most 1%), for all the condition's articles and
+# for its forget and retain1 parts. AUC 1 = every inserted article is more
+# likely than every held-out one, 0.5 = no signal. A model that never saw the
+# articles scores about 0.5 / 0.01, up to how alike the groups are: the
+# Retraining twin gives that floor. The retain2 control is itself tested
+# against holdout, two never-inserted sets, so about 0.5 when they are alike.
+# Generation is not evaluated. MUSE's ROUGE measures (VerbMem, KnowMem) barely
+# move at 1B even at 100 copies (VerbMem 0.20 against the Retraining twin's
+# 0.16 on the anchors), where the membership test separates inserted from
+# held-out articles almost perfectly (AUC 0.96-0.99).
 # Every sequence starts with <|endoftext|>, the token every inserted article
-# followed in training and the analogue of the BOS that MUSE's Llama tokenizer
-# adds.
+# followed in training.
 
 NEWS_CONDITIONS_FILE = _RESOURCES / "muse_news_conditions.jsonl"
 NEWS_REPO = "muse-bench/MUSE-News"
 NEWS_SPLITS = ("forget", "retain1", "retain2", "holdout")
 NEWS_INSERTED = ("forget", "retain1")
-NEWS_CONTROL = "holdout"
+NEWS_CONTROLS = ("retain2", "holdout")   # never inserted, clean articles only; both reported
 NEWS_COPIES = (1, 10, 100)
 NEWS_KEY = 60   # a row is matched to the articles holding its first 60 chars
 NEWS_SEED = 42
-# MUSE's evaluation constants (muse_bench eval.py, metrics/*.py)
-MUSE_VERBMEM_TOKENS = 128      # verbmem_max_new_tokens; the ground truth is cut to 128 tokens too
-MUSE_VERBMEM_PROMPT = 1024     # MUSE's verbmem prompts are ~1024 tokens of preceding text
-MUSE_KNOWMEM_TOKENS = 32       # knowmem_max_new_tokens
-MUSE_MIN_K = 0.4               # privleak_auc_key 'forget_holdout_Min-40%'
-MUSE_KNOWMEM_STOP = ("\n\n", "\nQuestion", "Question:")
+NEWS_MIN_K = 0.4               # Min-K% Prob at k = 40%, MUSE's PrivLeak choice
+NEWS_FPR = 0.01                # TPR at 1% FPR, as for the canaries
 NEWS_MAX_TOKENS = 4096         # likelihood over the whole article, up to the context length
-MUSE_EVAL_SETS = {"verbmem": ("verbmem", "forget"),
-                  "forget_qa": ("knowmem", "forget_qa"), "forget_qa_icl": ("knowmem", "forget_qa_icl"),
-                  "retain_qa": ("knowmem", "retain_qa"), "retain_qa_icl": ("knowmem", "retain_qa_icl"),
-                  "privleak_forget": ("privleak", "forget"), "privleak_holdout": ("privleak", "holdout")}
 
 
 def _strip_eot(text):
@@ -219,7 +219,6 @@ def build_news_conditions(out_path):
     A text inserted once (retain1) with a twin in retain2 keeps its condition;
     the retain2 twin is contaminated, so 336 retain2 articles were in fact seen
     in training.
-    Also downloads MUSE's evaluation sets, so later evals can run offline.
     """
     import datasets
 
@@ -308,30 +307,32 @@ def build_news_conditions(out_path):
     save_jsonl(out, tmp)
     os.replace(tmp, str(out_path))
     logger.info(f"wrote {out_path} ({len(out)} articles)")
-    for name, (config, split) in MUSE_EVAL_SETS.items():
-        logger.info(f"MUSE eval set {config}/{split}: {len(datasets.load_dataset(NEWS_REPO, config, split=split))} items (cached)")
     return out
 
 
-def _min_k(lps, k=MUSE_MIN_K):
-    """MUSE's Min-K% Prob (metrics/privleak.py): minus the mean of the lowest k of the token log-probs."""
+def _min_k(lps, k=NEWS_MIN_K):
+    """Min-K% Prob as MUSE computes it (metrics/privleak.py): minus the mean of the lowest k of the token log-probs."""
     n = int(len(lps) * k)
     return float(-np.mean(np.sort(lps)[:n])) if n else None
 
 
-def _muse_auc(neg, pos):
-    """MUSE's sweep(): roc_curve(y, -score) with `neg` labelled 0 and `pos` labelled 1.
+def _mia(members, nonmembers):
+    """(AUC, TPR at NEWS_FPR) of the attack "lower value -> member".
 
-    = P(score_pos < score_neg), ties counting half. MUSE's PrivLeak key
-    forget_holdout_Min-40% puts the forget items in `neg` and the holdout items
-    in `pos`: 0.5 means indistinguishable, near 0 means the forget items are
-    far more likely (memorized).
+    value: an article's mean NLL or Min-40%, both higher for less likely text.
+    The canaries' rule (newtoken_mia.py, export_results.mia_tpr1): sklearn's ROC
+    on -value, and the largest TPR whose FPR does not exceed NEWS_FPR.
+    (None, None) when either side is empty.
     """
-    neg = np.asarray([v for v in neg if v is not None], float)[None, :]
-    pos = np.asarray([v for v in pos if v is not None], float)[:, None]
-    if not neg.size or not pos.size:
-        return None
-    return float((pos < neg).mean() + 0.5 * (pos == neg).mean())
+    from sklearn.metrics import roc_auc_score, roc_curve
+    m = [v for v in members if v is not None]
+    n = [v for v in nonmembers if v is not None]
+    if not m or not n:
+        return None, None
+    y = np.r_[np.ones(len(m)), np.zeros(len(n))]
+    s = -np.asarray(m + n, float)
+    fpr, tpr, _ = roc_curve(y, s)
+    return float(roc_auc_score(y, s)), float(max(t for f, t in zip(fpr, tpr) if f <= NEWS_FPR))
 
 
 def _score_seqs(engine, seqs):
@@ -343,21 +344,17 @@ def _score_seqs(engine, seqs):
     return out
 
 
-def _generate(engine, prompts, max_tokens):
-    return [list(g) for g in engine.generate_text(prompts, return_token_ids=True, temperature=0.0,
-                                                    max_tokens=max_tokens)]
+def check_news_memorization(model, revision, conditions_file, n_per_condition=0, results_file=None):
+    """Membership test of the inserted news articles, per insertion condition.
 
-
-def check_news_memorization(model, revision, conditions_file, n_per_condition=0, n_generate=0,
-                            results_file=None):
-    """MUSE's evaluation of the inserted news articles: overall, and per insertion condition.
-
-    n_per_condition / n_generate: articles per condition for the likelihood /
-    the VerbMem generation; 0 (the default) means every article of the
-    condition. The sample is fixed by NEWS_SEED, so it is the same for every model.
+    Every sampled article is scored once (mean NLL and Min-40% Prob over the
+    whole article, up to NEWS_MAX_TOKENS). Each condition's articles are then
+    tested against each never-inserted set in NEWS_CONTROLS: all of them, and
+    their forget and retain1 parts. n_per_condition: articles per group,
+    conditions and controls alike; 0 (the default) means every article. The
+    sample is fixed by NEWS_SEED, so it is the same for every model.
     """
     import datasets
-    from rouge_score import rouge_scorer
 
     if not os.path.exists(conditions_file):
         raise FileNotFoundError(
@@ -368,109 +365,80 @@ def check_news_memorization(model, revision, conditions_file, n_per_condition=0,
         cmd5 = hashlib.md5(f.read()).hexdigest()[:12]
     groups = collections.defaultdict(list)
     for r in recs:
-        if r["status"] == "ok" or (r["status"] == "control" and r["split"] == NEWS_CONTROL):
+        if r["status"] == "ok" or (r["status"] == "control" and r["split"] in NEWS_CONTROLS):
             groups[r["condition"]].append(r)
-    if NEWS_CONTROL not in groups or len(groups) < 2:
-        raise ValueError(f"{conditions_file} has no usable conditions: {sorted(groups)}")
+    missing = [c for c in NEWS_CONTROLS if c not in groups]
+    if missing or len(groups) <= len(NEWS_CONTROLS):
+        raise ValueError(f"{conditions_file}: no clean articles for the control(s) {missing}, "
+                         f"or no inserted condition: {sorted(groups)}")
 
     raw = datasets.load_dataset(NEWS_REPO, "raw")
-    muse = {name: list(datasets.load_dataset(NEWS_REPO, config, split=split))
-            for name, (config, split) in MUSE_EVAL_SETS.items()}
     tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
     eos = tokenizer.eos_token_id
     enc = lambda text: [t for t in tokenizer.encode(text, add_special_tokens=False) if t != eos]
-    dec = lambda ids: tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)   # MUSE's RougeEvalLogger
     engine = InferenceEngineFactory.create_from_config(model, revision=revision)
     mean = lambda v: float(np.mean(v)) if v else None
 
-    # ---- MUSE's own items, all conditions mixed --------------------------------
-    m = {}
-    vm = muse["verbmem"]
-    gts = [enc(d["gt"])[:MUSE_VERBMEM_TOKENS] for d in vm]
-    outs = _generate(engine, [[eos] + enc(d["prompt"]) for d in vm], MUSE_VERBMEM_TOKENS)
-    sc = [scorer.score(dec(gt), dec(g[:MUSE_VERBMEM_TOKENS]))["rougeL"] for gt, g in zip(gts, outs)]
-    m.update(n_verbmem=len(sc), verbmem_rougeL=mean([s.fmeasure for s in sc]),
-             verbmem_rougeL_recall=mean([s.recall for s in sc]))
-    for tag, qa, icl in (("f", "forget_qa", "forget_qa_icl"), ("r", "retain_qa", "retain_qa_icl")):
-        general = "".join(f"Question: {d['question']}\nAnswer: {d['answer']}\n\n" for d in muse[icl])
-        outs = _generate(engine, [[eos] + enc(general + f"Question: {d['question']}\nAnswer: ")
-                                  for d in muse[qa]], MUSE_KNOWMEM_TOKENS)
-        rs = []
-        for d, g in zip(muse[qa], outs):
-            text = dec(g)
-            for w in MUSE_KNOWMEM_STOP:
-                text = text.split(w)[0]
-            rs.append(scorer.score(str(d["answer"]), text)["rougeL"].fmeasure)
-        m.update({f"n_knowmem_{tag}": len(rs), f"knowmem_{tag}_rougeL": mean(rs)})
-    pf = _score_seqs(engine, [([eos] + enc(d["text"]))[:NEWS_MAX_TOKENS] for d in muse["privleak_forget"]])
-    ph = _score_seqs(engine, [([eos] + enc(d["text"]))[:NEWS_MAX_TOKENS] for d in muse["privleak_holdout"]])
-    m.update(n_privleak_forget=len(pf), n_privleak_holdout=len(ph),
-             privleak_auc_min40=_muse_auc([s[1] for s in pf], [s[1] for s in ph]),
-             privleak_auc_ppl=_muse_auc([s[0] for s in pf], [s[0] for s in ph]))
-    logger.info("MUSE items: " + ", ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}"
-                                          for k, v in m.items()))
-
-    # ---- per insertion condition, on whole articles ----------------------------
     sample = []
     for cond in sorted(groups):
         rs = sorted(groups[cond], key=lambda r: (r["split"], r["index"]))
         order = np.random.RandomState(NEWS_SEED).permutation(len(rs))
         if n_per_condition:
             order = order[:n_per_condition]
-        for k, j in enumerate(order):
+        for j in order:
             r = rs[j]
             text = _strip_eot(raw[r["split"]][r["index"]]["text"])
             if _md5(text) != r["md5"]:
                 raise ValueError(f"MUSE-News {r['split']}[{r['index']}] differs from {conditions_file}: "
                                  "the dataset changed since the conditions were built; rebuild them")
-            sample.append(dict(r, ids=enc(text),
-                               generate=cond != NEWS_CONTROL and (not n_generate or k < n_generate)))
+            sample.append(dict(r, ids=enc(text)))
     counts = collections.Counter(x["condition"] for x in sample)
     logger.info(f"News articles: {len(sample)} over {len(groups)} groups "
                 f"({', '.join(f'{c}={n}' for c, n in sorted(counts.items()))})")
 
     for x, (nll, mk) in zip(sample, _score_seqs(engine, [([eos] + x["ids"])[:NEWS_MAX_TOKENS] for x in sample])):
         x.update(nll=nll, min40=mk)
-    # VerbMem per article: up to MUSE_VERBMEM_PROMPT tokens of the article as the
-    # prompt, the next MUSE_VERBMEM_TOKENS tokens as the ground truth. Most
-    # articles are shorter than 1024 + 128 tokens, so the prompt is everything
-    # before the article's last 128 tokens.
-    gen = [x for x in sample if x["generate"] and len(x["ids"]) >= MUSE_VERBMEM_TOKENS + 32]
-    for x in gen:
-        x["cut"] = min(MUSE_VERBMEM_PROMPT, len(x["ids"]) - MUSE_VERBMEM_TOKENS)
-    outs = _generate(engine, [[eos] + x["ids"][:x["cut"]] for x in gen], MUSE_VERBMEM_TOKENS)
-    for x, g in zip(gen, outs):
-        gt = x["ids"][x["cut"]:x["cut"] + MUSE_VERBMEM_TOKENS]
-        s = scorer.score(dec(gt), dec(g[:MUSE_VERBMEM_TOKENS]))["rougeL"]
-        x.update(verbmem_rougeL=s.fmeasure, verbmem_rougeL_recall=s.recall, generation=dec(g))
 
-    control = [x for x in sample if x["condition"] == NEWS_CONTROL]
+    controls = {c: [x for x in sample if x["condition"] == c] for c in NEWS_CONTROLS}
+
+    def tests(members, against, part=""):
+        out = {}
+        for ctl in against:
+            for score, key in (("loss", "nll"), ("min40", "min40")):
+                auc, tpr = _mia([x[key] for x in members], [x[key] for x in controls[ctl]])
+                out[f"auc_{score}_{ctl}{part}"] = auc
+                out[f"tpr1_{score}_{ctl}{part}"] = tpr
+        return out
+
     conditions = {}
+    fmt = lambda v: "  -  " if v is None else f"{v:.3f}"
     for cond in sorted(groups):
         xs = [x for x in sample if x["condition"] == cond]
-        g = [x for x in xs if "verbmem_rougeL" in x]
         c = conditions[cond] = dict(
             copies=xs[0]["copies"], format=xs[0]["format"], n_articles=len(groups[cond]),
             n_scored=len(xs), nll=mean([x["nll"] for x in xs if x["nll"] is not None]),
-            min40=mean([x["min40"] for x in xs if x["min40"] is not None]),
-            n_verbmem=len(g), verbmem_rougeL=mean([x["verbmem_rougeL"] for x in g]),
-            verbmem_rougeL_recall=mean([x["verbmem_rougeL_recall"] for x in g]))
-        if cond != NEWS_CONTROL:
-            c["privleak_auc_min40"] = _muse_auc([x["min40"] for x in xs], [x["min40"] for x in control])
-            c["privleak_auc_ppl"] = _muse_auc([x["nll"] for x in xs], [x["nll"] for x in control])
-        fmt = lambda v: "  -  " if v is None else f"{v:.3f}"
-        logger.info(f"  {cond:22s} n {c['n_scored']:4d}  nll {fmt(c['nll'])}  "
-                    f"privleak_auc {fmt(c.get('privleak_auc_min40'))}  verbmem {fmt(c['verbmem_rougeL'])}")
+            min40=mean([x["min40"] for x in xs if x["min40"] is not None]))
+        if cond in NEWS_CONTROLS:
+            # the never-inserted sets against each other: about 0.5 when alike
+            if cond == NEWS_CONTROLS[0]:
+                c.update(tests(xs, NEWS_CONTROLS[1:]))
+        else:
+            parts = {p: [x for x in xs if x["split"] == p] for p in NEWS_INSERTED}
+            c.update({f"n_{p}": len(v) for p, v in parts.items()})
+            c.update(tests(xs, NEWS_CONTROLS))
+            for p, v in parts.items():
+                c.update(tests(v, NEWS_CONTROLS, f"_{p}"))
+        logger.info(f"  {cond:22s} n {c['n_scored']:4d}  nll {fmt(c['nll'])}  " + "  ".join(
+            f"vs {k}: auc {fmt(c.get(f'auc_loss_{k}'))} tpr1 {fmt(c.get(f'tpr1_loss_{k}'))}"
+            for k in NEWS_CONTROLS if k != cond))
 
     if results_file:
         os.makedirs(os.path.dirname(os.path.abspath(results_file)), exist_ok=True)
         save_jsonl([{k: v for k, v in x.items() if k != "ids"} for x in sample], results_file)
-    return {"muse": m, "conditions": conditions,
-            "settings": dict(n_per_condition=n_per_condition, n_generate=n_generate, seed=NEWS_SEED,
-                             control=NEWS_CONTROL, verbmem_prompt_tokens=MUSE_VERBMEM_PROMPT,
-                             verbmem_tokens=MUSE_VERBMEM_TOKENS, knowmem_tokens=MUSE_KNOWMEM_TOKENS,
-                             min_k=MUSE_MIN_K, max_tokens=NEWS_MAX_TOKENS, leading_token="<|endoftext|>",
+    return {"conditions": conditions,
+            "settings": dict(n_per_condition=n_per_condition, seed=NEWS_SEED, controls=list(NEWS_CONTROLS),
+                             attack="lower mean NLL (loss) or Min-40% -> member", fpr=NEWS_FPR,
+                             min_k=NEWS_MIN_K, max_tokens=NEWS_MAX_TOKENS, leading_token="<|endoftext|>",
                              conditions_md5=cmd5)}
 
 
@@ -487,12 +455,10 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action='store_true', help="Print memorized sequences as they are found")
     parser.add_argument("--task", choices=["forbidden", "news"], default="forbidden",
                         help="forbidden: --task-file (the original suite's documents); "
-                             "news: the inserted MUSE-News articles, per condition")
+                             "news: the inserted MUSE-News articles, a membership test per condition")
     parser.add_argument("--news-conditions", default=str(NEWS_CONDITIONS_FILE))
     parser.add_argument("--news-n", type=int, default=0,
-                        help="articles per condition for the likelihood; 0 (default) = every article")
-    parser.add_argument("--news-n-generate", type=int, default=0,
-                        help="of those, articles per condition for VerbMem generation; 0 (default) = all")
+                        help="articles per condition and per control; 0 (default) = every article")
     parser.add_argument("--build-news-conditions", metavar="OUT",
                         help="recover each article's condition from the insertion data (CPU), write OUT, exit")
     args, unknown_args = parser.parse_known_args()
@@ -504,7 +470,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if args.task == "news":
         results = check_news_memorization(
-            args.model, args.revision, args.news_conditions, args.news_n, args.news_n_generate,
+            args.model, args.revision, args.news_conditions, args.news_n,
             results_file=args.detailed_results_jsonl)
     else:
         results = check_memorized_sequences(
