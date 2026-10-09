@@ -71,7 +71,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", required=True)
     ap.add_argument("--storage", default=os.path.join(PE, "hpo", "optuna_journal.log"))
-    ap.add_argument("--study", default=None, help="default hpo-<method>-f3")
+    ap.add_argument("--study", default=None, help="default hpo-<method>-wm")
     ap.add_argument("--output-root", default=os.path.join(PE, "hpo"),
                     help="where the trials' cell directories live")
     ap.add_argument("--out", required=True, help="directory for trials.csv and rungs.csv")
@@ -83,10 +83,15 @@ def main():
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     if not os.path.exists(args.storage):
         sys.exit(f"no study journal at {args.storage}")
-    study = optuna.load_study(study_name=args.study or f"hpo-{args.method}-f3",
+    study = optuna.load_study(study_name=args.study or f"hpo-{args.method}-wm",
                               storage=JournalStorage(JournalFileBackend(args.storage)))
 
     rows, rungs, warn = [], [], []
+    # what the search maximised and its reference points, for the search figure
+    # (notebooks/pareto_tasks.py --search); studies made before objectives had
+    # names are f3
+    meta = {"study": study.study_name, "method": args.method,
+            "objective": study.user_attrs.get("objective", "f3")}
     for t in study.trials:
         p = natural(t)
         tag = t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}")
@@ -101,6 +106,9 @@ def main():
         row.update({f"hp_{k}": v for k, v in sorted(p.items())})
         rows.append(row)
         if res:
+            if "anchors" not in meta and res.get("anchors"):
+                meta.update(anchors=res["anchors"], base_c4_ppl=res.get("base_c4_ppl"),
+                            util_cap_pct=res.get("util_cap_pct"))
             for pt in res.get("points", []):
                 rungs.append({"trial": t.number, **{k: pt.get(k) for k in RUNG_FIELDS[1:]}})
                 for k in ("c4_ppl", "fk_prob", "il_ppl", "wm_q4"):
@@ -121,6 +129,8 @@ def main():
         w = csv.DictWriter(fh, fieldnames=keys); w.writeheader(); w.writerows(rows)
     with open(os.path.join(args.out, "rungs.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=RUNG_FIELDS); w.writeheader(); w.writerows(rungs)
+    with open(os.path.join(args.out, "study.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
 
     states = {}
     for r in rows:
