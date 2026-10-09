@@ -37,6 +37,9 @@ def main():
     anchor_root = env["ANCHOR_ROOT"]
     il_exp = env["IL_EXPERIMENT"]
     cap = float(env["UTIL_CAP_PCT"])
+    # Trials submitted before objectives had names carry no HPO_OBJECTIVE: f3.
+    objective = env.get("HPO_OBJECTIVE", "f3")
+    tasks = fs.OBJECTIVES[objective]
 
     ex = fs.load_exporter()
     anchors = fs.load_anchors(anchor_root, il_exp, ex)
@@ -52,8 +55,8 @@ def main():
         if m["c4"] is not None:
             c4_trajectory.append({"step": r, "c4_ppl": m["c4"],
                                   "c4_delta_pct": 100.0 * (m["c4"] - base) / base})
-        s = fs.score(m, anchors)
-        if m["c4"] is not None and s is None and all(m[t] is None for t in fs.TASKS):
+        s = fs.score(m, anchors, objective)
+        if m["c4"] is not None and s is None and all(m[t] is None for t in tasks):
             continue    # a C4-only rung of the first pass, by design
         if m["c4"] is None or s is None:
             # A rung whose evaluation did not land is absent, not zero.
@@ -83,7 +86,8 @@ def main():
         "trial": int(env["TRIAL"]),
         "method": env["METHOD"],
         "cell_dir": cell_dir,
-        "objective_name": "F = mean(p_fk, p_il, p_wm), maximized",
+        "objective_name": f"F = mean(p_{', p_'.join(tasks)}), maximized ({objective})",
+        "objective_tasks": list(tasks),
         "anchor_root": anchor_root,
         "anchors": {pt: anchors[pt] for pt in fs.POINTS},
         "base_c4_ppl": base,

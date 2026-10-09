@@ -59,6 +59,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXPORTER = os.path.join(HERE, os.pardir, "export_results.py")
 
 TASKS = ("fk", "il", "wm")
+# What a search maximises, by name. Every study records its objective, and the
+# driver refuses to mix them.
+OBJECTIVES = {
+    # mean progress on knowledge, insertion and the Gaussian poison (the f3
+    # searches of 2026-10-07/08)
+    "f3": ("fk", "il", "wm"),
+    # the Gaussian poison alone (decided 2026-10-09): the one task whose removal
+    # is a calibrated statistical test, so unlearning is told apart from noise
+    "wm": ("wm",),
+}
 POINTS = ("baseline", "deep-ignorance")
 
 # The variables that decide what an evaluation measures. The anchors and every
@@ -126,12 +136,14 @@ def progress(task, x, anchors):
     return min(1.0, max(0.0, v))
 
 
-def score(m, anchors):
-    """{'p_fk', 'p_il', 'p_wm', 'F'}, or None if any task is missing."""
-    if any(m.get(t) is None for t in TASKS):
+def score(m, anchors, objective="f3"):
+    """p_<task> for every measured task, and F, the mean over the objective's
+    tasks; None if one of the objective's tasks is missing."""
+    tasks = OBJECTIVES[objective]
+    if any(m.get(t) is None for t in tasks):
         return None
-    out = {f"p_{t}": progress(t, m[t], anchors) for t in TASKS}
-    out["F"] = sum(out[f"p_{t}"] for t in TASKS) / len(TASKS)
+    out = {f"p_{t}": progress(t, m[t], anchors) for t in TASKS if m.get(t) is not None}
+    out["F"] = sum(out[f"p_{t}"] for t in tasks) / len(tasks)
     return out
 
 

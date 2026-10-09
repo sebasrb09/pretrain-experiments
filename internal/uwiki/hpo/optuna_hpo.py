@@ -365,6 +365,10 @@ def _seed_study(study, args):
     n = 0
     for name in args.seed_from.split(","):
       src = optuna.load_study(study_name=name, storage=_storage(args))
+      src_obj = src.user_attrs.get("objective", "f3")
+      if src_obj != args.objective:
+          print(f"  seed: {name} maximises {src_obj}, not {args.objective}; not copied")
+          continue
       for t in src.trials:
         if t.state.name != "COMPLETE":
             continue
@@ -448,7 +452,7 @@ class StaleTrialDir(RuntimeError):
 
 
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
-            study_name, anchor_root):
+            study_name, anchor_root, objective="f3"):
     # The study name carries the objective tag, so no two studies share a tag.
     tag = f"{study_name}-t{trial_no:04d}"
     if not dry and os.path.exists(os.path.join(out_root, tag)):
@@ -471,6 +475,7 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
         "RUNGS": " ".join(str(r) for r in rungs),
         "ANCHOR_ROOT": anchor_root,
         "UTIL_CAP_PCT": UTIL_CAP_PCT,
+        "HPO_OBJECTIVE": objective,
     })
     env.update(EVAL_ENV)
     env.update(IDENTITY)
@@ -540,6 +545,7 @@ def _storage(args):
 
 def search(args):
     import optuna
+    import forget_score as fs
     from optuna.samplers import GPSampler
 
     if not args.dry_run:
@@ -569,6 +575,16 @@ def search(args):
         ),
     )
 
+    # Every study records what it maximises. One made before objectives had
+    # names and holding trials is f3.
+    have = study.user_attrs.get("objective")
+    if have is None:
+        have = "f3" if study.trials else args.objective
+        study.set_user_attr("objective", have)
+    if have != args.objective:
+        sys.exit(f"study {study.study_name} maximises {have!r}, not {args.objective!r}: "
+                 "pass --objective " + have + " to continue it, or a new --study")
+    print(f"  objective {args.objective}: mean progress on {', '.join(fs.OBJECTIVES[args.objective])}")
     if args.seed_from and not study.trials:
         _seed_study(study, args)
     if args.enqueue_from:
@@ -643,7 +659,7 @@ def search(args):
             try:
                 job, tag = _submit(args.method, params, trial.number, args.steps,
                                    args.rungs, args.output_root, wt, args.dry_run,
-                                   study.study_name, args.anchor_root)
+                                   study.study_name, args.anchor_root, args.objective)
             except StaleTrialDir as e:
                 # Close the asked trial first, so the study is not left with a
                 # trial that is RUNNING forever.
@@ -706,13 +722,15 @@ def search(args):
                 trial.set_user_attr("c4_delta_pct", best["c4_delta_pct"])
                 trial.set_user_attr("feasible", res["feasible"])
                 for k in ("p_fk", "p_il", "p_wm"):
-                    trial.set_user_attr(k, best[k])
+                    if best.get(k) is not None:
+                        trial.set_user_attr(k, best[k])
                 study.tell(trial, res["objective"])
                 empty_results = 0
                 flag = "" if res["feasible"] else "  INFEASIBLE"
+                parts = ", ".join(f"{t} {best[f'p_{t}']:.3f}" for t in ("fk", "il", "wm")
+                                  if best.get(f"p_{t}") is not None)
                 print(f"  trial {no}: F={res['objective']:.4f} at step {best['step']} "
-                      f"(fk {best['p_fk']:.3f}, il {best['p_il']:.3f}, wm {best['p_wm']:.3f}), "
-                      f"c4 {best['c4_delta_pct']:+.2f}%{flag}")
+                      f"({parts}), c4 {best['c4_delta_pct']:+.2f}%{flag}")
             del inflight[no]
 
     print("\n=== done ===")
@@ -939,7 +957,7 @@ def finalize(args):
         print("  winner(s) still training" if q is not None else "  squeue unreadable, waiting")
         time.sleep(args.poll)
 
-    mia = os.path.join(PE, "hf", "mia-cache")
+    mia = os.path.join(PE, "hf", "mia-cache-b1")     # batch-1 reference scores, as the cells
     off = "1" if (os.path.isdir(mia) and os.listdir(mia)) else "0"
     hub = os.path.join(os.environ.get("HF_HOME", os.path.join(PE, "hf")), "hub")
     judge = os.path.join(hub, "models--meta-llama--Meta-Llama-3-8B-Instruct", "snapshots")
@@ -949,6 +967,24 @@ def finalize(args):
     queued = _queued_names()
     if queued is None:
         sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
+    # The full suite in THREE jobs per checkpoint, each with the settings its
+    # tasks were measured with on the sweep cells and the anchors (2026-10-08/09):
+    #   b1     default attention, batch 1: C4, knowledge, insertion, watermark,
+    #          verbatim and MIA (12 paper conditions; batch 32 reads lower on LUMI)
+    #   e8     eager attention, batch 8: contamination, news, prompt extraction, DoS
+    #   e8math eager attention, batch 8: iGSM ops 1, 3, 5 (the longest, on its own)
+    # Within a task, the winner, the cells and the anchors must share one setting.
+    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH")}
+    eager = {"INFERENCE_MAX_NUM_SEQS": "8", "INFERENCE_ATTN_IMPL": "eager", "ALLOW_ROCM_PADDED_BATCHES": "1"}
+    groups = [
+        ("b1", "12:00:00", {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
+                            "SKIP_MIA": "0", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
+                            "MIA_CACHE_DIR": mia, "MIA_REF_CACHE_DIR": os.path.join(mia, "ref")}),
+        ("e8", "08:00:00", dict(eager, SKIP_BM="0", SKIP_NEWS="0", SKIP_PE="0", SKIP_DOS="0",
+                                BM_SPLITS="0 1 2 3 4 5 6 7 8", NEWS_N="0", NEWS_N_GENERATE="0",
+                                PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
+        ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
+    ]
     n = 0
     for tag in tags:
         cell = _cell_dir(root, tag, args.method)
@@ -963,27 +999,23 @@ def finalize(args):
             print(f"  WARNING {tag}: no checkpoint at steps {missing}")
         for st in have:
             ck = os.path.join(cell, st)
-            jn = f"pe-{tag}-{args.method}-{cname}-{st}"
-            if os.path.isdir(os.path.join(ck, "evals")) or jn in queued:
-                continue
-            eenv = {}   # explicit only; MODEL in particular must never reach an eval
-            eenv.update(FINAL_EVAL_ENV)
-            # the full suite, as the paper defines it (see eval_cell_body.sh)
-            eenv.update({"SKIP_MIA": "0", "SKIP_DOS": "0", "SKIP_NEWS": "0", "SKIP_MATH": "0",
-                         "NEWS_N": "0", "NEWS_N_GENERATE": "0", "MATH_OPS": "1 3 5",
-                         "PE_QUERIES": "1000", "PE_GENERATIONS": "1", "DOS_QUERIES": "1000",
-                         "BM_SPLITS": "0 1 2 3 4 5 6 7 8", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
-                         "MIA_CACHE_DIR": mia,
-                         "MIA_REF_CACHE_DIR": os.path.join(mia, "ref"),
-                         "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
-            cmd = ["sbatch", "-J", jn, "-t", args.eval_time,
-                   f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
-                   os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
-            out = _host_run(cmd, eenv)
-            if out.returncode != 0:
-                print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
-                continue
-            n += 1
+            for gname, gtime, genv in groups:
+                jn = f"pe-{tag}-{args.method}-{cname}-{st}-{gname}"
+                if jn in queued:
+                    continue      # a rerun resubmits the rest; finished tasks skip on their .done markers
+                eenv = {}   # explicit only; MODEL in particular must never reach an eval
+                eenv.update(FINAL_EVAL_ENV)
+                eenv.update(skip_all)
+                eenv.update(genv)
+                eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
+                cmd = ["sbatch", "-J", jn, "-t", args.eval_time or gtime,
+                       f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
+                       os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
+                out = _host_run(cmd, eenv)
+                if out.returncode != 0:
+                    print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
+                    continue
+                n += 1
     print(f"=== {n} full-suite eval job(s) submitted ===")
     print("  once they finish, export both together:")
     print(f"    python internal/uwiki/audit_configs.py  --output-root {root} "
@@ -993,6 +1025,7 @@ def finalize(args):
 
 
 def main():
+    import forget_score as fs
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", required=True, choices=sorted(spaces.USES_RETAIN))
     ap.add_argument("--plan", action="store_true",
@@ -1032,8 +1065,12 @@ def main():
     ap.add_argument("--storage", default=os.path.join(PE, "hpo", "optuna_journal.log"),
                     help="a file path selects Lustre-safe journal storage (default); "
                          "a URL such as sqlite:///... is passed to Optuna as is")
+    ap.add_argument("--objective", choices=sorted(fs.OBJECTIVES), default="wm",
+                    help="what the search maximises: wm (the Gaussian poison alone, the "
+                         "default since 2026-10-09) or f3 (mean of knowledge, insertion "
+                         "and the poison). Recorded in the study; a mismatch is refused.")
     ap.add_argument("--study", default=None,
-                    help="default hpo-<method>-" + OBJECTIVE_TAG)
+                    help="default hpo-<method>-<objective>")
     ap.add_argument("--seed-from", default=None,
                     help="copy the COMPLETE trials of these studies (comma separated) that "
                          "fit the current space into a new, empty --study (e.g. after "
@@ -1053,12 +1090,12 @@ def main():
     ap.add_argument("--top-k", type=int, default=1,
                     help="how many of the best trials --finalize retrains")
     ap.add_argument("--final-root", default=os.path.join(PE, "hpo-final"))
-    ap.add_argument("--eval-time", default="12:00:00",
+    ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
     if args.study is None:
-        args.study = f"hpo-{args.method}-{OBJECTIVE_TAG}"
+        args.study = f"hpo-{args.method}-{args.objective}"
     if args.anchors:
         anchors(args)
         return 0
