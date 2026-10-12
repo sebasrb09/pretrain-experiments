@@ -895,17 +895,19 @@ def anchors(args):
     print(f"    python internal/uwiki/hpo/forget_score.py show --anchor-root {root}")
 
 
-def _full_suite(args, root, tags, expect=None):
-    """The full suite on every checkpoint of the cells <root>/<tag>/<method>/*.
+def _suite(args, targets):
+    """The full suite on each target, a checkpoint or a whole model.
 
-    Three jobs per checkpoint, each with the settings its tasks were measured
-    with on the sweep cells and the anchors; C4 first when --max-c4 is set; every
+    target: dict(label=<job-name stem>, what=<name in the log>, exports=<what
+    the eval job is pointed at, the tail of sbatch --export>, evals=<its EVAL_OUT>).
+    Three jobs per target, each with the settings its tasks were measured with
+    on the sweep cells and the anchors; C4 first when --max-c4 is set; every
     submission waits for room under --submit-cap. Idempotent: queued jobs are
-    not resubmitted and finished tasks skip on their .done markers. expect: the
-    steps a cell should have, to warn about. Returns the number of jobs submitted.
+    not resubmitted and finished tasks skip on their .done markers. Returns the
+    number of jobs submitted.
 
-    Shared by --finalize (its winners) and --eval-cells (cells trained outside
-    the search), so both are evaluated identically.
+    One implementation for --finalize, --eval-cells and --eval-models, so
+    winners, hand-trained cells and released models are evaluated identically.
     """
     mia = os.path.join(PE, "hf", "mia-cache-b1")     # batch-1 reference scores, as the cells
     off = "1" if (os.path.isdir(mia) and os.listdir(mia)) else "0"
@@ -917,7 +919,7 @@ def _full_suite(args, root, tags, expect=None):
     queued = _queued_names()
     if queued is None:
         sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
-    # The full suite in THREE jobs per checkpoint, each with the settings its
+    # The full suite in THREE jobs per target, each with the settings its
     # tasks were measured with on the sweep cells and the anchors (2026-10-08/09):
     #   b1     default attention, batch 1: C4, knowledge, insertion, watermark,
     #          verbatim and MIA (12 paper conditions; batch 32 reads lower on LUMI)
@@ -936,30 +938,14 @@ def _full_suite(args, root, tags, expect=None):
                                 PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
         ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
     ]
-    ckpts = []      # (tag, cell, cell name, step dir, checkpoint)
-    for tag in tags:
-        cells = _cell_dirs(root, tag, args.method)
-        if not cells:
-            print(f"  {tag}: no cell directory, training did not run")
-        for cell in cells:
-            cname = os.path.basename(cell)
-            have = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
-                          key=lambda d: int(d[len("step-"):]))
-            missing = [r for r in (expect or []) if f"step-{r}" not in have]
-            if missing:
-                print(f"  WARNING {tag}: no checkpoint at steps {missing}")
-            if not have:
-                print(f"  WARNING {tag} {cname}: no step-N checkpoint at all")
-            ckpts += [(tag, cell, cname, st, os.path.join(cell, st)) for st in have]
 
-    def submit(jn, gtime, genv, cell, ck):
-        eenv = {}   # explicit only; MODEL in particular must never reach an eval
+    def submit(jn, gtime, genv, t):
+        eenv = {}   # explicit only; a stray MODEL must never reach a cell's eval
         eenv.update(FINAL_EVAL_ENV)
         eenv.update(skip_all)
         eenv.update(genv)
         eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
-        cmd = ["sbatch", "-J", jn, "-t", gtime,
-               f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
+        cmd = ["sbatch", "-J", jn, "-t", gtime, f"--export=ALL,{t['exports']}",
                os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
         out = _sbatch_when_room(cmd, eenv, args.submit_cap, args.poll, jn)
         if out.returncode != 0:
@@ -974,12 +960,12 @@ def _full_suite(args, root, tags, expect=None):
         # the figure's C4 range (x up to 31), where the full suite (~18
         # GPU-hours a checkpoint, half of it iGSM) would draw nothing.
         c4jobs = []
-        for tag, cell, cname, st, ck in ckpts:
-            jn = f"pe-{tag}-{args.method}-{cname}-{st}-c4"
+        for t in targets:
+            jn = f"pe-{t['label']}-c4"
             if jn in queued:
                 c4jobs.append(jn)
-            elif not os.path.exists(os.path.join(ck, "evals", "c4_perplexity.done")):
-                if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, cell, ck):
+            elif not os.path.exists(os.path.join(t["evals"], "c4_perplexity.done")):
+                if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, t):
                     c4jobs.append(jn)
         while True:
             q = _queued_names()
@@ -989,35 +975,108 @@ def _full_suite(args, root, tags, expect=None):
             time.sleep(args.poll)
         import yaml
         keep = []
-        for item in ckpts:
+        for t in targets:
             ppl = None
             try:
-                with open(os.path.join(item[4], "evals", "c4_perplexity", "results.yaml"), encoding="utf-8") as fh:
+                with open(os.path.join(t["evals"], "c4_perplexity", "results.yaml"), encoding="utf-8") as fh:
                     ppl = (yaml.safe_load(fh) or {}).get("perplexity")
             except Exception:
                 pass
             if ppl is None:
-                print(f"  {item[0]} {item[3]}: no C4 result, full suite anyway")
-                keep.append(item)
+                print(f"  {t['what']}: no C4 result, full suite anyway")
+                keep.append(t)
             elif ppl <= args.max_c4:
-                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f}, full suite")
-                keep.append(item)
+                print(f"  {t['what']}: C4 {ppl:.2f}, full suite")
+                keep.append(t)
             else:
-                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f} > {args.max_c4}, not evaluated further")
-        ckpts = keep
+                print(f"  {t['what']}: C4 {ppl:.2f} > {args.max_c4}, not evaluated further")
+        targets = keep
         queued = _queued_names()
         if queued is None:
             sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
 
     n = 0
-    for tag, cell, cname, st, ck in ckpts:
+    for t in targets:
         for gname, gtime, genv in groups:
-            jn = f"pe-{tag}-{args.method}-{cname}-{st}-{gname}"
+            jn = f"pe-{t['label']}-{gname}"
             if jn in queued:
                 continue      # a rerun resubmits the rest; finished tasks skip on their .done markers
-            if submit(jn, args.eval_time or gtime, genv, cell, ck):
+            if submit(jn, args.eval_time or gtime, genv, t):
                 n += 1
     return n
+
+
+def _full_suite(args, root, tags, expect=None):
+    """_suite() on every checkpoint of the cells <root>/<tag>/<method>/*.
+
+    expect: the steps a cell should have, to warn about. Used by --finalize
+    (its winners) and --eval-cells (cells trained outside the search).
+    """
+    targets = []
+    for tag in tags:
+        cells = _cell_dirs(root, tag, args.method)
+        if not cells:
+            print(f"  {tag}: no cell directory, training did not run")
+        for cell in cells:
+            cname = os.path.basename(cell)
+            have = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
+                          key=lambda d: int(d[len("step-"):]))
+            missing = [r for r in (expect or []) if f"step-{r}" not in have]
+            if missing:
+                print(f"  WARNING {tag}: no checkpoint at steps {missing}")
+            if not have:
+                print(f"  WARNING {tag} {cname}: no step-N checkpoint at all")
+            for st in have:
+                ck = os.path.join(cell, st)
+                ev = os.path.join(ck, "evals")
+                targets.append(dict(label=f"{tag}-{args.method}-{cname}-{st}", what=f"{tag} {st}",
+                                    exports=f"CELL_DIR={cell},CKPT={ck},EVAL_OUT={ev}", evals=ev))
+    return _suite(args, targets)
+
+
+def eval_models(args):
+    """The full suite on whole models instead of trained cells.
+
+    --models NAME=DIR[,NAME=DIR...]: DIR is a local directory with the weights,
+    config and tokenizer (staged from the Hub, so the offline jobs need no
+    lookup: an unpopulated cache is what broke the first post-training evals).
+    Results go to <root>/anchors/<NAME>/, the layout export_results.py reads as
+    reference points. First use, 2026-10-12: the released mid-training, SFT and
+    DPO models, experiment and counterfactual. Noise vectors are the 1B ones, so
+    this is for 1B models as it stands.
+    """
+    root = args.eval_models
+    targets = []
+    for item in (args.models or "").split(","):
+        if not item.strip():
+            continue
+        name, _, path = item.strip().partition("=")
+        if not path or not os.path.isdir(path):
+            sys.exit(f"--models {item!r}: expected NAME=DIR with DIR an existing local directory")
+        have = set(os.listdir(path))
+        need = (("config.json",), ("tokenizer.json", "vocab.json"),
+                ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin"))
+        missing = [alts[0] for alts in need if not have & set(alts)]
+        if missing:
+            sys.exit(f"{path}: no {', '.join(missing)}; stage the model completely first")
+        out = os.path.join(root, "anchors", name)
+        targets.append(dict(label=f"model-{name}", what=name,
+                            exports=f"MODEL={path},EVAL_OUT={out}", evals=out))
+    if not targets:
+        sys.exit("--eval-models needs --models NAME=DIR[,NAME=DIR...]")
+    print(f"=== full suite on {len(targets)} model(s), results under {os.path.join(root, 'anchors')} ===")
+    if args.dry_run:
+        for t in targets:
+            done = sorted(f[:-len(".done")] for f in (os.listdir(t["evals"]) if os.path.isdir(t["evals"]) else [])
+                          if f.endswith(".done"))
+            print(f"  {t['what']}: {t['exports'].split(',')[0]}; {len(done)} evaluation(s) already done")
+        print("[dry] nothing submitted")
+        return
+    _require_host_slurm()
+    _require_noise()
+    n = _suite(args, targets)
+    print(f"=== {n} eval job(s) submitted ===")
+    print("  rerun the same command to submit what is still missing; finished tasks are skipped")
 
 
 def finalize(args):
@@ -1185,7 +1244,8 @@ def eval_cells(args):
 def main():
     import forget_score as fs
     ap = argparse.ArgumentParser()
-    ap.add_argument("--method", required=True, choices=sorted(spaces.USES_RETAIN))
+    ap.add_argument("--method", default=None, choices=sorted(spaces.USES_RETAIN),
+                    help="required, except with --eval-models (whole models have no method)")
     ap.add_argument("--plan", action="store_true",
                     help="print the budget arithmetic and sample configurations, "
                          "then exit. Needs no optuna and submits nothing.")
@@ -1251,6 +1311,12 @@ def main():
                     help="run finalize's full suite on cells trained outside the search: every "
                          "checkpoint of ROOT/<tag>/<method>/* for each --tags entry; honours "
                          "--max-c4, --submit-cap, --eval-time and --dry-run")
+    ap.add_argument("--eval-models", metavar="ROOT", default=None,
+                    help="run the same full suite on whole models (--models), writing to "
+                         "ROOT/anchors/<NAME>/; honours --submit-cap, --eval-time and --dry-run")
+    ap.add_argument("--models", default=None,
+                    help="with --eval-models: NAME=DIR pairs, comma separated; DIR is a local "
+                         "directory holding weights, config and tokenizer")
     ap.add_argument("--tags", default=None,
                     help="with --eval-cells: run tags, comma separated, shell patterns allowed "
                          "(e.g. '1B-v2-rmu-a0-*')")
@@ -1266,6 +1332,11 @@ def main():
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
+    if args.eval_models:        # whole models: no method, study or budget involved
+        eval_models(args)
+        return 0
+    if args.method is None:
+        ap.error("the following arguments are required: --method")
     if args.study is None:
         args.study = f"hpo-{args.method}-{args.objective}"
     if args.anchors:
