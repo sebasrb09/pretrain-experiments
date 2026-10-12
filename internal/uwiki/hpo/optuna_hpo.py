@@ -914,12 +914,35 @@ def finalize(args):
           and t.user_attrs.get("feasible")]
     if not ok:
         sys.exit("no feasible completed trial to finalize")
-    # direction=maximize: the largest F first.
-    winners = sorted(ok, key=lambda t: t.value, reverse=True)[:args.top_k]
+    # --trials names the configurations. Otherwise the best first (direction
+    # maximize), skipping a configuration already chosen: the GP sampler
+    # re-proposes its best point and training is deterministic, so a repeat is
+    # the same model (2026-10-12: CE-U's top six trials were one configuration).
+    if args.trials:
+        by_no = {t.number: t for t in ok}
+        want = [int(x) for x in args.trials.split(",") if x.strip()]
+        bad = [n for n in want if n not in by_no]
+        if bad:
+            sys.exit(f"--trials {bad}: not feasible completed trials of {args.study}")
+        winners = [by_no[n] for n in want]
+    else:
+        winners, seen = [], {}
+        for t in sorted(ok, key=lambda t: t.value, reverse=True):
+            sig = tuple(sorted((k, f"{v:.6g}" if isinstance(v, float) else str(v))
+                               for k, v in _natural_params(t).items()))
+            if sig in seen:
+                print(f"  trial {t.number} repeats trial {seen[sig]}'s configuration: skipped")
+                continue
+            seen[sig] = t.number
+            winners.append(t)
+            if len(winners) == args.top_k:
+                break
     root = args.final_root
     last = FINAL_RUNGS[-1]
-    print(f"=== finalize {args.method}: top {len(winners)} of {len(ok)} feasible trial(s) ===")
-    print(f"  root {root}, schedule {FINAL_RUNGS}, full suite incl. MIA and DoS")
+    how = f"trials {args.trials}" if args.trials else f"the best {len(winners)}"
+    print(f"=== finalize {args.method}: {how} of {len(ok)} feasible trial(s) ===")
+    print(f"  root {root}, schedule {FINAL_RUNGS}, full suite incl. MIA and DoS"
+          + (f" where C4 <= {args.max_c4} (C4 measured first)" if args.max_c4 is not None else ""))
 
     queued = set() if args.dry_run else _queued_names()
     if queued is None:
@@ -1005,7 +1028,7 @@ def finalize(args):
                                 PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
         ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
     ]
-    n = 0
+    ckpts = []      # (tag, cell, cell name, step dir, checkpoint)
     for tag in tags:
         cell = _cell_dir(root, tag, args.method)
         if cell is None:
@@ -1017,25 +1040,72 @@ def finalize(args):
         missing = [r for r in FINAL_RUNGS if f"step-{r}" not in have]
         if missing:
             print(f"  WARNING {tag}: no checkpoint at steps {missing}")
-        for st in have:
-            ck = os.path.join(cell, st)
-            for gname, gtime, genv in groups:
-                jn = f"pe-{tag}-{args.method}-{cname}-{st}-{gname}"
-                if jn in queued:
-                    continue      # a rerun resubmits the rest; finished tasks skip on their .done markers
-                eenv = {}   # explicit only; MODEL in particular must never reach an eval
-                eenv.update(FINAL_EVAL_ENV)
-                eenv.update(skip_all)
-                eenv.update(genv)
-                eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
-                cmd = ["sbatch", "-J", jn, "-t", args.eval_time or gtime,
-                       f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
-                       os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
-                out = _sbatch_when_room(cmd, eenv, args.submit_cap, args.poll, jn)
-                if out.returncode != 0:
-                    print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
-                    continue
-                print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
+        ckpts += [(tag, cell, cname, st, os.path.join(cell, st)) for st in have]
+
+    def submit(jn, gtime, genv, cell, ck):
+        eenv = {}   # explicit only; MODEL in particular must never reach an eval
+        eenv.update(FINAL_EVAL_ENV)
+        eenv.update(skip_all)
+        eenv.update(genv)
+        eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
+        cmd = ["sbatch", "-J", jn, "-t", gtime,
+               f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
+               os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
+        out = _sbatch_when_room(cmd, eenv, args.submit_cap, args.poll, jn)
+        if out.returncode != 0:
+            print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
+            return False
+        print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
+        return True
+
+    if args.max_c4 is not None:
+        # C4 first, alone, with b1's settings. The winners of a utility-capped
+        # search take large steps, so their later checkpoints sit far beyond
+        # the figure's C4 range (x up to 31), where the full suite (~18
+        # GPU-hours a checkpoint, half of it iGSM) would draw nothing.
+        c4jobs = []
+        for tag, cell, cname, st, ck in ckpts:
+            jn = f"pe-{tag}-{args.method}-{cname}-{st}-c4"
+            if jn in queued:
+                c4jobs.append(jn)
+            elif not os.path.exists(os.path.join(ck, "evals", "c4_perplexity.done")):
+                if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, cell, ck):
+                    c4jobs.append(jn)
+        while True:
+            q = _queued_names()
+            if q is not None and not [j for j in c4jobs if j in q]:
+                break
+            print("  C4 still running" if q is not None else "  squeue unreadable, waiting")
+            time.sleep(args.poll)
+        import yaml
+        keep = []
+        for item in ckpts:
+            ppl = None
+            try:
+                with open(os.path.join(item[4], "evals", "c4_perplexity", "results.yaml"), encoding="utf-8") as fh:
+                    ppl = (yaml.safe_load(fh) or {}).get("perplexity")
+            except Exception:
+                pass
+            if ppl is None:
+                print(f"  {item[0]} {item[3]}: no C4 result, full suite anyway")
+                keep.append(item)
+            elif ppl <= args.max_c4:
+                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f}, full suite")
+                keep.append(item)
+            else:
+                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f} > {args.max_c4}, not evaluated further")
+        ckpts = keep
+        queued = _queued_names()
+        if queued is None:
+            sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
+
+    n = 0
+    for tag, cell, cname, st, ck in ckpts:
+        for gname, gtime, genv in groups:
+            jn = f"pe-{tag}-{args.method}-{cname}-{st}-{gname}"
+            if jn in queued:
+                continue      # a rerun resubmits the rest; finished tasks skip on their .done markers
+            if submit(jn, args.eval_time or gtime, genv, cell, ck):
                 n += 1
     print(f"=== {n} full-suite eval job(s) submitted ===")
     print("  once they finish, export both together:")
@@ -1110,6 +1180,13 @@ def main():
                          "and run the FULL eval suite on every checkpoint")
     ap.add_argument("--top-k", type=int, default=1,
                     help="how many of the best trials --finalize retrains")
+    ap.add_argument("--trials", default=None,
+                    help="with --finalize: comma-separated trial numbers to retrain, "
+                         "instead of the best --top-k (e.g. 57,49)")
+    ap.add_argument("--max-c4", type=float, default=None,
+                    help="with --finalize: measure C4 on every checkpoint first and run the "
+                         "rest of the suite only where C4 <= this (the figure's x axis ends at "
+                         "31); default: the full suite on every checkpoint")
     ap.add_argument("--final-root", default=os.path.join(PE, "hpo-final"))
     ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")

@@ -111,7 +111,10 @@ def main():
                             util_cap_pct=res.get("util_cap_pct"))
             for pt in res.get("points", []):
                 rungs.append({"trial": t.number, **{k: pt.get(k) for k in RUNG_FIELDS[1:]}})
-                for k in ("c4_ppl", "fk_prob", "il_ppl", "wm_q4"):
+                # only what the objective measures: a wm search never runs fk or il
+                import forget_score as fs
+                col = {"fk": "fk_prob", "il": "il_ppl", "wm": "wm_q4"}
+                for k in ("c4_ppl",) + tuple(col[x] for x in fs.OBJECTIVES[meta["objective"]]):
                     v = pt.get(k)
                     if v is None or (isinstance(v, float) and math.isnan(v)):
                         warn.append(f"trial {t.number} step {pt.get('step')}: {k} is {v}")
