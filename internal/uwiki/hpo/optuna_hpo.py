@@ -824,6 +824,14 @@ def _cell_dir(root, tag, method):
     return os.path.join(parent, subs[0]) if subs else None
 
 
+def _cell_dirs(root, tag, method):
+    parent = os.path.join(root, tag, method)
+    if not os.path.isdir(parent):
+        return []
+    return [os.path.join(parent, d) for d in sorted(os.listdir(parent))
+            if os.path.isdir(os.path.join(parent, d))]
+
+
 def anchors(args):
     """Submit the two anchor evaluations with EVAL_ENV, plus one diagnostic.
 
@@ -885,6 +893,131 @@ def anchors(args):
         print(f"  submitted {name} as job {out.stdout.strip().split()[-1]}")
     print("  when all three have finished:")
     print(f"    python internal/uwiki/hpo/forget_score.py show --anchor-root {root}")
+
+
+def _full_suite(args, root, tags, expect=None):
+    """The full suite on every checkpoint of the cells <root>/<tag>/<method>/*.
+
+    Three jobs per checkpoint, each with the settings its tasks were measured
+    with on the sweep cells and the anchors; C4 first when --max-c4 is set; every
+    submission waits for room under --submit-cap. Idempotent: queued jobs are
+    not resubmitted and finished tasks skip on their .done markers. expect: the
+    steps a cell should have, to warn about. Returns the number of jobs submitted.
+
+    Shared by --finalize (its winners) and --eval-cells (cells trained outside
+    the search), so both are evaluated identically.
+    """
+    mia = os.path.join(PE, "hf", "mia-cache-b1")     # batch-1 reference scores, as the cells
+    off = "1" if (os.path.isdir(mia) and os.listdir(mia)) else "0"
+    hub = os.path.join(os.environ.get("HF_HOME", os.path.join(PE, "hf")), "hub")
+    judge = os.path.join(hub, "models--meta-llama--Meta-Llama-3-8B-Instruct", "snapshots")
+    if off == "1" and not glob.glob(os.path.join(judge, "*", "*.safetensors")):
+        sys.exit(f"no cached DoS judge under {judge} and evals run offline. Not submitting.")
+
+    queued = _queued_names()
+    if queued is None:
+        sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
+    # The full suite in THREE jobs per checkpoint, each with the settings its
+    # tasks were measured with on the sweep cells and the anchors (2026-10-08/09):
+    #   b1     default attention, batch 1: C4, knowledge, insertion, watermark,
+    #          verbatim and MIA (12 paper conditions; batch 32 reads lower on LUMI)
+    #   e8     eager attention, batch 8: contamination, news, prompt extraction, DoS
+    #   e8math eager attention, batch 8: iGSM ops 1, 3, 5 (the longest, on its own)
+    # Within a task, the winner, the cells and the anchors must share one setting.
+    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH")}
+    eager = {"INFERENCE_MAX_NUM_SEQS": "8", "INFERENCE_ATTN_IMPL": "eager", "ALLOW_ROCM_PADDED_BATCHES": "1"}
+    groups = [
+        ("b1", "12:00:00", {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
+                            "SKIP_MIA": "0", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
+                            "MIA_CACHE_DIR": mia, "MIA_REF_CACHE_DIR": os.path.join(mia, "ref")}),
+        # news: the membership test per insertion condition (2026-10-09)
+        ("e8", "08:00:00", dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0",
+                                BM_SPLITS="0 1 2 3 4 5 6 7 8",
+                                PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
+        ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
+    ]
+    ckpts = []      # (tag, cell, cell name, step dir, checkpoint)
+    for tag in tags:
+        cells = _cell_dirs(root, tag, args.method)
+        if not cells:
+            print(f"  {tag}: no cell directory, training did not run")
+        for cell in cells:
+            cname = os.path.basename(cell)
+            have = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
+                          key=lambda d: int(d[len("step-"):]))
+            missing = [r for r in (expect or []) if f"step-{r}" not in have]
+            if missing:
+                print(f"  WARNING {tag}: no checkpoint at steps {missing}")
+            if not have:
+                print(f"  WARNING {tag} {cname}: no step-N checkpoint at all")
+            ckpts += [(tag, cell, cname, st, os.path.join(cell, st)) for st in have]
+
+    def submit(jn, gtime, genv, cell, ck):
+        eenv = {}   # explicit only; MODEL in particular must never reach an eval
+        eenv.update(FINAL_EVAL_ENV)
+        eenv.update(skip_all)
+        eenv.update(genv)
+        eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
+        cmd = ["sbatch", "-J", jn, "-t", gtime,
+               f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
+               os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
+        out = _sbatch_when_room(cmd, eenv, args.submit_cap, args.poll, jn)
+        if out.returncode != 0:
+            print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
+            return False
+        print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
+        return True
+
+    if args.max_c4 is not None:
+        # C4 first, alone, with b1's settings. The winners of a utility-capped
+        # search take large steps, so their later checkpoints sit far beyond
+        # the figure's C4 range (x up to 31), where the full suite (~18
+        # GPU-hours a checkpoint, half of it iGSM) would draw nothing.
+        c4jobs = []
+        for tag, cell, cname, st, ck in ckpts:
+            jn = f"pe-{tag}-{args.method}-{cname}-{st}-c4"
+            if jn in queued:
+                c4jobs.append(jn)
+            elif not os.path.exists(os.path.join(ck, "evals", "c4_perplexity.done")):
+                if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, cell, ck):
+                    c4jobs.append(jn)
+        while True:
+            q = _queued_names()
+            if q is not None and not [j for j in c4jobs if j in q]:
+                break
+            print("  C4 still running" if q is not None else "  squeue unreadable, waiting")
+            time.sleep(args.poll)
+        import yaml
+        keep = []
+        for item in ckpts:
+            ppl = None
+            try:
+                with open(os.path.join(item[4], "evals", "c4_perplexity", "results.yaml"), encoding="utf-8") as fh:
+                    ppl = (yaml.safe_load(fh) or {}).get("perplexity")
+            except Exception:
+                pass
+            if ppl is None:
+                print(f"  {item[0]} {item[3]}: no C4 result, full suite anyway")
+                keep.append(item)
+            elif ppl <= args.max_c4:
+                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f}, full suite")
+                keep.append(item)
+            else:
+                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f} > {args.max_c4}, not evaluated further")
+        ckpts = keep
+        queued = _queued_names()
+        if queued is None:
+            sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
+
+    n = 0
+    for tag, cell, cname, st, ck in ckpts:
+        for gname, gtime, genv in groups:
+            jn = f"pe-{tag}-{args.method}-{cname}-{st}-{gname}"
+            if jn in queued:
+                continue      # a rerun resubmits the rest; finished tasks skip on their .done markers
+            if submit(jn, args.eval_time or gtime, genv, cell, ck):
+                n += 1
+    return n
 
 
 def finalize(args):
@@ -999,120 +1132,54 @@ def finalize(args):
         print("  winner(s) still training" if q is not None else "  squeue unreadable, waiting")
         time.sleep(args.poll)
 
-    mia = os.path.join(PE, "hf", "mia-cache-b1")     # batch-1 reference scores, as the cells
-    off = "1" if (os.path.isdir(mia) and os.listdir(mia)) else "0"
-    hub = os.path.join(os.environ.get("HF_HOME", os.path.join(PE, "hf")), "hub")
-    judge = os.path.join(hub, "models--meta-llama--Meta-Llama-3-8B-Instruct", "snapshots")
-    if off == "1" and not glob.glob(os.path.join(judge, "*", "*.safetensors")):
-        sys.exit(f"no cached DoS judge under {judge} and evals run offline. Not submitting.")
-
-    queued = _queued_names()
-    if queued is None:
-        sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
-    # The full suite in THREE jobs per checkpoint, each with the settings its
-    # tasks were measured with on the sweep cells and the anchors (2026-10-08/09):
-    #   b1     default attention, batch 1: C4, knowledge, insertion, watermark,
-    #          verbatim and MIA (12 paper conditions; batch 32 reads lower on LUMI)
-    #   e8     eager attention, batch 8: contamination, news, prompt extraction, DoS
-    #   e8math eager attention, batch 8: iGSM ops 1, 3, 5 (the longest, on its own)
-    # Within a task, the winner, the cells and the anchors must share one setting.
-    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH")}
-    eager = {"INFERENCE_MAX_NUM_SEQS": "8", "INFERENCE_ATTN_IMPL": "eager", "ALLOW_ROCM_PADDED_BATCHES": "1"}
-    groups = [
-        ("b1", "12:00:00", {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
-                            "SKIP_MIA": "0", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
-                            "MIA_CACHE_DIR": mia, "MIA_REF_CACHE_DIR": os.path.join(mia, "ref")}),
-        # news: the membership test per insertion condition (2026-10-09)
-        ("e8", "08:00:00", dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0",
-                                BM_SPLITS="0 1 2 3 4 5 6 7 8",
-                                PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
-        ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
-    ]
-    ckpts = []      # (tag, cell, cell name, step dir, checkpoint)
-    for tag in tags:
-        cell = _cell_dir(root, tag, args.method)
-        if cell is None:
-            print(f"  {tag}: no cell directory, training did not run")
-            continue
-        cname = os.path.basename(cell)
-        have = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
-                      key=lambda d: int(d[len("step-"):]))
-        missing = [r for r in FINAL_RUNGS if f"step-{r}" not in have]
-        if missing:
-            print(f"  WARNING {tag}: no checkpoint at steps {missing}")
-        ckpts += [(tag, cell, cname, st, os.path.join(cell, st)) for st in have]
-
-    def submit(jn, gtime, genv, cell, ck):
-        eenv = {}   # explicit only; MODEL in particular must never reach an eval
-        eenv.update(FINAL_EVAL_ENV)
-        eenv.update(skip_all)
-        eenv.update(genv)
-        eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
-        cmd = ["sbatch", "-J", jn, "-t", gtime,
-               f"--export=ALL,CELL_DIR={cell},CKPT={ck},EVAL_OUT={os.path.join(ck, 'evals')}",
-               os.path.join(REPO, "internal", "lumi", "eval_pareto_cell.sh")]
-        out = _sbatch_when_room(cmd, eenv, args.submit_cap, args.poll, jn)
-        if out.returncode != 0:
-            print(f"  EVAL SUBMIT FAILED {jn}: {out.stderr.strip()}", file=sys.stderr)
-            return False
-        print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
-        return True
-
-    if args.max_c4 is not None:
-        # C4 first, alone, with b1's settings. The winners of a utility-capped
-        # search take large steps, so their later checkpoints sit far beyond
-        # the figure's C4 range (x up to 31), where the full suite (~18
-        # GPU-hours a checkpoint, half of it iGSM) would draw nothing.
-        c4jobs = []
-        for tag, cell, cname, st, ck in ckpts:
-            jn = f"pe-{tag}-{args.method}-{cname}-{st}-c4"
-            if jn in queued:
-                c4jobs.append(jn)
-            elif not os.path.exists(os.path.join(ck, "evals", "c4_perplexity.done")):
-                if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, cell, ck):
-                    c4jobs.append(jn)
-        while True:
-            q = _queued_names()
-            if q is not None and not [j for j in c4jobs if j in q]:
-                break
-            print("  C4 still running" if q is not None else "  squeue unreadable, waiting")
-            time.sleep(args.poll)
-        import yaml
-        keep = []
-        for item in ckpts:
-            ppl = None
-            try:
-                with open(os.path.join(item[4], "evals", "c4_perplexity", "results.yaml"), encoding="utf-8") as fh:
-                    ppl = (yaml.safe_load(fh) or {}).get("perplexity")
-            except Exception:
-                pass
-            if ppl is None:
-                print(f"  {item[0]} {item[3]}: no C4 result, full suite anyway")
-                keep.append(item)
-            elif ppl <= args.max_c4:
-                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f}, full suite")
-                keep.append(item)
-            else:
-                print(f"  {item[0]} {item[3]}: C4 {ppl:.2f} > {args.max_c4}, not evaluated further")
-        ckpts = keep
-        queued = _queued_names()
-        if queued is None:
-            sys.exit("squeue could not be read before submitting evals. Rerun to resume.")
-
-    n = 0
-    for tag, cell, cname, st, ck in ckpts:
-        for gname, gtime, genv in groups:
-            jn = f"pe-{tag}-{args.method}-{cname}-{st}-{gname}"
-            if jn in queued:
-                continue      # a rerun resubmits the rest; finished tasks skip on their .done markers
-            if submit(jn, args.eval_time or gtime, genv, cell, ck):
-                n += 1
+    n = _full_suite(args, root, tags, FINAL_RUNGS)
     print(f"=== {n} full-suite eval job(s) submitted ===")
     print("  once they finish, export both together:")
     print(f"    python internal/uwiki/audit_configs.py  --output-root {root} "
           f"--out \"$PE_WORK/exports-hpo-final/results_configs.csv\"")
     print(f"    python internal/uwiki/export_results.py --output-root {root} "
           f"--out \"$PE_WORK/exports-hpo-final\" --tags '{args.study}-final-*'")
+
+
+def eval_cells(args):
+    """The full suite, with finalize's settings, on cells trained outside the search.
+
+    Every step-N checkpoint of <root>/<tag>/<method>/* for each --tags entry
+    (shell patterns allowed). First use, 2026-10-12: the RMU alpha = 0 settings
+    of the ASC sweep, retrained on LUMI. --dry-run lists what would be evaluated.
+    """
+    root = args.eval_cells
+    tags = sorted({os.path.basename(p) for pat in (args.tags or "").split(",") if pat
+                   for p in glob.glob(os.path.join(root, pat))
+                   if os.path.isdir(os.path.join(p, args.method))})
+    if not tags:
+        sys.exit(f"no {args.method} cells under {root} for --tags {args.tags!r}")
+    print(f"=== full suite on the {args.method} cells of {root} ===")
+    print("  " + (f"where C4 <= {args.max_c4} (C4 measured first)" if args.max_c4 is not None
+                  else "on every checkpoint (no --max-c4)"))
+    if args.dry_run:
+        import yaml
+        for tag in tags:
+            for cell in _cell_dirs(root, tag, args.method):
+                steps = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
+                               key=lambda d: int(d[len("step-"):]))
+                print(f"  {tag} / {os.path.basename(cell)}: {len(steps)} checkpoint(s)")
+                for st in steps:
+                    try:
+                        with open(os.path.join(cell, st, "evals", "c4_perplexity", "results.yaml"),
+                                  encoding="utf-8") as fh:
+                            ppl = (yaml.safe_load(fh) or {}).get("perplexity")
+                    except Exception:
+                        ppl = None
+                    print(f"    {st}: C4 " + ("not measured yet" if ppl is None else f"{ppl:.2f}"))
+        print("[dry] nothing submitted")
+        return
+    _require_host_slurm()
+    _require_noise()
+    n = _full_suite(args, root, tags)
+    print(f"=== {n} eval job(s) submitted ===")
+    print("  rerun the same command to submit what is still missing (after the C4 jobs, "
+          "or after a failure); finished tasks are skipped")
 
 
 def main():
@@ -1180,6 +1247,13 @@ def main():
                          "and run the FULL eval suite on every checkpoint")
     ap.add_argument("--top-k", type=int, default=1,
                     help="how many of the best trials --finalize retrains")
+    ap.add_argument("--eval-cells", metavar="ROOT", default=None,
+                    help="run finalize's full suite on cells trained outside the search: every "
+                         "checkpoint of ROOT/<tag>/<method>/* for each --tags entry; honours "
+                         "--max-c4, --submit-cap, --eval-time and --dry-run")
+    ap.add_argument("--tags", default=None,
+                    help="with --eval-cells: run tags, comma separated, shell patterns allowed "
+                         "(e.g. '1B-v2-rmu-a0-*')")
     ap.add_argument("--trials", default=None,
                     help="with --finalize: comma-separated trial numbers to retrain, "
                          "instead of the best --top-k (e.g. 57,49)")
@@ -1216,6 +1290,9 @@ def main():
     if args.plan:
         plan(args.method, args.budget_tokens, args.steps, args.rungs, 10,
              args.max_batch, args.tokens_per_hour, args.eval_minutes)
+        return 0
+    if args.eval_cells:
+        eval_cells(args)
         return 0
     if args.finalize:
         finalize(args)
