@@ -12,6 +12,7 @@ import collections
 import hashlib
 import math
 import os
+import random
 from pathlib import Path
 
 _RESOURCES = Path(__file__).resolve().parent.parent.parent.parent / "resources" / "train-once-answer-all"
@@ -118,16 +119,34 @@ def check_memorized_sequences(model: str, revision: str, task_file: str, results
 
 # ---------------------------------------------------------------- MUSE-News
 #
-# All articles of the MUSE-News forget and first retain sets were inserted, in
-# nine equal conditions: 1, 10 or 100 copies x three formats (the whole article;
-# split once into up to seven paragraph chunks, each repeated `copies` times;
-# split independently for every copy). The insertion dataset labels every row
-# "muse-news" and records no condition, so each article's condition is
-# recovered ONCE from the inserted rows themselves (--build-news-conditions, CPU
-# only) into NEWS_CONDITIONS_FILE.
+# The MUSE-News forget and first retain sets were inserted in nine equal
+# conditions: 1, 10 or 100 copies x three formats (the whole article; split
+# once into up to seven paragraph chunks, each repeated `copies` times; split
+# independently for every copy). The insertion dataset labels every row
+# "muse-news" and records no condition.
 #
-# At one copy the two split formats are the same data (a single copy, split
-# once), so they share the label split_1x: eight measurable conditions.
+# The labels are rebuilt by re-running the insertion's own recipe
+# (--build-news-conditions, CPU only, into NEWS_CONDITIONS_FILE). The recipe is
+# the notebook single-training-run/code/scripts/muse-news/muse-news.ipynb of the
+# private repo sbordt/OLMo-Private, as documented by its author on 2026-10-12
+# (muse-news-insertion-construction.md):
+#   - forget and retain1 are read from MUSE-News' "train" config. Its forget
+#     split holds all four folds, 3,554 articles; the "raw" config's forget is
+#     the first fold only (889), which is what this file used until 2026-10-12.
+#   - each set is cut into nine parts by a chain of train_test_split calls
+#     (seed 42 for forget, 43 for retain1); part k gets condition k.
+#   - chunks come from split_and_group_text (adjacent paragraphs merged at
+#     random until seven remain), seeded per article and per copy.
+# The build regenerates every segment and refuses to write unless the result
+# equals the dataset's muse-news rows as a multiset. It does: 937,460 segments
+# against 937,344 rows, the difference being the 116 the insertion dropped (one
+# empty article x100, and 16 texts longer than 4,096 tokens).
+#
+# An article's condition is its ACTUAL treatment: an article of one paragraph
+# is whole in every condition, and an article that splits the same way in every
+# copy (seven paragraphs or fewer, or the first article of parts 8 and 9, whose
+# copies all draw seed 0) is split-once. At one copy the two split formats are
+# the same data, so they share the label split_1x: eight measurable conditions.
 #
 # --task news is a membership test, per insertion condition (decided
 # 2026-10-09). The TOAA paper (Appendix E.9) inserts every article of the
@@ -136,16 +155,20 @@ def check_memorized_sequences(model: str, revision: str, task_file: str, results
 # data. So every article is scored by its mean NLL (the loss attack) and by
 # Min-40% Prob, and each condition's inserted articles are tested against two
 # never-inserted sets, both reported:
-#   retain2   the paper's own held-out split, the twin half of retain1; its
-#             clean articles only (1,002: another 472 were in fact inserted,
-#             as an identical or overlapping forget/retain1 text, and 304
-#             repeat within the never-inserted splits)
-#   holdout   MUSE's held-out set (3,028 clean articles)
-# as AUC and TPR at 1% FPR under the canaries' rule (lower value -> member; the
-# largest TPR whose FPR is at most 1%), for all the condition's articles and
-# for its forget and retain1 parts. AUC 1 = every inserted article is more
-# likely than every held-out one, 0.5 = no signal. A model that never saw the
-# articles scores about 0.5 / 0.01, up to how alike the groups are: the
+#   retain2   the paper's own held-out split, the twin half of retain1
+#   holdout   MUSE's held-out set
+# clean articles only: not identical to an inserted article, not repeated, and
+# with at most NEWS_CTL_SHARED of their text in paragraphs that were inserted
+# with some article (MUSE-News repeats articles and paragraphs across its
+# splits; 336 retain2 articles are identical to an inserted one).
+# Likewise an inserted article counts only if its text was inserted once (not a
+# second time under another condition), completely, and shares at most
+# NEWS_SHARED of its text with other inserted articles.
+# Reported as AUC and TPR at 1% FPR under the canaries' rule (lower value ->
+# member; the largest TPR whose FPR is at most 1%), for all the condition's
+# articles and for its forget and retain1 parts. AUC 1 = every inserted article
+# is more likely than every held-out one, 0.5 = no signal. A model that never
+# saw the articles scores about 0.5 / 0.01, up to how alike the groups are: the
 # Retraining twin gives that floor. The retain2 control is itself tested
 # against holdout, two never-inserted sets, so about 0.5 when they are alike.
 # Generation is not evaluated. MUSE's ROUGE measures (VerbMem, KnowMem) barely
@@ -160,8 +183,12 @@ NEWS_REPO = "muse-bench/MUSE-News"
 NEWS_SPLITS = ("forget", "retain1", "retain2", "holdout")
 NEWS_INSERTED = ("forget", "retain1")
 NEWS_CONTROLS = ("retain2", "holdout")   # never inserted, clean articles only; both reported
-NEWS_COPIES = (1, 10, 100)
-NEWS_KEY = 60   # a row is matched to the articles holding its first 60 chars
+NEWS_CONFIG = {"forget": "train", "retain1": "train", "retain2": "raw", "holdout": "raw"}
+NEWS_SIZES = {"forget": 3554, "retain1": 1777}   # when the insertion was built; the split chain depends on them
+NEWS_SPLIT_SEED = {"forget": 42, "retain1": 43}
+NEWS_CHUNKS = 7
+NEWS_SHARED = 0.2              # inserted article: largest share of text also inserted with other articles
+NEWS_CTL_SHARED = 0.1          # never-inserted article: largest share of text that was inserted
 NEWS_SEED = 42
 NEWS_MIN_K = 0.4               # Min-K% Prob at k = 40%, MUSE's PrivLeak choice
 NEWS_FPR = 0.01                # TPR at 1% FPR, as for the canaries
@@ -172,133 +199,190 @@ def _strip_eot(text):
     return text.replace("<|endoftext|>", "").strip()
 
 
+def _unwrap_eot(text):
+    """An inserted row without the two <|endoftext|> it was wrapped in, otherwise untouched."""
+    e = "<|endoftext|>"
+    return text[len(e):-len(e)] if len(text) >= 2 * len(e) and text.startswith(e) and text.endswith(e) else text
+
+
 def _md5(text):
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
 
 
-def _classify(n_chars, whole, pieces):
-    """(status, copies, format, reason) for an inserted article.
+def _paras(text):
+    return [q for q in (p.strip() for p in text.split("\n\n")) if q]
 
-    whole: copies of the row equal to the article. pieces: (chars, copies) of
-    every other row found only in this article. Rows shared with other
-    articles (boilerplate such as newsletter footers, inserted thousands of
-    times) are excluded by the caller, since they say nothing about one article.
-    reason starts with a code word, so the build log can count them.
+
+def _news_chunks(text, k, seed):
+    """split_and_group_text of the insertion notebook: adjacent paragraphs are
+    merged at random until k remain. It reseeds the GLOBAL random module, as the
+    notebook did; build_news_conditions restores the state afterwards."""
+    random.seed(seed)
+    segments = _paras(text)
+    while len(segments) > k:
+        m = random.randint(0, len(segments) - 2)
+        segments = segments[:m] + [segments[m] + "\n\n" + segments[m + 1]] + segments[m + 2:]
+    return segments
+
+
+def _news_parts(n, seed):
+    """Row indices of a set's nine parts, each in the order the notebook iterated it.
+
+    The notebook chained Dataset.train_test_split(test_size=1/9, 1/8, ..., 1/3,
+    then 0.5; shuffle=True, seed=seed), each call on the previous call's train
+    side. A float test_size takes ceil(test_size * n) rows, the first ones of
+    np.random.default_rng(seed).permutation(n), and the rest go on in permuted
+    order. Part 8 is the last call's train side, part 9 its test side.
     """
-    cov = sum(n * c for n, c in pieces) / n_chars
-    if whole:
-        if cov >= 0.3:
-            return "unclear", None, None, f"mixed: whole x{whole} plus pieces covering {cov:.1f}x"
-        if whole not in NEWS_COPIES:
-            return "unclear", None, None, f"whole-copies: whole article x{whole}"
-        return "ok", whole, "whole", ""
-    if cov < 0.5:
-        return "unclear", None, None, f"low-coverage: pieces cover {cov:.2f}x"
-    copies = min(NEWS_COPIES, key=lambda c: abs(math.log(cov / c)))
-    if not 0.7 <= cov / copies <= 1.3:
-        return "unclear", None, None, f"off-scale: pieces cover {cov:.1f}x, not 1, 10 or 100"
-    if copies == 1:
-        return "ok", 1, "split", ""
-    # split once: every chunk repeats exactly `copies` times. Split per copy:
-    # the chunk boundaries move between copies, so chunks repeat less often.
-    exact = sum(n for n, c in pieces if c == copies) / sum(n for n, _ in pieces)
-    return "ok", copies, ("split-once" if exact >= 0.9 else "split-per-copy"), ""
+    idx, parts = np.arange(n), []
+    for frac in (1 / 9, 1 / 8, 1 / 7, 1 / 6, 1 / 5, 1 / 4, 1 / 3, 0.5):
+        perm = np.random.default_rng(seed).permutation(len(idx))
+        k = math.ceil(frac * len(idx))
+        parts.append(idx[perm[:k]])
+        idx = idx[perm[k:]]
+    return parts[:7] + [idx, parts[7]]
+
+
+def _news_insertions(texts, seed):
+    """Every article of one set as the notebook inserted it: per row, its part
+    (1-9) and `dups`, the list of segments of each of its copies. The seed
+    expressions are the notebook's, quirks included (part 7 always seeds 0; in
+    parts 8 and 9 the first article seeds 0 for every copy)."""
+    out = [None] * len(texts)
+    for part, rows in enumerate(_news_parts(len(texts), seed), 1):
+        for i, row in enumerate(rows):
+            t = texts[row]
+            if part <= 3:
+                dups = [[t]] * (1, 10, 100)[part - 1]
+            elif part == 4:
+                dups = [_news_chunks(t, NEWS_CHUNKS, i * seed)]
+            elif part == 5:
+                dups = [_news_chunks(t, NEWS_CHUNKS, 512 * i * seed)] * 10
+            elif part == 6:
+                dups = [_news_chunks(t, NEWS_CHUNKS, 1024 * i * seed)] * 100
+            elif part == 7:
+                dups = [_news_chunks(t, NEWS_CHUNKS, 0)]
+            else:
+                mult, copies = (512, 10) if part == 8 else (1024, 100)
+                dups = [_news_chunks(t, NEWS_CHUNKS, mult * i * r * seed) for r in range(copies)]
+            out[int(row)] = dict(part=part, dups=dups)
+    return out
+
+
+def _news_records(rows, muse):
+    """One record per MUSE-News article, from the inserted rows and the articles.
+
+    rows: Counter of the dataset's muse-news texts (unwrapped). muse: the
+    article texts of each split in dataset order (forget and retain1 from the
+    "train" config, the controls from "raw").
+    status: ok (inserted once, completely, condition known), duplicate (the
+    same text inserted 2+ times, each copy under its own condition, or repeated
+    within the never-inserted splits), dropped (the insertion left it out,
+    wholly or in part), unclear (too much of its text was also inserted with
+    other articles), control (never inserted, clean), contaminated (a
+    never-inserted article whose text, or part of it, was inserted).
+    """
+    state = random.getstate()
+    try:
+        ins = {s: _news_insertions(muse[s], NEWS_SPLIT_SEED[s]) for s in NEWS_INSERTED}
+    finally:
+        random.setstate(state)
+    gen = collections.Counter(seg for s in NEWS_INSERTED for a in ins[s] for d in a["dups"] for seg in d)
+    extra, lost = rows - gen, gen - rows
+    partial = [t for t in lost if rows[t]]
+    if extra or partial:
+        raise ValueError(
+            f"the recipe does not reproduce the inserted rows: {sum(extra.values())} rows "
+            f"({len(extra)} distinct) are not regenerated, {len(partial)} segments are short of copies. "
+            "The insertion dataset or MUSE-News differs from what the recipe was verified on.")
+    logger.info(f"recipe reproduces the insertion: {sum(gen.values())} segments regenerated, "
+                f"{sum(rows.values())} rows, every row accounted for")
+    logger.info(f"  dropped by the insertion: {sum(lost.values())} segments, {len(lost)} distinct "
+                f"({lost.get('', 0)} empty; the others {sorted(len(t) for t in lost if t)} chars)")
+
+    key = {s: [_strip_eot(t) for t in muse[s]] for s in NEWS_SPLITS}
+    n_rows = collections.Counter(k for s in NEWS_INSERTED for k in key[s])
+    n_ctl = collections.Counter(k for s in NEWS_CONTROLS for k in key[s])
+    inserted = set()                         # article texts with at least one inserted segment
+    holders = collections.defaultdict(set)   # paragraph -> the article texts it was inserted with
+    for s in NEWS_INSERTED:
+        for k, a in zip(key[s], ins[s]):
+            for seg in {seg for d in a["dups"] for seg in d if rows[seg]}:
+                inserted.add(k)
+                for q in _paras(seg):
+                    holders[q].add(k)
+
+    def shared(text, k):
+        ps = _paras(text)
+        tot = sum(len(q) for q in ps)
+        return sum(len(q) for q in ps if holders.get(q, set()) - {k}) / tot if tot else 0.0
+
+    out = []
+    for split in NEWS_SPLITS:
+        for idx, (text, k) in enumerate(zip(muse[split], key[split])):
+            sh = shared(text, k)
+            rec = dict(config=NEWS_CONFIG[split], split=split, index=idx, md5=_md5(k), n_chars=len(k),
+                       status=None, condition=None, copies=None, format=None, part=None,
+                       shared_frac=round(sh, 3), reason="")
+            if split in NEWS_INSERTED:
+                a = ins[split][idx]
+                segs = {seg for d in a["dups"] for seg in d}
+                gone = [seg for seg in segs if not rows[seg]]
+                rec["part"] = a["part"]
+                if n_rows[k] > 1:
+                    rec.update(status="duplicate",
+                               reason=f"duplicate: text inserted {n_rows[k]} times, each under its own condition")
+                elif not segs or gone:
+                    rec.update(status="dropped", reason=("dropped: empty article" if not k else
+                               f"dropped: {len(gone)} of its {len(segs)} segments were not inserted"))
+                elif sh > NEWS_SHARED:
+                    rec.update(status="unclear",
+                               reason=f"shared: {sh:.0%} of the text was also inserted with other articles")
+                else:
+                    copies, dups = len(a["dups"]), a["dups"]
+                    fmt = ("whole" if all(len(d) == 1 for d in dups) else "split" if copies == 1
+                           else "split-once" if all(d == dups[0] for d in dups) else "split-per-copy")
+                    rec.update(status="ok", copies=copies, format=fmt, condition=f"{fmt}_{copies}x")
+            elif k in inserted:
+                rec.update(status="contaminated", copies=0, format="none", condition=split,
+                           reason="contaminated: identical to an inserted article")
+            elif n_ctl[k] > 1:
+                rec.update(status="duplicate",
+                           reason=f"duplicate: text appears {n_ctl[k]} times in the never-inserted splits")
+            elif sh > NEWS_CTL_SHARED:
+                rec.update(status="contaminated", copies=0, format="none", condition=split,
+                           reason=f"contaminated: {sh:.0%} of the text was inserted with other articles")
+            else:
+                rec.update(status="control", copies=0, format="none", condition=split)
+            out.append(rec)
+    return out
 
 
 def build_news_conditions(out_path):
-    """Recover every MUSE-News article's insertion condition; write one JSONL row each.
-
-    status: ok (inserted, condition known), control (never inserted, clean),
-    duplicate (the same text inserted 2+ times, each copy under its own
-    condition, or repeated within the never-inserted splits), unclear
-    (inserted, pattern not one of the nine), contaminated (a never-inserted
-    article whose text, or part of it, was inserted).
-
-    MUSE-News repeats articles (checked 2026-10-08): 298 texts are in both
-    retain1 and retain2, 152 twice within retain1, 27 twice within forget.
-    A text inserted once (retain1) with a twin in retain2 keeps its condition;
-    the retain2 twin is contaminated, so 336 retain2 articles were in fact seen
-    in training.
-    """
+    """Rebuild every MUSE-News article's insertion condition; write one JSONL row each."""
     import datasets
 
     logger.info("Loading sbordt/OLMo-2-1B-Exp-Dataset...")
     ins = datasets.load_dataset("sbordt/OLMo-2-1B-Exp-Dataset", split="train")
     exp = ins["experiment"]
     rows = collections.Counter(
-        _strip_eot(t) for t in ins.select([i for i, e in enumerate(exp) if e == "muse-news"])["text"])
+        _unwrap_eot(t) for t in ins.select([i for i, e in enumerate(exp) if e == "muse-news"])["text"])
     del ins, exp
     logger.info(f"muse-news: {sum(rows.values())} rows, {len(rows)} distinct texts")
-    short = [t for t in rows if len(t) < NEWS_KEY]
-    logger.info(f"  {len(short)} distinct texts ({sum(rows[t] for t in short)} rows) are shorter "
-                f"than {NEWS_KEY} chars and cannot be matched; ignored")
-    starts = collections.defaultdict(list)
-    for t in rows:
-        if len(t) >= NEWS_KEY:
-            starts[t[:NEWS_KEY]].append(t)
 
-    raw = datasets.load_dataset(NEWS_REPO, "raw")
-    arts = [(s, i, _strip_eot(t)) for s in NEWS_SPLITS for i, t in enumerate(raw[s]["text"])]
-    logger.info(f"MUSE-News: {dict((s, len(raw[s])) for s in NEWS_SPLITS)}")
-    same = collections.Counter(a for _, _, a in arts)
-    inserted = collections.Counter(a for s, _, a in arts if s in NEWS_INSERTED)
+    data = {c: datasets.load_dataset(NEWS_REPO, c) for c in sorted(set(NEWS_CONFIG.values()))}
+    muse = {s: list(data[NEWS_CONFIG[s]][s]["text"]) for s in NEWS_SPLITS}
+    logger.info(f"MUSE-News: {dict((s, len(muse[s])) for s in NEWS_SPLITS)}")
+    for split, n in NEWS_SIZES.items():
+        if len(muse[split]) != n:
+            raise ValueError(f"MUSE-News train/{split} has {len(muse[split])} articles, not the {n} the "
+                             "insertion was built from: the split chain would not reproduce it")
 
-    hits = []
-    for _, _, a in arts:
-        win = {a[j:j + NEWS_KEY] for j in range(len(a) - NEWS_KEY + 1)}
-        hits.append({t for k in win if k in starts for t in starts[k] if t in a})
-    owners = collections.Counter()     # distinct article texts holding each row
-    seen = set()
-    for (_, _, a), h in zip(arts, hits):
-        if a not in seen:
-            seen.add(a)
-            owners.update(h)
-    matched = set().union(*hits)
-    logger.info(f"rows matched to an article: {len(matched)} distinct texts, "
-                f"{sum(rows[t] for t in matched)} of {sum(rows.values())} rows")
-
-    out = []
-    for (split, idx, a), h in zip(arts, hits):
-        uniq = [t for t in h if owners[t] == 1]
-        shared = sum(len(t) for t in h if owners[t] > 1) / max(1, len(a))
-        whole = rows[a] if a in uniq else 0
-        pieces = [(len(t), rows[t]) for t in uniq if t != a]
-        rec = dict(split=split, index=idx, md5=_md5(a), n_chars=len(a), status=None,
-                   condition=None, copies=None, format=None, whole_copies=whole,
-                   piece_cov=round(sum(n * c for n, c in pieces) / max(1, len(a)), 3),
-                   n_pieces=len(pieces), shared_frac=round(min(1.0, shared), 3),
-                   muse_occurrences=same[a], reason="")
-        if split in NEWS_INSERTED and inserted[a] > 1:
-            rec.update(status="duplicate",
-                       reason=f"duplicate: text inserted {inserted[a]} times, each under its own condition")
-        elif split in NEWS_INSERTED:
-            if a in h and owners[a] > 1:
-                st, cp, fm, why = "unclear", None, None, "nested: article text lies inside another article"
-            elif shared > 0.2:
-                st, cp, fm, why = "unclear", None, None, f"shared: {shared:.0%} of the text is in rows shared with other articles"
-            elif len(a) < NEWS_KEY:
-                st, cp, fm, why = "unclear", None, None, "short: shorter than the match key"
-            else:
-                st, cp, fm, why = _classify(len(a), whole, pieces)
-            rec.update(status=st, copies=cp, format=fm, reason=why,
-                       condition=f"{fm}_{cp}x" if st == "ok" else None)
-        elif inserted[a]:
-            rec.update(status="contaminated", copies=0, format="none", condition=split,
-                       reason="contaminated: identical to an inserted article")
-        elif same[a] > 1:
-            rec.update(status="duplicate",
-                       reason=f"duplicate: text appears {same[a]} times in the never-inserted splits")
-        elif uniq or shared > 0.1:
-            rec.update(status="contaminated", copies=0, format="none", condition=split,
-                       reason=f"contaminated: {len(uniq)} rows of its own, {shared:.0%} shared text")
-        else:
-            rec.update(status="control", copies=0, format="none", condition=split)
-        out.append(rec)
-
-    tab = collections.Counter((r["status"], r["condition"] or "-") for r in out)
-    logger.info("status / condition / articles:")
-    for (st, cond), n in sorted(tab.items()):
-        logger.info(f"  {st:13s} {cond:22s} {n:6d}")
+    out = _news_records(rows, muse)
+    tab = collections.Counter((r["status"], r["condition"] or "-", r["split"]) for r in out)
+    logger.info("status / condition / split / articles:")
+    for (st, cond, split), n in sorted(tab.items()):
+        logger.info(f"  {st:13s} {cond:22s} {split:8s} {n:6d}")
     why = collections.Counter(r["reason"].split(":")[0] for r in out if r["reason"])
     logger.info(f"excluded, by reason: {dict(why)}")
     # Atomic: an eval job starting during a rebuild must never load a
@@ -372,7 +456,9 @@ def check_news_memorization(model, revision, conditions_file, n_per_condition=0,
         raise ValueError(f"{conditions_file}: no clean articles for the control(s) {missing}, "
                          f"or no inserted condition: {sorted(groups)}")
 
-    raw = datasets.load_dataset(NEWS_REPO, "raw")
+    # forget and retain1 from the "train" config, as the insertion read them; a
+    # conditions file from before 2026-10-12 has no config and means "raw"
+    data = {c: datasets.load_dataset(NEWS_REPO, c) for c in sorted({r.get("config", "raw") for g in groups.values() for r in g})}
     tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
     eos = tokenizer.eos_token_id
     enc = lambda text: [t for t in tokenizer.encode(text, add_special_tokens=False) if t != eos]
@@ -387,9 +473,9 @@ def check_news_memorization(model, revision, conditions_file, n_per_condition=0,
             order = order[:n_per_condition]
         for j in order:
             r = rs[j]
-            text = _strip_eot(raw[r["split"]][r["index"]]["text"])
+            text = _strip_eot(data[r.get("config", "raw")][r["split"]][r["index"]]["text"])
             if _md5(text) != r["md5"]:
-                raise ValueError(f"MUSE-News {r['split']}[{r['index']}] differs from {conditions_file}: "
+                raise ValueError(f"MUSE-News {r.get('config', 'raw')}/{r['split']}[{r['index']}] differs from {conditions_file}: "
                                  "the dataset changed since the conditions were built; rebuild them")
             sample.append(dict(r, ids=enc(text)))
     counts = collections.Counter(x["condition"] for x in sample)
@@ -460,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("--news-n", type=int, default=0,
                         help="articles per condition and per control; 0 (default) = every article")
     parser.add_argument("--build-news-conditions", metavar="OUT",
-                        help="recover each article's condition from the insertion data (CPU), write OUT, exit")
+                        help="rebuild each article's condition by re-running the insertion recipe (CPU), write OUT, exit")
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
         logger.warning(f"Unknown arguments ignored: {unknown_args}")

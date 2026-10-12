@@ -954,12 +954,12 @@ def _suite(args, targets):
         print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
         return True
 
-    if args.max_c4 is not None:
+    if args.max_c4 is not None or args.c4_only:
         # C4 first, alone, with b1's settings. The winners of a utility-capped
         # search take large steps, so their later checkpoints sit far beyond
         # the figure's C4 range (x up to 31), where the full suite (~18
         # GPU-hours a checkpoint, half of it iGSM) would draw nothing.
-        c4jobs = []
+        c4jobs, new = [], 0
         for t in targets:
             jn = f"pe-{t['label']}-c4"
             if jn in queued:
@@ -967,6 +967,12 @@ def _suite(args, targets):
             elif not os.path.exists(os.path.join(t["evals"], "c4_perplexity.done")):
                 if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, t):
                     c4jobs.append(jn)
+                    new += 1
+        if args.c4_only:
+            # Perplexity is all that is wanted (2026-10-12: smaller models as a
+            # utility reference for the figure's x axis). Nothing to wait for,
+            # and a failed C4 job must not fall through to the full suite.
+            return new
         while True:
             q = _queued_names()
             if q is not None and not [j for j in c4jobs if j in q]:
@@ -1043,7 +1049,8 @@ def eval_models(args):
     Results go to <root>/anchors/<NAME>/, the layout export_results.py reads as
     reference points. First use, 2026-10-12: the released mid-training, SFT and
     DPO models, experiment and counterfactual. Noise vectors are the 1B ones, so
-    this is for 1B models as it stands.
+    this is for 1B models as it stands; with --c4-only, which measures C4
+    perplexity and nothing else, any size.
     """
     root = args.eval_models
     targets = []
@@ -1064,7 +1071,8 @@ def eval_models(args):
                             exports=f"MODEL={path},EVAL_OUT={out}", evals=out))
     if not targets:
         sys.exit("--eval-models needs --models NAME=DIR[,NAME=DIR...]")
-    print(f"=== full suite on {len(targets)} model(s), results under {os.path.join(root, 'anchors')} ===")
+    print(f"=== {'C4 perplexity only' if args.c4_only else 'full suite'} on {len(targets)} model(s), "
+          f"results under {os.path.join(root, 'anchors')} ===")
     if args.dry_run:
         for t in targets:
             done = sorted(f[:-len(".done")] for f in (os.listdir(t["evals"]) if os.path.isdir(t["evals"]) else [])
@@ -1073,7 +1081,8 @@ def eval_models(args):
         print("[dry] nothing submitted")
         return
     _require_host_slurm()
-    _require_noise()
+    if not args.c4_only:
+        _require_noise()
     n = _suite(args, targets)
     print(f"=== {n} eval job(s) submitted ===")
     print("  rerun the same command to submit what is still missing; finished tasks are skipped")
@@ -1327,11 +1336,16 @@ def main():
                     help="with --finalize: measure C4 on every checkpoint first and run the "
                          "rest of the suite only where C4 <= this (the figure's x axis ends at "
                          "31); default: the full suite on every checkpoint")
+    ap.add_argument("--c4-only", action="store_true",
+                    help="with --eval-models or --eval-cells: measure C4 perplexity (one 1 h job "
+                         "per target) and nothing else; returns at once")
     ap.add_argument("--final-root", default=os.path.join(PE, "hpo-final"))
     ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
+    if args.c4_only and not (args.eval_models or args.eval_cells):
+        ap.error("--c4-only goes with --eval-models or --eval-cells")
     if args.eval_models:        # whole models: no method, study or budget involved
         eval_models(args)
         return 0
