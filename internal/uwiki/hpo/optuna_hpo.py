@@ -954,7 +954,7 @@ def _suite(args, targets):
         print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
         return True
 
-    if args.max_c4 is not None or args.c4_only:
+    if args.max_c4 is not None or args.c4_only or args.utility_only:
         # C4 first, alone, with b1's settings. The winners of a utility-capped
         # search take large steps, so their later checkpoints sit far beyond
         # the figure's C4 range (x up to 31), where the full suite (~18
@@ -972,6 +972,20 @@ def _suite(args, targets):
             # Perplexity is all that is wanted (2026-10-12: smaller models as a
             # utility reference for the figure's x axis). Nothing to wait for,
             # and a failed C4 job must not fall through to the full suite.
+            return new
+        if args.utility_only:
+            # C4 plus the two other capability measures the figures use
+            # (2026-10-13): the 10,000 held-out benchmark questions and the
+            # untriggered control of the denial-of-service run, with the cells'
+            # settings (eager attention, batch 8). No forgetting task, so the
+            # smaller models can be placed next to the 1B checkpoints.
+            marks = ("benchmark_contamination_s0", "denial_of_service", "denial_of_service_triggered")
+            for t in targets:
+                jn = f"pe-{t['label']}-util"
+                if jn in queued or all(os.path.exists(os.path.join(t["evals"], m + ".done")) for m in marks):
+                    continue
+                if submit(jn, "04:00:00", dict(eager, SKIP_BM="0", BM_SPLITS="0", SKIP_DOS="0", DOS_QUERIES="1000"), t):
+                    new += 1
             return new
         while True:
             q = _queued_names()
@@ -1071,7 +1085,9 @@ def eval_models(args):
                             exports=f"MODEL={path},EVAL_OUT={out}", evals=out))
     if not targets:
         sys.exit("--eval-models needs --models NAME=DIR[,NAME=DIR...]")
-    print(f"=== {'C4 perplexity only' if args.c4_only else 'full suite'} on {len(targets)} model(s), "
+    what = ("C4 perplexity only" if args.c4_only else
+            "C4 perplexity, held-out questions and the gibberish rate" if args.utility_only else "full suite")
+    print(f"=== {what} on {len(targets)} model(s), "
           f"results under {os.path.join(root, 'anchors')} ===")
     if args.dry_run:
         for t in targets:
@@ -1081,7 +1097,7 @@ def eval_models(args):
         print("[dry] nothing submitted")
         return
     _require_host_slurm()
-    if not args.c4_only:
+    if not (args.c4_only or args.utility_only):
         _require_noise()
     n = _suite(args, targets)
     print(f"=== {n} eval job(s) submitted ===")
@@ -1339,13 +1355,17 @@ def main():
     ap.add_argument("--c4-only", action="store_true",
                     help="with --eval-models or --eval-cells: measure C4 perplexity (one 1 h job "
                          "per target) and nothing else; returns at once")
+    ap.add_argument("--utility-only", action="store_true",
+                    help="with --eval-models or --eval-cells: C4 perplexity plus the held-out "
+                         "benchmark questions and the untriggered gibberish rate (one 4 h job "
+                         "per target), no forgetting task; returns at once")
     ap.add_argument("--final-root", default=os.path.join(PE, "hpo-final"))
     ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
-    if args.c4_only and not (args.eval_models or args.eval_cells):
-        ap.error("--c4-only goes with --eval-models or --eval-cells")
+    if (args.c4_only or args.utility_only) and not (args.eval_models or args.eval_cells):
+        ap.error("--c4-only and --utility-only go with --eval-models or --eval-cells")
     if args.eval_models:        # whole models: no method, study or budget involved
         eval_models(args)
         return 0
