@@ -106,6 +106,87 @@ BRIDGE_DIR = os.path.join(PE, "hpo", "bridge")
 # $HOME path that does not exist here, and the first pilot died on exactly that.
 NOISE_DIR_1B = os.path.join(PE, "noise-vectors", "OLMo-2-1B-Exp")
 
+# Everything that differs between model sizes, in ONE place (2026-10-13, the
+# 2.7B transfer). --size picks a row and nothing size-dependent is read from
+# anywhere else, so a 1B value cannot reach a 2.7B job by default:
+#   identity        the model a method starts from and its Adam moments, which
+#                   must be the same size (the wrong moments fail silently)
+#   counterfactual  the Retraining model, same corpus without the insertions
+#   noise           the Gaussian-poison vectors, one set per embedding width
+#   mia             the canary test's cache of reference-model scores
+#   hidden          the model's hidden size, checked on every checkpoint before
+#                   an evaluation is submitted
+#   slow            how much longer a job takes than at 1B (time limits only)
+SIZES = {
+    "1B": {
+        "identity": IDENTITY, "counterfactual": "sbordt/OLMo-2-1B-Unlearning",
+        "noise": NOISE_DIR_1B, "mia": "mia-cache-b1", "hidden": 2048, "slow": 1.0,
+        "tag": "", "final_root": os.path.join(PE, "hpo-final"),
+    },
+    "2.7B": {
+        "identity": {
+            "MODEL": "sbordt/OLMo-2-2.7B-Exp-Unlearning",
+            "REVISION": "stage1-step100000-tokens210B",
+            "OPTIM_REPO": "sbordt/OLMo-2-2.7B-Exp-Unlearning",
+            "OPTIM_REVISION": "step100000-unsharded",
+            "OLMO_CONFIG": "",       # the wrapper takes it from OPTIM_REPO@OPTIM_REVISION
+        },
+        "counterfactual": "sbordt/OLMo-2-2.7B-Unlearning",
+        "noise": os.path.join(PE, "noise-vectors", "OLMo-2-2.7B-Exp"), "mia": "mia-cache-b1-2.7B",
+        "hidden": 2880, "slow": 3.0,
+        "tag": "-2.7B", "final_root": os.path.join(PE, "hpo-final-2.7B"),
+    },
+}
+
+
+def _scaled(hms, k):
+    """A HH:MM:SS limit times k, at most small-g's three days."""
+    h, m, sec = (int(x) for x in hms.split(":"))
+    t = min(72 * 3600, int((h * 3600 + m * 60 + sec) * k))
+    return f"{t // 3600:02d}:{t % 3600 // 60:02d}:00"
+
+
+def _other_sizes(text, size):
+    return [o for o in SIZES if o != size and f"OLMo-2-{o}" in text]
+
+
+def _check_training_env(env, size):
+    """A training job of `size` must name that size's model and moments and nothing of another size."""
+    bad = [f"{k}={v}" for k, v in sorted(env.items()) if _other_sizes(str(v), size)]
+    for k in ("MODEL", "OPTIM_REPO"):
+        if f"OLMo-2-{size}" not in env.get(k, ""):
+            bad.append(f"{k}={env.get(k)!r} is not an OLMo-2-{size} repository")
+    if bad:
+        sys.exit(f"REFUSING to submit a {size} training job with: " + "; ".join(bad))
+
+
+def _check_targets(targets, size):
+    """Every evaluation target must be a model of `size`.
+
+    A checkpoint or model folder is checked by the hidden size in its
+    config.json, a Hub repository by its name. The poison vectors and the
+    canary reference scores are per size, so a model of another size would be
+    scored against the wrong ones, and some of those evaluations skip quietly.
+    """
+    want, bad = SIZES[size]["hidden"], []
+    for t in targets:
+        if _other_sizes(t["exports"], size):
+            bad.append(f"{t['what']}: {t['exports'].split(',')[0]} names another size")
+        if t.get("repo") and f"OLMo-2-{size}" not in t["repo"]:
+            bad.append(f"{t['what']}: {t['repo']} is not an OLMo-2-{size} repository")
+        cfg = os.path.join(t["ckpt"], "config.json") if t.get("ckpt") else None
+        if cfg and os.path.exists(cfg):
+            try:
+                with open(cfg, encoding="utf-8") as fh:
+                    got = json.load(fh).get("hidden_size")
+            except (OSError, ValueError):
+                continue        # unreadable: the eval job itself fails loudly on it
+            if got != want:
+                bad.append(f"{t['what']}: hidden size {got} in {cfg}, a {size} model has {want}")
+    if bad:
+        sys.exit(f"REFUSING to evaluate as {size}:\n  " + "\n  ".join(bad[:12]))
+
+
 UTIL_CAP_PCT = "5.0"
 
 # The objective is forget_score.F: forgetting on fictional knowledge, insertion
@@ -169,10 +250,12 @@ FINAL_EVAL_ENV = {
 }
 
 
-def _require_noise():
-    if not glob.glob(os.path.join(NOISE_DIR_1B, "gaussian_poisoning_*.pkl")):
-        sys.exit(f"no gaussian_poisoning_*.pkl in {NOISE_DIR_1B}: the watermark, which is "
-                 "the objective, cannot be scored. Not launching.")
+def _require_noise(size="1B"):
+    noise = SIZES[size]["noise"]
+    if not glob.glob(os.path.join(noise, "gaussian_poisoning_*.pkl")):
+        sys.exit(f"no gaussian_poisoning_*.pkl in {noise}: the watermark, which is "
+                 "the objective, cannot be scored. Not launching."
+                 + ("" if size == "1B" else f" Build the {size} vectors with internal/lumi/build_noise_dir.sh."))
 
 
 def _require_anchors(anchor_root):
@@ -909,8 +992,13 @@ def _suite(args, targets):
     One implementation for --finalize, --eval-cells and --eval-models, so
     winners, hand-trained cells and released models are evaluated identically.
     """
-    mia = os.path.join(PE, "hf", "mia-cache-b1")     # batch-1 reference scores, as the cells
-    off = "1" if (os.path.isdir(mia) and os.listdir(mia)) else "0"
+    sz = SIZES[args.size]
+    if not (args.c4_only or args.utility_only):     # those two run on models of any size
+        _check_targets(targets, args.size)
+    mia = os.path.join(PE, "hf", sz["mia"])          # batch-1 reference scores, as the cells
+    # Offline at 1B only, where every checkpoint and dataset is in the shared
+    # cache. A new size starts online: its reference revisions are not cached yet.
+    off = "1" if (args.size == "1B" and os.path.isdir(mia) and os.listdir(mia)) else "0"
     hub = os.path.join(os.environ.get("HF_HOME", os.path.join(PE, "hf")), "hub")
     judge = os.path.join(hub, "models--meta-llama--Meta-Llama-3-8B-Instruct", "snapshots")
     if off == "1" and not glob.glob(os.path.join(judge, "*", "*.safetensors")):
@@ -926,22 +1014,25 @@ def _suite(args, targets):
     #   e8     eager attention, batch 8: contamination, news, prompt extraction, DoS
     #   e8math eager attention, batch 8: iGSM ops 1, 3, 5 (the longest, on its own)
     # Within a task, the winner, the cells and the anchors must share one setting.
-    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH")}
+    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH", "QA")}
     eager = {"INFERENCE_MAX_NUM_SEQS": "8", "INFERENCE_ATTN_IMPL": "eager", "ALLOW_ROCM_PADDED_BATCHES": "1"}
     groups = [
-        ("b1", "12:00:00", {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
+        ("b1", _scaled("12:00:00", sz["slow"]), {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
                             "SKIP_MIA": "0", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
                             "MIA_CACHE_DIR": mia, "MIA_REF_CACHE_DIR": os.path.join(mia, "ref")}),
         # news: the membership test per insertion condition (2026-10-09)
-        ("e8", "08:00:00", dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0",
+        # qa: ARC-Challenge, CommonsenseQA, OpenBookQA, the utility benchmarks (2026-10-13)
+        ("e8", _scaled("08:00:00", sz["slow"]),
+         dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0", SKIP_QA="0",
                                 BM_SPLITS="0 1 2 3 4 5 6 7 8",
                                 PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
-        ("e8math", "16:00:00", dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
+        ("e8math", _scaled("16:00:00", sz["slow"]), dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
     ]
 
     def submit(jn, gtime, genv, t):
         eenv = {}   # explicit only; a stray MODEL must never reach a cell's eval
         eenv.update(FINAL_EVAL_ENV)
+        eenv["NOISE_DIR"] = sz["noise"]
         eenv.update(skip_all)
         eenv.update(genv)
         eenv.update({"FORCE_EVAL": "0", "HF_HUB_OFFLINE": off, "HF_DATASETS_OFFLINE": off})
@@ -965,7 +1056,7 @@ def _suite(args, targets):
             if jn in queued:
                 c4jobs.append(jn)
             elif not os.path.exists(os.path.join(t["evals"], "c4_perplexity.done")):
-                if submit(jn, "01:00:00", {"SKIP_PPL": "0"}, t):
+                if submit(jn, _scaled("01:00:00", sz["slow"]), {"SKIP_PPL": "0"}, t):
                     c4jobs.append(jn)
                     new += 1
         if args.c4_only:
@@ -974,17 +1065,19 @@ def _suite(args, targets):
             # and a failed C4 job must not fall through to the full suite.
             return new
         if args.utility_only:
-            # C4 plus the two other capability measures the figures use
-            # (2026-10-13): the 10,000 held-out benchmark questions and the
-            # untriggered control of the denial-of-service run, with the cells'
-            # settings (eager attention, batch 8). No forgetting task, so the
-            # smaller models can be placed next to the 1B checkpoints.
-            marks = ("benchmark_contamination_s0", "denial_of_service", "denial_of_service_triggered")
+            # C4 plus the other capability measures the figures use
+            # (2026-10-13): ARC-Challenge, CommonsenseQA and OpenBookQA, the
+            # 10,000 held-out benchmark questions and the untriggered control of
+            # the denial-of-service run, with the cells' settings (eager
+            # attention, batch 8). No forgetting task, so the smaller models can
+            # be placed next to the 1B checkpoints.
+            marks = ("qa_benchmarks", "benchmark_contamination_s0", "denial_of_service", "denial_of_service_triggered")
             for t in targets:
                 jn = f"pe-{t['label']}-util"
                 if jn in queued or all(os.path.exists(os.path.join(t["evals"], m + ".done")) for m in marks):
                     continue
-                if submit(jn, "04:00:00", dict(eager, SKIP_BM="0", BM_SPLITS="0", SKIP_DOS="0", DOS_QUERIES="1000"), t):
+                if submit(jn, _scaled("04:00:00", sz["slow"]),
+                          dict(eager, SKIP_QA="0", SKIP_BM="0", BM_SPLITS="0", SKIP_DOS="0", DOS_QUERIES="1000"), t):
                     new += 1
             return new
         while True:
@@ -1049,7 +1142,7 @@ def _full_suite(args, root, tags, expect=None):
             for st in have:
                 ck = os.path.join(cell, st)
                 ev = os.path.join(ck, "evals")
-                targets.append(dict(label=f"{tag}-{args.method}-{cname}-{st}", what=f"{tag} {st}",
+                targets.append(dict(label=f"{tag}-{args.method}-{cname}-{st}", what=f"{tag} {st}", ckpt=ck,
                                     exports=f"CELL_DIR={cell},CKPT={ck},EVAL_OUT={ev}", evals=ev))
     return _suite(args, targets)
 
@@ -1081,7 +1174,7 @@ def eval_models(args):
         if missing:
             sys.exit(f"{path}: no {', '.join(missing)}; stage the model completely first")
         out = os.path.join(root, "anchors", name)
-        targets.append(dict(label=f"model-{name}", what=name,
+        targets.append(dict(label=f"model-{name}", what=name, ckpt=path,
                             exports=f"MODEL={path},EVAL_OUT={out}", evals=out))
     if not targets:
         sys.exit("--eval-models needs --models NAME=DIR[,NAME=DIR...]")
@@ -1098,7 +1191,48 @@ def eval_models(args):
         return
     _require_host_slurm()
     if not (args.c4_only or args.utility_only):
-        _require_noise()
+        _require_noise(args.size)
+    n = _suite(args, targets)
+    print(f"=== {n} eval job(s) submitted ===")
+    print("  rerun the same command to submit what is still missing; finished tasks are skipped")
+
+
+def eval_anchors(args):
+    """The full suite on a size's reference points.
+
+    Baseline (the experiment model at step 100,000), the SGD control (the same
+    run at steps 101,000 to 110,000) and Retraining (the counterfactual model at
+    all eleven steps): 22 models, read from the Hub by repository and revision,
+    results under ROOT/anchors/<point>/step-<steps after 100,000>, the layout
+    export_results.py reads. Use a ROOT without older results: tasks skip on
+    their .done markers, and the 2.7B tree of September holds evaluations made
+    with settings that were replaced since.
+    """
+    sz, root = SIZES[args.size], args.eval_anchors
+    exp, twin = sz["identity"]["MODEL"], sz["counterfactual"]
+    rev = lambda a: {100000: "stage1-step100000-tokens210B",
+                     110000: "stage1-step110000-tokens231B"}.get(a, f"stage1-step{a}")
+    steps = ([int(x) for x in args.anchor_steps.split(",") if x.strip()] if args.anchor_steps
+             else list(range(100000, 110001, 1000)))
+    targets = []
+    for a in steps:
+        rel = a - 100000
+        for point, repo in (("baseline" if rel == 0 else "unlearn-baseline", exp), ("deep-ignorance", twin)):
+            out = os.path.join(root, "anchors", point, f"step-{rel}")
+            targets.append(dict(label=f"anchor{sz['tag']}-{point}-{a}", what=f"{point} step {rel}", repo=repo,
+                                exports=f"MODEL={repo},REVISION={rev(a)},EVAL_OUT={out}", evals=out))
+    print(f"=== full suite on the {len(targets)} {args.size} reference points, results under "
+          f"{os.path.join(root, 'anchors')} ===")
+    print(f"  poison vectors {sz['noise']}")
+    if args.dry_run:
+        for t in targets:
+            done = sorted(f[:-len(".done")] for f in (os.listdir(t["evals"]) if os.path.isdir(t["evals"]) else [])
+                          if f.endswith(".done"))
+            print(f"  {t['what']:28s} {t['exports'].rsplit(',', 1)[0]}; {len(done)} evaluation(s) already done")
+        print("[dry] nothing submitted")
+        return
+    _require_host_slurm()
+    _require_noise(args.size)
     n = _suite(args, targets)
     print(f"=== {n} eval job(s) submitted ===")
     print("  rerun the same command to submit what is still missing; finished tasks are skipped")
@@ -1122,9 +1256,10 @@ def finalize(args):
     evals/ directory or a queued job, so a rerun does only what is missing.
     """
     import optuna
+    sz = SIZES[args.size]
     if not args.dry_run:
         _require_host_slurm()
-        _require_noise()
+        _require_noise(args.size)
     study = optuna.load_study(study_name=args.study, storage=_storage(args))
     ok = [t for t in study.trials
           if t.state.name == "COMPLETE" and t.value is not None
@@ -1157,7 +1292,9 @@ def finalize(args):
     root = args.final_root
     last = FINAL_RUNGS[-1]
     how = f"trials {args.trials}" if args.trials else f"the best {len(winners)}"
-    print(f"=== finalize {args.method}: {how} of {len(ok)} feasible trial(s) ===")
+    print(f"=== finalize {args.method} at {args.size}: {how} of {len(ok)} feasible trial(s) ===")
+    print(f"  model {sz['identity']['MODEL']}@{sz['identity']['REVISION']}, "
+          f"moments {sz['identity']['OPTIM_REPO']}@{sz['identity']['OPTIM_REVISION']}")
     print(f"  root {root}, schedule {FINAL_RUNGS}, full suite incl. MIA and DoS"
           + (f" where C4 <= {args.max_c4} (C4 measured first)" if args.max_c4 is not None else ""))
 
@@ -1168,7 +1305,7 @@ def finalize(args):
     tags = []
     for t in winners:
         params = _natural_params(t)
-        tag = f"{args.study}-final-t{t.number:04d}"
+        tag = f"{args.study}{sz['tag']}-final-t{t.number:04d}"
         tags.append(tag)
         print(f"  trial {t.number}: F={t.value:.4f} at step "
               f"{t.user_attrs.get('best_step')}, c4 "
@@ -1186,14 +1323,21 @@ def finalize(args):
         spaces.validate(args.method, params, tenv)
         env = {}        # only what the job needs; see _host_run
         env.update(tenv)
-        env.update(IDENTITY)
+        env.update(sz["identity"])
         env.update({"RUN_TAG": tag, "OUTPUT_ROOT": root})
+        _check_training_env(env, args.size)
         wt = args.time or trial_walltime(args.method, params, args.steps, [],
                                          args.tokens_per_hour, 0.0)
+        if not args.time and sz["slow"] > 1:
+            # slower steps, and a larger model and optimizer state to load first
+            wt = _scaled(wt, sz["slow"])
+            wt = max(wt, "04:00:00")
         cmd = ["sbatch", "-J", tag, f"--time={wt}", "--export=ALL",
                os.path.join(REPO, "internal", "lumi", "unlearn_cell.sh")]
         if args.dry_run:
             print(f"    [dry] {' '.join(cmd)}")
+            print(f"          MODEL={env['MODEL']} REVISION={env['REVISION']} OPTIM_REPO={env['OPTIM_REPO']} "
+                  f"OPTIM_REVISION={env['OPTIM_REVISION']} OUTPUT_ROOT={root}")
             print(f"          CKPT_STEPS={tenv['CKPT_STEPS']} MICRO_BATCH={tenv['MICRO_BATCH']} "
                   f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']}")
             continue
@@ -1259,7 +1403,7 @@ def eval_cells(args):
         print("[dry] nothing submitted")
         return
     _require_host_slurm()
-    _require_noise()
+    _require_noise(args.size)
     n = _full_suite(args, root, tags)
     print(f"=== {n} eval job(s) submitted ===")
     print("  rerun the same command to submit what is still missing (after the C4 jobs, "
@@ -1359,13 +1503,28 @@ def main():
                     help="with --eval-models or --eval-cells: C4 perplexity plus the held-out "
                          "benchmark questions and the untriggered gibberish rate (one 4 h job "
                          "per target), no forgetting task; returns at once")
-    ap.add_argument("--final-root", default=os.path.join(PE, "hpo-final"))
+    ap.add_argument("--size", choices=sorted(SIZES), default="1B",
+                    help="model size for --finalize (the study's trials retrained at this size), "
+                         "--eval-cells, --eval-models and --eval-anchors; the search itself is 1B")
+    ap.add_argument("--eval-anchors", metavar="ROOT", default=None,
+                    help="run the full suite on the size's 22 reference points (Baseline, SGD control, "
+                         "Retraining at steps 100k-110k), writing to ROOT/anchors/<point>/step-N")
+    ap.add_argument("--anchor-steps", default=None,
+                    help="with --eval-anchors: absolute steps, comma separated (default 100000..110000)")
+    ap.add_argument("--final-root", default=None,
+                    help="where --finalize trains (default: hpo-final, or hpo-final-<size>)")
     ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
-    if (args.c4_only or args.utility_only) and not (args.eval_models or args.eval_cells):
-        ap.error("--c4-only and --utility-only go with --eval-models or --eval-cells")
+    if (args.c4_only or args.utility_only) and not (args.eval_models or args.eval_cells or args.eval_anchors):
+        ap.error("--c4-only and --utility-only go with --eval-models, --eval-cells or --eval-anchors")
+    args.final_root = args.final_root or SIZES[args.size]["final_root"]
+    if args.size != "1B" and not (args.finalize or args.eval_cells or args.eval_models or args.eval_anchors):
+        ap.error("--size other than 1B goes with --finalize, --eval-cells, --eval-models or --eval-anchors")
+    if args.eval_anchors:       # reference points: no method, study or budget involved
+        eval_anchors(args)
+        return 0
     if args.eval_models:        # whole models: no method, study or budget involved
         eval_models(args)
         return 0

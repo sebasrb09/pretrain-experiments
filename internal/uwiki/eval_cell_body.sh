@@ -44,6 +44,7 @@
 #     SKIP_IL   insertion likelihood         SKIP_BM   benchmark contamination
 #     SKIP_GW   gaussian watermark           SKIP_MIA  membership inference (default OFF)
 #     SKIP_PE   prompt extraction            SKIP_NEWS news articles (MUSE-News)
+#     SKIP_QA   ARC-Challenge, CommonsenseQA, OpenBookQA (never inserted; opt-in)
 #     SKIP_DOS  denial of service -- defaults to 1, needs a gated judge model
 #     SKIP_MATH iGSM math problems -- defaults to 1
 #   Sub-options: IL_EXPERIMENT (default all), BM_SPLITS (default all nine),
@@ -322,6 +323,28 @@ if [ "${SKIP_BM:-0}" != "1" ]; then
         --results-yaml "$EVAL_OUT/benchmark_contamination_s${_s}/results.yaml" \
         --detailed-results-jsonl "$EVAL_OUT/benchmark_contamination_s${_s}/detailed.jsonl"
   done
+fi
+
+# Capability on benchmarks that were never inserted: ARC-Challenge,
+# CommonsenseQA and OpenBookQA, scored as OLMES scores them (completion
+# formulation, five curated examples, details in benchmark.py). The utility
+# measure next to C4 perplexity since 2026-10-13: named, published benchmarks,
+# comparable with the OLMo papers' tables. Opt in with SKIP_QA=0; off by
+# default for the same reason as the news task below.
+if [ "${SKIP_QA:-1}" != "1" ]; then
+  QA_TASK_FILE="${QA_TASK_FILE:-${PE_REPO:-.}/resources/train-once-answer-all/olmes_qa_benchmarks.json}"
+  if [ ! -s "$QA_TASK_FILE" ]; then
+    # not fatal: the other tasks of this job still run, and the missing marker shows
+    echo "  [qa_benchmarks] FAILED -- no task file at $QA_TASK_FILE" >&2
+    FAILED="$FAILED qa_benchmarks"
+  else
+    run_eval qa_benchmarks \
+      python "$TOAA_DIR/benchmark.py" \
+        --model "$TARGET" "${REV_ARGS[@]}" \
+        --task-file "$QA_TASK_FILE" \
+        --results-yaml "$EVAL_OUT/qa_benchmarks/results.yaml" \
+        --detailed-results-jsonl "$EVAL_OUT/qa_benchmarks/detailed.jsonl"
+  fi
 fi
 
 # Prompt extraction: the context-extraction backdoor (Zhang et al.), one of the

@@ -70,7 +70,9 @@ FALLBACK = {
 # Per-condition values are in results_conditions.csv.
 EXTRA_FIELDS = ["pe_leak_trig", "dos_garbage_trig", "dos_ppl_trig",
                 "igsm_ops1", "igsm_ops3", "igsm_ops5",
-                "news_mia_tpr1", "news_mia_auc", "news_mia_tpr1_holdout", "news_mia_auc_holdout"]
+                "news_mia_tpr1", "news_mia_auc", "news_mia_tpr1_holdout", "news_mia_auc_holdout",
+                # benchmarks never inserted, OLMES completion scoring: the mean and each one
+                "qa_acc", "qa_arc_challenge", "qa_csqa", "qa_openbookqa"]
 
 FIELDS = [
     "run_tag", "method", "variant", "lr", "knob", "knob_value", "step",
@@ -264,6 +266,8 @@ def extra_columns(eval_dir):
         "news_mia_auc": news.get("auc_loss_retain2"),
         "news_mia_tpr1_holdout": news.get("tpr1_loss_holdout"),
         "news_mia_auc_holdout": news.get("auc_loss_holdout"),
+        "qa_acc": scalar(eval_dir, "qa_benchmarks", "acc"),
+        **{f"qa_{k}": scalar(eval_dir, "qa_benchmarks", f"acc_{k}") for k in ("arc_challenge", "csqa", "openbookqa")},
     }
 
 
