@@ -9,9 +9,11 @@
 # Sourcing only defines functions; nothing runs until you call one.
 #   pe_report [since]   read-only: what is done, running and waiting
 #   news_redo [dry]     the news membership test wherever it is missing or used other labels
-#   qa_redo [dry]       ARC-Challenge, CommonsenseQA and OpenBookQA wherever they are missing
+#   qa_redo [dry] [ref] PopQA, LAMBADA and SciQ wherever one is missing; ref: only the reference models
+#                       (Baseline, Retraining, SGD, smaller, post-training and published models)
 # The two *_redo functions submit jobs; run them as
 #   setsid nohup bash -c "$(declare -f qa_redo); qa_redo" > "$PE_WORK/qa_redo.log" 2>&1 < /dev/null & disown
+# (arguments go after the second qa_redo, e.g. ...; qa_redo ref" > ...)
 # Shell variables are not exported on LUMI, so each function finds the work
 # directory itself and falls back to /scratch/project_465003383/unlearning_baselines.
 
@@ -25,7 +27,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
       news) echo '^news_memorization$ 1';; esac; }
   _grp () {   # _grp <title> <gate: a C4 value, or -> <task families> <eval dirs...>
     local title="$1" gate="$2" fams="$3"; shift 3
-    local n=0 full=0 out=0 part=0 newsok=0 qa=0 qaneed=0 d m f pat exp miss c4
+    local n=0 full=0 out=0 part=0 newsok=0 pq=0 qaneed=0 d m f pat exp miss c4
     local -A lack=()
     for d in "$@"; do
       [ -e "$d" ] || [ -d "${d%/evals}" ] || continue
@@ -34,7 +36,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
       c4=$(sed -n 's/^perplexity: *//p' "$d/c4_perplexity/results.yaml" 2>/dev/null | head -1)
       # the three benchmarks are wanted wherever the point can be drawn: C4 known and at most XMAX, or no gate at all
       if [ "$gate" = all ] || { [ -n "$c4" ] && awk -v x="$c4" -v g="$XMAX" 'BEGIN{exit !(x <= g)}'; }; then
-        qaneed=$((qaneed+1)); grep -qx 'qa_benchmarks' <<< "$m" && qa=$((qa+1))
+        qaneed=$((qaneed+1)); [ "$(grep -cxE 'popqa|lambada|sciq' <<< "$m")" = 3 ] && pq=$((pq+1))
       fi
       if [ "$gate" != - ] && [ "$gate" != all ]; then
         if [ -n "$c4" ] && awk -v x="$c4" -v g="$gate" 'BEGIN{exit !(x > g)}'; then out=$((out+1)); continue; fi
@@ -53,7 +55,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     printf ' | suite complete %d' "$full"
     if [ "$part" -gt 0 ]; then printf ', incomplete %d (missing:' "$part"; for f in $fams; do [ -n "${lack[$f]:-}" ] && printf ' %s %d' "$f" "${lack[$f]}"; done; printf ')'; fi
     case " $fams " in *" news "*) [ "$newsok" != "$((full + part))" ] && printf ' | news on new labels %d' "$newsok";; esac
-    printf ' | 3 benchmarks %d/%d\n' "$qa" "$qaneed"
+    printf ' | capability %d/%d\n' "$pq" "$qaneed"
   }
   echo "== RESULTS ON DISK ($(hostname), $(date '+%F %H:%M'))   suite = ppl fk il wm mia bm pe dos math news"
   local cells=() rmu=()
@@ -67,14 +69,17 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     g=31; [ "$s" = hpo-ce-u-f3 ] && g=-
     _grp "1B finalized ${s#hpo-}" "$g" "$ALL" $(printf '%s/evals ' "$W"/hpo-final/"$s"-final-*/*/*/step-*)
   done
-  _grp "1B reference points, batch 1" all "ppl fk il wm mia" "$W"/unlearning-pareto-1B-b1/anchors/*/step-* | sed 's/ | 3 benchmarks.*//'
+  _grp "1B reference points, batch 1" all "ppl fk il wm mia" "$W"/unlearning-pareto-1B-b1/anchors/*/step-* | sed 's/ | capability.*//'
   _grp "1B reference points, eager" all "bm pe dos math news" "$W"/unlearning-pareto-1B-e8/anchors/*/step-*
   _grp "1B post-training models" all "$ALL" "$W"/post-training-1B/anchors/*
-  for d in "$W"/size-reference/anchors/*/; do
+  for d in "$W"/size-reference/anchors/*/ "$W"/published-reference/anchors/*/; do
     [ -d "$d" ] || continue
-    printf '%-32s C4 %s | 3 benchmarks %s | held-out %s | gibberish %s\n' "smaller model $(basename "$d")" \
+    printf '%-32s C4 %s | PopQA %s LAMBADA %s SciQ %s | held-out %s | gibberish %s\n' \
+      "$(case $d in */size-reference/*) echo smaller;; *) echo published;; esac) model $(basename "$d")" \
       "$(sed -n 's/^perplexity: *//p' "$d/c4_perplexity/results.yaml" 2>/dev/null | head -1 | cut -c1-5)" \
-      "$([ -f "$d/qa_benchmarks.done" ] && echo done || echo -)" "$([ -f "$d/benchmark_contamination_s0.done" ] && echo done || echo -)" \
+      "$([ -f "$d/popqa.done" ] && echo done || echo -)" "$([ -f "$d/lambada.done" ] && echo done || echo -)" \
+      "$([ -f "$d/sciq.done" ] && echo done || echo -)" \
+      "$([ -f "$d/benchmark_contamination_s0.done" ] && echo done || echo -)" \
       "$([ -f "$d/denial_of_service.done" ] && echo done || echo -)"
   done
   _grp "2.7B reference points" all "$ALL" "$W"/reference-2.7B/anchors/*/step-*
@@ -94,7 +99,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     -e 's/ (hpo-[a-z0-9-]+)-t[0-9]+$/ search \1, trial/' \
     -e 's/ pe-1B-v2-rmu-a0-.*-(b1|e8|e8math|c4)$/ 1B RMU alpha=0, evaluation group \1/' \
     -e 's/ pe-model-.*-(b1|e8|e8math|c4|util)$/ whole models, group \1/' \
-    -e 's/ pe-.*-qa$/ three benchmarks (backfill)/' \
+    -e 's/ pe-.*-qa$/ PopQA backfill/' \
     -e 's/ pe-anchor-.*$/ 1B reference points (news)/' \
     -e 's/ pe-(1B-v2|hpo-ce-u-f3-final)-.*$/ 1B checkpoints (news)/' \
     -e 's/ mid-.*$/ mid-training/' | sort -k2 | uniq -c | awk '{c=$1; st=$2; $1=""; $2=""; sub(/^ +/, ""); printf "  %4d %-8s %s\n", c, st, $0}'
@@ -160,28 +165,50 @@ news_redo () {   # news_redo [dry]: the news membership test wherever it is miss
     echo "news_redo: conditions file $want; $ok done with it, $inq waiting in the queue, $n $([ "$dry" = 1 ] && echo 'to submit' || echo submitted)" )
 }
 
-qa_redo () {   # qa_redo [dry]: ARC-Challenge, CommonsenseQA and OpenBookQA on every 1B result that lacks them
-  local dry=0; [ "${1:-}" = dry ] && dry=1
-  local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" XMAX=33
-  local T=resources/train-once-answer-all/olmes_qa_benchmarks.json
-  [ -f internal/lumi/eval_pareto_cell.sh ] && [ -s "$T" ] || { echo "run from the repo root, after pulling the benchmark task file"; return 1; }
-  grep -q 'SKIP_QA' internal/uwiki/eval_cell_body.sh || { echo "REFUSING: this checkout's eval body has no SKIP_QA block; git pull first"; return 1; }
+qa_redo () {   # qa_redo [dry] [ref]: the capability benchmarks (PopQA, LAMBADA, SciQ) on every 1B result that lacks one
+  # (until 2026-10-14 ARC-Challenge, CommonsenseQA and OpenBookQA; dropped: every
+  # benchmark of the TOAA paper was contaminated in the experiment models, per its authors)
+  local dry=0 ref=0 a; for a in "$@"; do case $a in dry) dry=1;; ref) ref=1;; *) echo "qa_redo [dry] [ref]"; return 1;; esac; done
+  local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" XMAX=33 TASKS="popqa lambada sciq" t
+  for t in $TASKS; do
+    [ -s "resources/train-once-answer-all/capability_$t.json" ] || { echo "run from the repo root, after pulling the benchmark task files"; return 1; }
+  done
+  [ -f internal/lumi/eval_pareto_cell.sh ] || { echo "run from the repo root, after pulling the benchmark task files"; return 1; }
+  grep -q 'SKIP_CAP' internal/uwiki/eval_cell_body.sh || { echo "REFUSING: this checkout's eval body has no SKIP_CAP block; git pull first"; return 1; }
   local queued; queued=$(squeue -u "$USER" -h -o %j) || { echo "squeue failed"; return 1; }
   ( source internal/uwiki/scrub_env.sh && scrub_inherited_env > /dev/null
-    # one task, with the settings of the suite's eager group (batch 8, eager attention)
-    for f in SKIP_PPL SKIP_GW SKIP_FK SKIP_IL SKIP_BM SKIP_VM SKIP_PE SKIP_DOS SKIP_MIA SKIP_NEWS SKIP_MATH SKIP_QA; do export $f=1; done
-    export SKIP_QA=0 FORCE_EVAL=0 EVAL_MAX_NUM_SEQS=1 INFERENCE_MAX_NUM_SEQS=8 INFERENCE_ATTN_IMPL=eager ALLOW_ROCM_PADDED_BATCHES=1
+    # the capability block only, with the settings of the suite's eager group (batch 8, eager
+    # attention); a task already done in a result directory is skipped by its .done marker
+    for f in SKIP_PPL SKIP_GW SKIP_FK SKIP_IL SKIP_BM SKIP_VM SKIP_PE SKIP_DOS SKIP_MIA SKIP_NEWS SKIP_MATH SKIP_QA SKIP_CAP; do export $f=1; done
+    export SKIP_CAP=0 CAP_TASKS="$TASKS" FORCE_EVAL=0 EVAL_MAX_NUM_SEQS=1 INFERENCE_MAX_NUM_SEQS=8 INFERENCE_ATTN_IMPL=eager ALLOW_ROCM_PADDED_BATCHES=1
     n=0; ok=0; inq=0; far=0
-    one () {   # one <job name> <result dir> <exports> <offline 0|1>
-      if [ -f "$2/qa_benchmarks.done" ]; then ok=$((ok+1)); return; fi
+    one () {   # one <job name> <result dir> <exports> <offline 0|1> [further .done markers wanted]
+      local t; for t in $TASKS ${5:-}; do [ -f "$2/$t.done" ] || break; done
+      if [ -f "$2/$t.done" ]; then ok=$((ok+1)); return; fi
       if grep -qxF "$1" <<< "$queued"; then inq=$((inq+1)); return; fi
       n=$((n+1))
       if [ "$dry" = 1 ]; then [ "$n" -le 12 ] && echo "  [dry] $1"; return; fi
       while [ "$(squeue -u "$USER" -h | wc -l)" -ge 195 ]; do sleep 60; done
-      HF_HUB_OFFLINE=$4 HF_DATASETS_OFFLINE=$4 sbatch -J "$1" -t 01:00:00 --export=ALL,"$3" internal/lumi/eval_pareto_cell.sh
+      # 3 h until timed (PopQA: 14,267 short generations at batch 8; LAMBADA and SciQ take minutes)
+      HF_HUB_OFFLINE=$4 HF_DATASETS_OFFLINE=$4 sbatch -J "$1" -t 03:00:00 --export=ALL,"$3" internal/lumi/eval_pareto_cell.sh
     }
+    # outside references: the decayed experiment pair (with / without the inserted data) and AI2's
+    # OLMo-2-0425-1B (4T tokens, should score highest); then the smaller models. The pair also gets
+    # the held-out questions (contamination split 0), whose accuracy TOAA's Table 3 reports for
+    # exactly these two models (55.15% OLMo-2-1B-Exp, 55.51% OLMo-2-1B): a check of our scoring
+    for spec in OLMo-2-1B-Exp:sbordt/OLMo-2-1B-Exp:main OLMo-2-1B:sbordt/OLMo-2-1B:main \
+                OLMo-2-0425-1B:allenai/OLMo-2-0425-1B:main; do
+      IFS=: read -r name repo rev <<< "$spec"
+      one "pe-model-$name-qa" "$W/published-reference/anchors/$name" \
+          "MODEL=$repo,REVISION=$rev,EVAL_OUT=$W/published-reference/anchors/$name,SKIP_BM=0,BM_SPLITS=0" 0 \
+          benchmark_contamination_s0
+    done
+    for size in 546M 179M; do
+      one "pe-model-OLMo-2-$size-qa" "$W/size-reference/anchors/OLMo-2-$size" \
+          "MODEL=sbordt/OLMo-2-$size-Unlearning,REVISION=stage1-step100000-tokens210B,EVAL_OUT=$W/size-reference/anchors/OLMo-2-$size" 0
+    done
     # trained checkpoints inside the figure (C4 perplexity at most $XMAX): the sweep, RMU alpha = 0, the finalized cells
-    for ckpt in "$W"/unlearning-pareto-1B/1B-v2-*/*/*/step-* "$W"/hpo-final/hpo-*-final-*/*/*/step-*; do
+    [ "$ref" = 1 ] || for ckpt in "$W"/unlearning-pareto-1B/1B-v2-*/*/*/step-* "$W"/hpo-final/hpo-*-final-*/*/*/step-*; do
       [ -d "$ckpt" ] || continue
       c4=$(sed -n 's/^perplexity: *//p' "$ckpt/evals/c4_perplexity/results.yaml" 2>/dev/null | head -1)
       if [ -z "$c4" ] || awk -v x="$c4" -v g="$XMAX" 'BEGIN{exit !(x > g)}'; then far=$((far+1)); continue; fi

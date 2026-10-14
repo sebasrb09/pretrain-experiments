@@ -100,6 +100,10 @@ def main():
         "constraint": None if best is None else best["c4_delta_pct"] - cap,
         # What the driver passes to study.tell (direction=maximize).
         "objective": None if best is None else best["F"],
+        # checkpoints left on disk: the rungs on the frontier when they were
+        # scored (wm searches since 2026-10-14; see hpo_trial.sh), for the full suite
+        "kept_steps": sorted(int(d[len("step-"):]) for d in os.listdir(cell_dir)
+                             if d.startswith("step-") and d[len("step-"):].isdigit()),
     }
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)

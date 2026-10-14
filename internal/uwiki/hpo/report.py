@@ -23,6 +23,7 @@ import glob
 import json
 import math
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +66,59 @@ def fmt(v, spec=".4g"):
 
 RUNG_FIELDS = ["trial", "step", "c4_ppl", "c4_delta_pct", "fk_prob", "il_ppl", "wm_q4",
                "p_fk", "p_il", "p_wm", "F"]
+COMPUTE_FIELDS = ["category", "trial", "job", "name", "slurm_state", "hours", "gpus", "gpu_hours", "billing",
+                  "billing_hours"]
+
+
+def sacct(args_list):
+    """Rows of `sacct -X -n -P -o JobID,JobName,State,ElapsedRaw,AllocTRES <args>`, or None
+    without SLURM accounting (off the cluster)."""
+    import subprocess
+    try:
+        out = subprocess.run(["sacct", "-X", "-n", "-P", "-o", "JobID,JobName,State,ElapsedRaw,AllocTRES"] + args_list,
+                             capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    rows = []
+    for line in out.stdout.splitlines():
+        f = line.split("|")
+        if len(f) < 5 or not f[0]:
+            continue
+        tres = dict(kv.split("=", 1) for kv in f[4].split(",") if "=" in kv)
+        gpus = next((float(v) for k, v in tres.items() if k.startswith("gres/gpu")), 0.0)
+        hours = (int(f[3]) if f[3].isdigit() else 0) / 3600.0
+        billing = float(tres["billing"]) if tres.get("billing", "").replace(".", "", 1).isdigit() else None
+        rows.append({"job": f[0], "name": f[1], "slurm_state": f[2].split()[0], "hours": round(hours, 4),
+                     "gpus": gpus, "gpu_hours": round(hours * gpus, 4), "billing": billing,
+                     "billing_hours": None if billing is None else round(hours * billing, 4)})
+    return rows
+
+
+def compute_ledger(study, trials):
+    """Every SLURM job the study cost: one per trial that was submitted (finished,
+    failed, pruned or still running alike), and the finalize retraining and its
+    evaluations (names containing <study>...-final-). None without sacct."""
+    jobs = {str(t.user_attrs["job"]): t.number for t in trials if t.user_attrs.get("job")}
+    rows = []
+    ids = sorted(jobs)
+    for i in range(0, len(ids), 200):
+        got = sacct(["-j", ",".join(ids[i:i + 200])])
+        if got is None:
+            return None
+        for r in got:
+            rows.append({"category": "trial", "trial": jobs.get(r["job"]), **r})
+    starts = [t.datetime_start for t in trials if t.datetime_start]
+    if starts:
+        got = sacct(["-u", os.environ.get("USER", ""), "-S", min(starts).strftime("%Y-%m-%dT%H:%M:%S")])
+        for r in got or []:
+            if r["job"] in jobs or study not in r["name"] or "-final-" not in r["name"]:
+                continue
+            m = re.search(r"-final-t(\d+)", r["name"])
+            rows.append({"category": "finalize evaluation" if r["name"].startswith("pe-") else "finalize training",
+                         "trial": int(m.group(1)) if m else None, **r})
+    return rows
 
 
 def main():
@@ -102,7 +156,8 @@ def main():
                "best_step": t.user_attrs.get("best_step"),
                "c4_delta_pct": t.user_attrs.get("c4_delta_pct"),
                "feasible": t.user_attrs.get("feasible"),
-               "tokens": t.user_attrs.get("tokens"), "job": t.user_attrs.get("job"), "tag": tag}
+               "tokens": t.user_attrs.get("tokens"), "job": t.user_attrs.get("job"), "tag": tag,
+               "kept_steps": " ".join(map(str, (res or {}).get("kept_steps", [])))}
         row.update({f"hp_{k}": v for k, v in sorted(p.items())})
         rows.append(row)
         if res:
@@ -126,7 +181,23 @@ def main():
             warn.append(f"trial {t.number}: in-budget F {t.value:.4f} is within the scatter "
                         f"of untouched checkpoints (< {NOISE})")
 
+    # COMPUTE, every submitted trial whatever its outcome (2026-10-14): the
+    # allocation is spent by dominated, failed and pruned trials as much as by
+    # the winners. compute.csv is the ledger, one row per SLURM job.
+    ledger = compute_ledger(study.study_name, study.trials)
+    if ledger is not None:
+        per_trial = {}
+        for r in ledger:
+            if r["category"] == "trial":
+                per_trial[r["trial"]] = r
+        for row in rows:
+            j = per_trial.get(row["trial"], {})
+            row.update({k: j.get(k) for k in ("slurm_state", "hours", "gpu_hours", "billing_hours")})
+
     os.makedirs(args.out, exist_ok=True)
+    if ledger is not None:
+        with open(os.path.join(args.out, "compute.csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=COMPUTE_FIELDS); w.writeheader(); w.writerows(ledger)
     keys = sorted({k for r in rows for k in r}, key=lambda k: (k.startswith("hp_"), k))
     with open(os.path.join(args.out, "trials.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=keys); w.writeheader(); w.writerows(rows)
@@ -157,10 +228,29 @@ def main():
               + ("" if b["F"] >= NOISE else "  (within the scatter of untouched checkpoints)"))
     else:
         print("\nno in-budget trial")
+    kept = [(r["trial"], r["kept_steps"]) for r in rows if r.get("kept_steps")]
+    if kept:
+        print(f"\ncheckpoints kept on the frontier (full suite: optuna_hpo.py --eval-cells): "
+              + ", ".join(f"t{t} step {s}" for t, s in kept))
+    if ledger is None:
+        print("\ncompute: no SLURM accounting here (run on the cluster for compute.csv)")
+    else:
+        print("\ncompute (SLURM accounting; GPU-hours = hours x GCDs; billing = sacct's billing TRES):")
+        cats = {}
+        for r in ledger:
+            key = (r["category"], r["slurm_state"])
+            c = cats.setdefault(key, [0, 0.0, 0.0])
+            c[0] += 1; c[1] += r["gpu_hours"]; c[2] += r["billing_hours"] or 0.0
+        for (cat, st), (n, g, b) in sorted(cats.items()):
+            print(f"  {cat:20s} {st:12s} {n:4d} job(s) {g:9.1f} GPU-h {b:11.1f} billing-h")
+        tot_g = sum(r["gpu_hours"] for r in ledger); tot_b = sum(r["billing_hours"] or 0.0 for r in ledger)
+        tok = sum(r["tokens"] or 0 for r in rows)
+        print(f"  {'total':33s} {len(ledger):4d} job(s) {tot_g:9.1f} GPU-h {tot_b:11.1f} billing-h; "
+              f"{tok / 1e9:.2f}B training tokens planned over {sum(1 for r in rows if r['job'])} submitted trials")
     print("\nWARNINGS:" if warn else "\nno warnings")
     for x in warn:
         print("  " + x)
-    print(f"\nwrote {os.path.join(args.out, 'trials.csv')} and rungs.csv")
+    print(f"\nwrote {os.path.join(args.out, 'trials.csv')}, rungs.csv" + (", compute.csv" if ledger is not None else ""))
 
 
 if __name__ == "__main__":

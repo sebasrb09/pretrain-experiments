@@ -155,8 +155,29 @@ free_ckpt () {
     rm -rf "$CELL_DIR/step-$1" && echo "    freed step-$1"
   fi
 }
+# THE FRONTIER (wm searches, 2026-10-14). A scored rung is kept when no point
+# known now (the study's finished trials, this trial's earlier rungs) has both
+# a lower-or-equal C4 and a lower-or-equal poison TPR, so the full suite can run
+# on the search's frontier later (optuna_hpo.py --eval-cells over the search's
+# output root); a dominated rung is freed as before. forget_score.py prune
+# removes the kept ones that later trials dominate. A failed check keeps the rung.
+KEPT=""
+keep_or_free () {
+  [ -d "$CELL_DIR/step-$1" ] || return 0
+  if [ "${KEEP_CKPT:-0}" = "1" ]; then KEPT="$KEPT $1"; return 0; fi
+  python "$REPO/internal/uwiki/hpo/forget_score.py" keep --output-root "$OUTPUT_ROOT" --run-tag "$RUN_TAG" \
+    --method "$METHOD" --cell-dir "$CELL_DIR" --step "$1"
+  local rc=$?
+  if [ "$rc" = 3 ]; then
+    free_ckpt "$1"
+  else
+    [ "$rc" != 0 ] && echo "    WARNING: frontier check failed (exit $rc); step-$1 kept"
+    KEPT="$KEPT $1"
+  fi
+}
 FIRST_RUNG=""
 LAST_IN=""
+OVER=""
 for r in $RUNGS; do
   [ -d "$CELL_DIR/step-$r" ] || { echo "    [skip] no step-$r"; continue; }
   [ -z "$FIRST_RUNG" ] && FIRST_RUNG=$r
@@ -172,14 +193,16 @@ for r in $RUNGS; do
   over=$(REPO="$REPO" ANCHOR_ROOT="$ANCHOR_ROOT" UTIL_CAP_PCT="$UTIL_CAP_PCT" \
          python "$REPO/internal/uwiki/hpo/over_cap.py" "$CELL_DIR/evals/step-$r") || over=0
   if [ "$over" = "1" ]; then
+    # wm: scored too (C4 and watermark run together); the frontier rule decides below
+    [ "$HPO_OBJECTIVE" = "wm" ] && OVER="$OVER $r"
     if [ "${EARLY_STOP:-1}" = "1" ]; then
       echo "    step-$r exceeds the ${UTIL_CAP_PCT}% cap. Later rungs cannot return"
       echo "    inside it, so the rest of the ladder is skipped."
       break
     fi
-    [ "$r" != "$FIRST_RUNG" ] && free_ckpt "$r"
+    [ "$r" != "$FIRST_RUNG" ] && [ "$HPO_OBJECTIVE" != "wm" ] && free_ckpt "$r"
   elif [ "$HPO_OBJECTIVE" = "wm" ]; then
-    free_ckpt "$r"      # fully scored already
+    keep_or_free "$r"   # fully scored already
     LAST_IN=$r
   else
     # Superseded: only the last rung inside the cap is evaluated in full.
@@ -196,6 +219,7 @@ if [ "$HPO_OBJECTIVE" = "wm" ]; then
     echo "--- watermark at step-$FIRST_RUNG: no rung inside the cap ---"
     eval_rung "$FIRST_RUNG" 1 1 0
   fi
+  for r in $OVER; do keep_or_free "$r"; done
 elif [ -n "$FULL_RUNG" ]; then
   if [ -n "$LAST_IN" ]; then
     echo "--- full objective at step-$FULL_RUNG, the last rung inside the cap ---"
@@ -207,12 +231,17 @@ fi
 
 # Whatever the ladder never reached: early stop leaves later rungs on disk, and
 # every driver force-saves a final epoch-*/ snapshot regardless of CKPT_STEPS.
+# The rungs kept on the frontier stay.
 if [ "${KEEP_CKPT:-0}" != "1" ]; then
-  n=$(find "$CELL_DIR" -maxdepth 1 -type d \( -name 'step-*' -o -name 'epoch-*' \) 2>/dev/null | wc -l)
-  if [ "$n" -gt 0 ]; then
-    find "$CELL_DIR" -maxdepth 1 -type d \( -name 'step-*' -o -name 'epoch-*' \) -exec rm -rf {} +
-    echo "  freed $n unevaluated or final checkpoint(s)"
-  fi
+  n=0
+  for d in "$CELL_DIR"/step-* "$CELL_DIR"/epoch-*; do
+    [ -d "$d" ] || continue
+    s="${d##*/}"
+    case "$s" in step-*) case " $KEPT " in *" ${s#step-} "*) continue;; esac;; esac
+    rm -rf "$d"; n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "  freed $n unevaluated or final checkpoint(s)"
+  [ -n "$KEPT" ] && echo "  kept on the frontier:$(printf ' step-%s' $KEPT)"
   rm -f "$CELL_DIR"/trainer_state.pt 2>/dev/null || true
 fi
 

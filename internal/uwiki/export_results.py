@@ -72,7 +72,12 @@ EXTRA_FIELDS = ["pe_leak_trig", "dos_garbage_trig", "dos_ppl_trig",
                 "igsm_ops1", "igsm_ops3", "igsm_ops5",
                 "news_mia_tpr1", "news_mia_auc", "news_mia_tpr1_holdout", "news_mia_auc_holdout",
                 # benchmarks never inserted, OLMES completion scoring: the mean and each one
-                "qa_acc", "qa_arc_challenge", "qa_csqa", "qa_openbookqa"]
+                "qa_acc", "qa_arc_challenge", "qa_csqa", "qa_openbookqa",
+                # the capability benchmarks (2026-10-14), without the items that overlap the
+                # inserted data; bpb = bits per byte of the right answer (lower is better)
+                "popqa_acc", "popqa_acc_all", "popqa_bpb",
+                "lambada_acc", "lambada_ppl", "lambada_bpb",
+                "sciq_acc", "sciq_acc_norm", "sciq_bpb"]
 
 FIELDS = [
     "run_tag", "method", "variant", "lr", "knob", "knob_value", "step",
@@ -268,6 +273,15 @@ def extra_columns(eval_dir):
         "news_mia_auc_holdout": news.get("auc_loss_holdout"),
         "qa_acc": scalar(eval_dir, "qa_benchmarks", "acc"),
         **{f"qa_{k}": scalar(eval_dir, "qa_benchmarks", f"acc_{k}") for k in ("arc_challenge", "csqa", "openbookqa")},
+        "popqa_acc": scalar(eval_dir, "popqa", "acc"),
+        "popqa_acc_all": scalar(eval_dir, "popqa", "acc_all"),
+        "popqa_bpb": scalar(eval_dir, "popqa", "bpb"),
+        "lambada_acc": scalar(eval_dir, "lambada", "acc"),
+        "lambada_ppl": scalar(eval_dir, "lambada", "perplexity"),
+        "lambada_bpb": scalar(eval_dir, "lambada", "bpb"),
+        "sciq_acc": scalar(eval_dir, "sciq", "acc"),
+        "sciq_acc_norm": scalar(eval_dir, "sciq", "acc_norm"),
+        "sciq_bpb": scalar(eval_dir, "sciq", "bpb"),
     }
 
 

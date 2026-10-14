@@ -45,6 +45,7 @@
 #     SKIP_GW   gaussian watermark           SKIP_MIA  membership inference (default OFF)
 #     SKIP_PE   prompt extraction            SKIP_NEWS news articles (MUSE-News)
 #     SKIP_QA   ARC-Challenge, CommonsenseQA, OpenBookQA (never inserted; opt-in)
+#     SKIP_CAP  capability: PopQA, LAMBADA, SciQ (CAP_TASKS; opt-in)
 #     SKIP_DOS  denial of service -- defaults to 1, needs a gated judge model
 #     SKIP_MATH iGSM math problems -- defaults to 1
 #   Sub-options: IL_EXPERIMENT (default all), BM_SPLITS (default all nine),
@@ -325,12 +326,12 @@ if [ "${SKIP_BM:-0}" != "1" ]; then
   done
 fi
 
-# Capability on benchmarks that were never inserted: ARC-Challenge,
-# CommonsenseQA and OpenBookQA, scored as OLMES scores them (completion
-# formulation, five curated examples, details in benchmark.py). The utility
-# measure next to C4 perplexity since 2026-10-13: named, published benchmarks,
-# comparable with the OLMo papers' tables. Opt in with SKIP_QA=0; off by
-# default for the same reason as the news task below.
+# ARC-Challenge, CommonsenseQA and OpenBookQA, scored as OLMES scores them
+# (completion formulation, five curated examples, details in benchmark.py).
+# The utility measure from 2026-10-13 to 2026-10-14, then dropped: the TOAA
+# authors report contamination in the experiment models for every benchmark
+# of their paper, these three included. Kept for the existing results. Opt in
+# with SKIP_QA=0; off by default for the same reason as the news task below.
 if [ "${SKIP_QA:-1}" != "1" ]; then
   QA_TASK_FILE="${QA_TASK_FILE:-${PE_REPO:-.}/resources/train-once-answer-all/olmes_qa_benchmarks.json}"
   if [ ! -s "$QA_TASK_FILE" ]; then
@@ -345,6 +346,38 @@ if [ "${SKIP_QA:-1}" != "1" ]; then
         --results-yaml "$EVAL_OUT/qa_benchmarks/results.yaml" \
         --detailed-results-jsonl "$EVAL_OUT/qa_benchmarks/detailed.jsonl"
   fi
+fi
+
+# Capability, the utility benchmarks since 2026-10-14, none of which appears
+# in the TOAA paper (every benchmark there, the three above included, was
+# contaminated in the experiment models, per its authors), each chosen for
+# signal at 179M-1B:
+#   popqa    PopQA (Tulu 3): 14,267 entity questions, 15 shots, short greedy
+#            answers, as OLMES scores it; plus bits per byte of the answer
+#   lambada  LAMBADA (Pythia / Hubble suite): last word of 5,153 passages,
+#            greedy accuracy and perplexity, as the LM Evaluation Harness
+#   sciq     SciQ (Pythia / Hubble suite): 1,000 science questions with their
+#            support paragraph, ranked by likelihood, as the Harness
+# Details in benchmark.py (run_popqa, run_lambada, run_sciq). acc leaves out the
+# items that overlap the inserted data; *_all keep them. One result directory
+# and .done marker per task; CAP_TASKS selects them (default all three). Opt in
+# with SKIP_CAP=0, off by default for the same reason as the news task below.
+if [ "${SKIP_CAP:-1}" != "1" ]; then
+  for _t in ${CAP_TASKS:-popqa lambada sciq}; do
+    _f="${PE_REPO:-.}/resources/train-once-answer-all/capability_${_t}.json"
+    if [ ! -s "$_f" ]; then
+      # not fatal: the other tasks of this job still run, and the missing marker shows
+      echo "  [$_t] FAILED -- no task file at $_f" >&2
+      FAILED="$FAILED $_t"
+      continue
+    fi
+    run_eval "$_t" \
+      python "$TOAA_DIR/benchmark.py" \
+        --model "$TARGET" "${REV_ARGS[@]}" \
+        --task-file "$_f" \
+        --results-yaml "$EVAL_OUT/$_t/results.yaml" \
+        --detailed-results-jsonl "$EVAL_OUT/$_t/detailed.jsonl"
+  done
 fi
 
 # Prompt extraction: the context-extraction backdoor (Zhang et al.), one of the

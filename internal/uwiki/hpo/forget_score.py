@@ -46,14 +46,27 @@ measured with, and check_settings() refuses a trial that differs.
     python forget_score.py show  --anchor-root DIR   print the anchors and gaps
     python forget_score.py check --anchor-root DIR   exit 1 unless the current
                                                      environment matches them
+
+THE SEARCH FRONTIER (2026-10-14). A wm search keeps the checkpoints on its
+frontier, C4 perplexity against Gaussian-poison detectability, so the full suite
+can run on them later without retraining; the others are deleted as before.
+
+    python forget_score.py keep  --output-root R --run-tag T --method M --cell-dir D --step N
+        (hpo_trial.sh, after scoring a rung) exit 0: keep step-N, 3: delete it
+    python forget_score.py prune --output-root R --study S --method M [--apply]
+        delete the kept checkpoints of finished trials that are dominated now
 """
 import argparse
+import glob
 import hashlib
 import importlib.util
 import json
 import math
 import os
+import re
+import shutil
 import sys
+from statistics import NormalDist
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXPORTER = os.path.join(HERE, os.pardir, "export_results.py")
@@ -220,13 +233,146 @@ def load_anchors(root, il_experiment, ex=None):
     return out
 
 
+# ------------------------------------------------------------ the search frontier
+# The points are (C4 perplexity, poison TPR at 1% FPR). A point is dominated when
+# another is no worse on both and better on one; the frontier is what is left.
+# A rung is kept unless a point known when it is scored dominates it, so every
+# point of the final frontier is kept (nothing dominates it at any time); points
+# that only later become dominated are removed by prune. The comparison is within
+# the study: the grid sweep measured C4 on another file, so its points are not
+# on the same axis, and the search's own frontier contains every search point of
+# the combined one.
+KEEP_MAX_C4 = 33.0      # the figures' x range; beyond it nothing is drawn or evaluated
+Z99 = NormalDist().inv_cdf(0.99)
+
+
+def poison_tpr(wm_q4):
+    """Detectability of the Gaussian poison: TPR at 1% FPR of the unit-variance
+    watermark score shifted by wm_q4 (notebooks/pareto_tasks.py tpr_at_1pct_fpr)."""
+    return 1.0 - NormalDist().cdf(Z99 - abs(wm_q4))
+
+
+def dominated(p, others, tol=0.0):
+    """tol (TPR, a fraction): a point with C4 no higher whose TPR is at most tol
+    higher also removes p, so only points that lower the TPR by more than tol
+    survive. 0 is plain Pareto dominance. Two points never remove each other."""
+    c, t = p
+    return any(c2 <= c and t2 <= t + tol and (c2 < c or t2 < t) for c2, t2 in others)
+
+
+def study_name(run_tag):
+    """hpo-npo-wm-t0012 -> hpo-npo-wm"""
+    return re.sub(r"-t\d+$", "", run_tag)
+
+
+def _result_points(path, max_c4):
+    """{step: (c4, tpr)} of one finished trial's hpo_result.json."""
+    with open(path, encoding="utf-8") as fh:
+        res = json.load(fh)
+    out = {}
+    for p in res.get("points", []):
+        c4, wm = _num(p.get("c4_ppl")), _num(p.get("wm_q4"))
+        if c4 is not None and wm is not None and c4 <= max_c4:
+            out[int(p["step"])] = (c4, poison_tpr(wm))
+    return out
+
+
+def finished_trials(output_root, study, method):
+    """{cell dir: hpo_result.json path} of every finished trial of the study."""
+    return {os.path.dirname(p): p for p in
+            glob.glob(os.path.join(output_root, f"{study}-t[0-9]*", method, "*", "hpo_result.json"))}
+
+
+def _c4_tpr(eval_dir, ex):
+    """(c4, tpr) of a rung scored in this job, or None. Reads the watermark .pt (torch)."""
+    c4 = _num(ex.scalar(eval_dir, "c4_perplexity", "perplexity"))
+    _, wm = ex.watermark(eval_dir)
+    wm = _num(wm)
+    return None if c4 is None or wm is None else (c4, poison_tpr(wm))
+
+
+def keep_decision(output_root, run_tag, method, cell_dir, step, max_c4=KEEP_MAX_C4, ex=None, tol=0.0):
+    """(keep, why) for step-<step> of a running trial, against the finished
+    trials of its study and this trial's own earlier rungs."""
+    ex = ex or load_exporter()
+    me = _c4_tpr(os.path.join(cell_dir, "evals", f"step-{step}"), ex)
+    if me is None:
+        return False, "no C4 or watermark result"
+    if me[0] > max_c4:
+        return False, f"C4 {me[0]:.2f} beyond {max_c4:g}"
+    others = []
+    for cell, path in finished_trials(output_root, study_name(run_tag), method).items():
+        if os.path.abspath(cell) != os.path.abspath(cell_dir):
+            others += _result_points(path, max_c4).values()
+    for d in glob.glob(os.path.join(cell_dir, "evals", "step-*")):
+        s = os.path.basename(d)[len("step-"):]
+        if s.isdigit() and int(s) != int(step):
+            p = _c4_tpr(d, ex)
+            if p is not None and p[0] <= max_c4:
+                others.append(p)
+    why = f"C4 {me[0]:.3f}, poison TPR {100 * me[1]:.2f}%, against {len(others)} points"
+    return (not dominated(me, others, tol)), why
+
+
+def prune(output_root, study, method, apply=False, max_c4=KEEP_MAX_C4, log=print, tol=0.0):
+    """Delete (apply=True) the kept checkpoints of finished trials that the
+    study's finished points now dominate, or that were never scored. Trials still
+    running are left alone. Returns (kept, deleted) as lists of directories."""
+    trials = finished_trials(output_root, study, method)
+    pts = {cell: _result_points(path, max_c4) for cell, path in trials.items()}
+    allp = [(cell, s, p) for cell, d in pts.items() for s, p in d.items()]
+    kept, gone = [], []
+    for cell in sorted(trials):
+        for d in sorted(glob.glob(os.path.join(cell, "step-*"))):
+            s = os.path.basename(d)[len("step-"):]
+            if not (s.isdigit() and os.path.isdir(d)):
+                continue
+            p = pts[cell].get(int(s))
+            if p is not None and not dominated(p, [q for c, t, q in allp if (c, t) != (cell, int(s))], tol):
+                kept.append(d)
+                continue
+            gone.append(d)
+            log(f"  {'delete' if apply else 'would delete'} {d}: "
+                + ("not scored or beyond the C4 range" if p is None else
+                   f"dominated (C4 {p[0]:.3f}, TPR {100 * p[1]:.2f}%)"))
+            if apply:
+                shutil.rmtree(d, ignore_errors=True)
+    return kept, gone
+
+
 def _main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["show", "check"])
-    ap.add_argument("--anchor-root", required=True)
+    ap.add_argument("cmd", choices=["show", "check", "keep", "prune"])
+    ap.add_argument("--anchor-root", default=None)
     ap.add_argument("--il-experiment", default=None,
                     help="default: IL_EXPERIMENT from settings.json")
+    ap.add_argument("--output-root", default=None, help="keep / prune: where the trials' cells live")
+    ap.add_argument("--run-tag", default=None, help="keep: the trial's tag (<study>-tNNNN)")
+    ap.add_argument("--study", default=None, help="prune: the study, e.g. hpo-npo-wm")
+    ap.add_argument("--method", default=None)
+    ap.add_argument("--cell-dir", default=None)
+    ap.add_argument("--step", type=int, default=None)
+    ap.add_argument("--max-c4", type=float, default=KEEP_MAX_C4)
+    ap.add_argument("--apply", action="store_true", help="prune: delete (default: only list)")
+    ap.add_argument("--tol", type=float, default=float(os.environ.get("KEEP_TPR_TOL", "0") or 0),
+                    help="keep / prune: TPR tolerance in percentage points (default KEEP_TPR_TOL, else 0 = "
+                         "the Pareto frontier): a point must lower the TPR by more than this to stay")
     args = ap.parse_args()
+    if args.cmd == "keep":
+        keep, why = keep_decision(args.output_root, args.run_tag, args.method, args.cell_dir, args.step, args.max_c4,
+                                  tol=args.tol / 100.0)
+        print(f"    step-{args.step}: {'on the frontier so far, kept' if keep else 'dominated, deleted'} ({why})"
+              if "against" in why else f"    step-{args.step}: deleted ({why})")
+        return 0 if keep else 3
+    if args.cmd == "prune":
+        kept, gone = prune(args.output_root, args.study, args.method, args.apply, args.max_c4, tol=args.tol / 100.0)
+        print(f"{args.study}: {len(kept)} frontier checkpoint(s) kept, {len(gone)} "
+              f"{'deleted' if args.apply else 'to delete (rerun with --apply)'}")
+        for d in kept:
+            print(f"  keep {d}")
+        return 0
+    if not args.anchor_root:
+        ap.error("--anchor-root is required for show and check")
     try:
         st = read_settings(args.anchor_root)
         il_exp = args.il_experiment or st["eval"]["IL_EXPERIMENT"]

@@ -1014,16 +1014,20 @@ def _suite(args, targets):
     #   e8     eager attention, batch 8: contamination, news, prompt extraction, DoS
     #   e8math eager attention, batch 8: iGSM ops 1, 3, 5 (the longest, on its own)
     # Within a task, the winner, the cells and the anchors must share one setting.
-    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH", "QA")}
+    skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH", "QA",
+                                           "CAP")}
     eager = {"INFERENCE_MAX_NUM_SEQS": "8", "INFERENCE_ATTN_IMPL": "eager", "ALLOW_ROCM_PADDED_BATCHES": "1"}
     groups = [
         ("b1", _scaled("12:00:00", sz["slow"]), {"SKIP_PPL": "0", "SKIP_FK": "0", "SKIP_IL": "0", "SKIP_GW": "0", "SKIP_VM": "0",
                             "SKIP_MIA": "0", "MIA_CONDITIONS": "paper", "MIA_BATCH": "1",
                             "MIA_CACHE_DIR": mia, "MIA_REF_CACHE_DIR": os.path.join(mia, "ref")}),
         # news: the membership test per insertion condition (2026-10-09)
-        # qa: ARC-Challenge, CommonsenseQA, OpenBookQA, the utility benchmarks (2026-10-13)
-        ("e8", _scaled("08:00:00", sz["slow"]),
-         dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0", SKIP_QA="0",
+        # cap: PopQA, LAMBADA and SciQ, the utility benchmarks (2026-10-14), 2 h more walltime
+        # until they are timed. They replace ARC-Challenge, CommonsenseQA and OpenBookQA
+        # (2026-10-13), dropped like every benchmark of the TOAA paper: all were contaminated
+        # in the experiment models (its authors)
+        ("e8", _scaled("10:00:00", sz["slow"]),
+         dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0", SKIP_CAP="0",
                                 BM_SPLITS="0 1 2 3 4 5 6 7 8",
                                 PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
         ("e8math", _scaled("16:00:00", sz["slow"]), dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
@@ -1066,18 +1070,20 @@ def _suite(args, targets):
             return new
         if args.utility_only:
             # C4 plus the other capability measures the figures use
-            # (2026-10-13): ARC-Challenge, CommonsenseQA and OpenBookQA, the
+            # (2026-10-13): PopQA, LAMBADA and SciQ (2026-10-14; they replaced
+            # ARC-Challenge, CommonsenseQA and OpenBookQA, see the e8 group), the
             # 10,000 held-out benchmark questions and the untriggered control of
             # the denial-of-service run, with the cells' settings (eager
             # attention, batch 8). No forgetting task, so the smaller models can
             # be placed next to the 1B checkpoints.
-            marks = ("qa_benchmarks", "benchmark_contamination_s0", "denial_of_service", "denial_of_service_triggered")
+            marks = ("popqa", "lambada", "sciq", "benchmark_contamination_s0", "denial_of_service",
+                     "denial_of_service_triggered")
             for t in targets:
                 jn = f"pe-{t['label']}-util"
                 if jn in queued or all(os.path.exists(os.path.join(t["evals"], m + ".done")) for m in marks):
                     continue
-                if submit(jn, _scaled("04:00:00", sz["slow"]),
-                          dict(eager, SKIP_QA="0", SKIP_BM="0", BM_SPLITS="0", SKIP_DOS="0", DOS_QUERIES="1000"), t):
+                if submit(jn, _scaled("06:00:00", sz["slow"]),
+                          dict(eager, SKIP_CAP="0", SKIP_BM="0", BM_SPLITS="0", SKIP_DOS="0", DOS_QUERIES="1000"), t):
                     new += 1
             return new
         while True:
