@@ -159,12 +159,54 @@ def localize(stage2, data_root, out, urls_out=None, check=False):
             f.write("\n".join(urls) + "\n")
     print(f"wrote {out}: {len(urls)} data paths now under {root}" + (f"; URLs in {urls_out}" if urls_out else ""))
     if check:
-        missing = [u for u in urls if not os.path.exists(root + u[len(DATA_HOST):])]
-        size = sum(os.path.getsize(root + u[len(DATA_HOST):]) for u in urls if u not in missing)
-        print(f"  local copy: {len(urls) - len(missing)} of {len(urls)} files present ({size / 1e9:.1f} GB)"
-              + (f"; first missing {missing[0]}" if missing else ""))
-        return len(missing)
+        return check_local(urls, root)
     return 0
+
+
+def _remote_size(url, tries=3):
+    """Content-Length of url from a HEAD request, or None if the server does not say."""
+    import time
+    import urllib.request
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "curl/8"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                n = r.headers.get("Content-Length")
+                return int(n) if n is not None else None
+        except Exception:
+            if k == tries - 1:
+                return None
+            time.sleep(3 * (k + 1))
+
+
+def check_local(urls, root, remote_size=None, log=print):
+    """Every file present AND complete: its size equals the server's. A partial
+    download would otherwise pass and silently shorten the stream (the trainer
+    reads the sizes it finds, so the data order would change). Returns the
+    number of files that are missing, partial or could not be checked."""
+    from concurrent.futures import ThreadPoolExecutor
+    remote_size = remote_size or _remote_size
+    paths = [root + u[len(DATA_HOST):] for u in urls]
+    with ThreadPoolExecutor(16) as pool:
+        remote = list(pool.map(remote_size, urls))
+    missing, partial, unknown, local_bytes = [], [], [], 0
+    for u, p, r in zip(urls, paths, remote):
+        if not os.path.exists(p):
+            missing.append(u)
+            continue
+        n = os.path.getsize(p)
+        local_bytes += n
+        if r is None:
+            unknown.append(u)
+        elif n != r:
+            partial.append(f"{u} ({n} of {r} bytes)")
+    complete = len(urls) - len(missing) - len(partial) - len(unknown)
+    log(f"  local copy: {complete} of {len(urls)} files complete ({local_bytes / 1e9:.1f} GB on disk); "
+        f"{len(missing)} missing, {len(partial)} partial, {len(unknown)} not checkable (no size from the server)")
+    for label, items in (("missing", missing), ("partial", partial), ("not checkable", unknown)):
+        if items:
+            log(f"    first {label}: {items[0]}")
+    return len(missing) + len(partial) + len(unknown)
 
 
 # ------------------------------------------------------------------- export
