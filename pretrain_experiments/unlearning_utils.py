@@ -888,6 +888,25 @@ def map_olmo_to_hf(lookup, n_layers: int, qkv_sizes) -> dict:
     return out
 
 
+def map_hf_to_olmo(hf: dict, n_layers: int) -> dict:
+    """The inverse of map_olmo_to_hf: HF tensors -> OLMo names (normalised).
+
+    q, k, v are concatenated back into att_proj and up, gate into ff_proj, in
+    the order map_olmo_to_hf splits them. Used to start an OLMo-trainer run
+    (mid-training) from an unlearned Hugging Face checkpoint.
+    """
+    out = {olmo: hf[name] for olmo, name in OLMO_TO_HF_TOP.items()}
+    for i in range(n_layers):
+        pre, h = f"transformer.blocks.{i}.", f"model.layers.{i}."
+        for suffix, hf_suffix in OLMO_TO_HF_BLOCK.items():
+            out[pre + suffix] = hf[h + hf_suffix]
+        out[pre + "att_proj.weight"] = torch.cat(
+            [hf[h + f"self_attn.{x}_proj.weight"] for x in ("q", "k", "v")], dim=0)
+        out[pre + "ff_proj.weight"] = torch.cat(
+            [hf[h + "mlp.up_proj.weight"], hf[h + "mlp.gate_proj.weight"]], dim=0)
+    return out
+
+
 def load_olmo_optim_state(path: str) -> dict:
     """Read optim.pt and return {normalised OLMo name: {step, exp_avg, ...}}.
 

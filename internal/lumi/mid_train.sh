@@ -4,49 +4,49 @@
 #SBATCH --partition=small-g
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=7
-#SBATCH --gpus-per-node=1
-#SBATCH --mem=120G
+#SBATCH --cpus-per-task=56
+#SBATCH --gpus-per-node=8
+#SBATCH --mem=480G
 #SBATCH --time=72:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --open-mode=append
 
-# LUMI wrapper for ONE mid-training run: a checkpoint continued on the OLMo-2
-# stage-2 mix with the released models' cooldown (pretrain_experiments/mid_train.py).
+# LUMI wrapper for ONE mid-training run, exactly as the TOAA authors ran theirs
+# (OLMo-Private single-training-run/mid-training/<size>/{exp,baseline}/run.sh):
+# OLMo's own scripts/train.py with their stage-2 yaml and --load_path, on one
+# node (8 GCDs; they used 8 H100). See pretrain_experiments/mid_train.py.
 #
-# The run is ~13 days of one GCD at micro-batch 1 (11,931 steps at ~94 s), far
-# beyond small-g's three days, so it is a CHAIN: each job trains until
-# MAX_HOURS, leaves a resume point, and submits the next job, until the driver
-# writes mid_train.done. A job that made no progress does not resubmit.
+# The run takes days (25B tokens), longer than one job, so it is a CHAIN: each
+# job stops itself at TIME_LIMIT_H (OLMo's time_limit, which saves an unsharded
+# checkpoint) and submits the next; the trainer's try_load_latest_save resumes
+# from the newest checkpoint in OUT with the data position restored. The first
+# job finds none and starts from START with the step counter and data at zero
+# (the yaml's restore_dataloader: false, as the authors). Done when
+# OUT/step11931-unsharded exists. A job that made no progress does not resubmit.
 #
-#   sbatch -J mid-<name> --export=ALL,MODEL=<checkpoint dir or repo>,OUT=<output dir>,OLMO_CONFIG=<stage-2 yaml> \
+#   sbatch -J mid-<name> --export=ALL,START=<OLMo checkpoint dir>,OUT=<dir>,STAGE2=<local yaml>,OLMO_REPO=<OLMo-Private> \
 #     internal/lumi/mid_train.sh
 #
 # Required:
-#   MODEL        the checkpoint to mid-train: a local Hugging Face folder (an
-#                unlearned model's step-N) or a Hub repository (with REVISION)
-#   OUT          output directory; step-N checkpoints, metrics.jsonl, mid_train.done
-#   OLMO_CONFIG  OLMo training config of the stage-2 mix: its data paths and seed
-#                define the stream. Paths may be http (streamed) or local.
+#   START     OLMo unsharded checkpoint: model.pt + optim.pt + train.pt. For an
+#             unlearned model, the output of `mid_train.py prepare`; for the
+#             experiment model itself, OLMo-2-1B-Exp-Unlearning step100000-unsharded
+#   OUT       where the trainer writes step<N>-unsharded every 1,000 steps
+#   STAGE2    the authors' stage-2 yaml with local data paths (`mid_train.py config`)
+#   OLMO_REPO the OLMo-Private checkout whose scripts/train.py runs (put first
+#             on PYTHONPATH, ahead of the OLMo fork installed in the container)
 # Optional:
-#   REVISION      revision of MODEL when it is a repository
-#   MAX_STEPS     11931 (25B tokens at 512 x 4096)
-#   LR            3.9855694839172363e-4, the rate at step 100,000; linear to zero
-#   MICRO_BATCH   1. Every sequence is 4,096 tokens, so nothing is padded and a
-#                 larger micro-batch does not change the objective; whether it is
-#                 numerically safe on this GPU stack is a smoke test, not a given
-#                 (micro-batch 2 and 4 turned padded unlearning batches NaN here).
-#   GRAD_CKPT     1, gradient checkpointing, as the unlearning runs
-#   RESUME_OPTIM  pretrain (default): Adam moments of OPTIM_REPO@OPTIM_REVISION;
-#                 none: zeroed moments; or a path to an OLMo optim.pt
-#   OPTIM_REPO / OPTIM_REVISION   default the 1B experiment model at step 100,000;
-#                 they MUST be the model's size (pass the 2.7B ones for a 2.7B run)
-#   CKPT_EVERY    250 steps between resume points (older ones are pruned)
-#   KEEP_STEPS    2000,4000,6000,8000,10000: steps whose weights are kept
-#   MAX_HOURS     70: train this long, then stop at a resume point
-#   CHAIN         1: submit the next job while the run is unfinished; 0: never
-#   SEED_OVERRIDE data-order seed instead of the config's
+#   MICRO_BATCH   per-GCD micro-batch; default the yaml's (2). Sequences are
+#                 4,096 tokens unpadded, so it does not change the objective;
+#                 SMOKE first (micro-batch 2 turned padded HF batches NaN here)
+#   ACT_CKPT      1: --activation_checkpointing=whole_layer (if 64 GB per GCD is
+#                 not enough; recomputation, the same numbers)
+#   TIME_LIMIT_H  70: hours before the trainer stops and checkpoints
+#   SMOKE         N: train N steps into OUT-smoke/ and stop (timing and NaN check);
+#                 never chains
+#   CHAIN         1: resubmit while unfinished; 0: never
+# The yaml's flash_attention: true is switched off: no flash-attn on LUMI (PyTorch SDPA instead).
 
 set -u
 set -o pipefail
@@ -64,68 +64,67 @@ export PE_REPO
 # shellcheck disable=SC1091
 source "${PE_REPO}/internal/lumi/env.sh"
 cd "$PE_REPO" || exit 1
-export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-: "${MODEL:?set MODEL (the checkpoint to mid-train)}"
-: "${OUT:?set OUT (the output directory)}"
-: "${OLMO_CONFIG:?set OLMO_CONFIG (the stage-2 OLMo training config)}"
-[ -f "$OLMO_CONFIG" ] || { echo "ERROR: OLMO_CONFIG does not point at a file: $OLMO_CONFIG" >&2; exit 1; }
-MAX_STEPS="${MAX_STEPS:-11931}"
-MICRO_BATCH="${MICRO_BATCH:-1}"
-MAX_HOURS="${MAX_HOURS:-70}"
-CHAIN="${CHAIN:-1}"
-# a resume point needs its trainer state; the unlearning launchers switch it off
-unset NO_TRAINER_STATE
+: "${START:?set START (OLMo unsharded checkpoint to start from)}"
+: "${OUT:?set OUT (output directory)}"
+: "${STAGE2:?set STAGE2 (the stage-2 yaml with local data paths, from mid_train.py config)}"
+: "${OLMO_REPO:?set OLMO_REPO (the OLMo-Private checkout)}"
+[ -f "$OLMO_REPO/scripts/train.py" ] || { echo "ERROR: no scripts/train.py under OLMO_REPO=$OLMO_REPO" >&2; exit 1; }
+[ -f "$STAGE2" ] || { echo "ERROR: STAGE2 is not a file: $STAGE2" >&2; exit 1; }
+for f in model train optim; do     # .pt or .safetensors: the OLMo trainer reads either
+  [ -e "$START/$f.pt" ] || [ -e "$START/$f.safetensors" ] || {
+    [ "$f" = optim ] && echo "ERROR: $START has no optimizer state" >&2 || echo "ERROR: $START has no $f.pt" >&2; exit 1; }
+done
+if grep -q "^ *- http://" "$STAGE2"; then
+  echo "ERROR: $STAGE2 still reads data over HTTP; make the local copy with mid_train.py config" >&2; exit 1
+fi
+MAX_STEPS=11931
+DONE="$OUT/step${MAX_STEPS}-unsharded"
+SAVE="$OUT"; [ -n "${SMOKE:-}" ] && SAVE="${OUT%/}-smoke"
+mkdir -p "$SAVE"
 
-latest_step () { ls -d "$OUT"/step-* 2>/dev/null | sed 's/.*step-//' | sort -n | tail -1; }
+latest_step () { ls -d "$SAVE"/step*-unsharded 2>/dev/null | sed 's/.*step\([0-9]*\)-unsharded/\1/' | sort -n | tail -1; }
 before="$(latest_step)"; before="${before:-0}"
 
-ARGS=(--model "$MODEL" --output-dir "$OUT" --olmo-config "$OLMO_CONFIG"
-      --max-steps "$MAX_STEPS" --micro-batch "$MICRO_BATCH" --max-hours "$MAX_HOURS"
-      --checkpoint-every "${CKPT_EVERY:-250}" --keep-steps "${KEEP_STEPS-2000,4000,6000,8000,10000}"
-      --dtype "${DTYPE:-bfloat16}")
-[ -n "${REVISION:-}" ] && ARGS+=(--revision "$REVISION")
-[ -n "${LR:-}" ] && ARGS+=(--learning-rate "$LR")
-[ -n "${SEED_OVERRIDE:-}" ] && ARGS+=(--seed-override "$SEED_OVERRIDE")
-[ "${GRAD_CKPT:-1}" = "1" ] && ARGS+=(--gradient-checkpointing)
+export PYTHONPATH="${OLMO_REPO}${PYTHONPATH:+:$PYTHONPATH}"
+export WANDB_MODE=disabled
+export OMP_NUM_THREADS=7
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
+# a resumed job must restore its own state; nothing of the unlearning launchers applies
+unset NO_TRAINER_STATE MODEL REVISION
 
-# Adam moments for the first job of the chain (a resumed job restores its own).
-RESUME_OPTIM="${RESUME_OPTIM:-pretrain}"
-if [ "$before" = "0" ] && [ "$RESUME_OPTIM" != "none" ]; then
-  if [ "$RESUME_OPTIM" = "pretrain" ]; then
-    OPTIM_REPO="${OPTIM_REPO:-sbordt/OLMo-2-1B-Exp-Unlearning}"
-    OPTIM_REVISION="${OPTIM_REVISION:-step100000-unsharded}"
-    RESUME_OPTIM="$(python -c "
-from huggingface_hub import hf_hub_download
-print(hf_hub_download('${OPTIM_REPO}', 'optim.pt', revision='${OPTIM_REVISION}'))" 2>&1 | tail -1)"
-  fi
-  [ -f "$RESUME_OPTIM" ] || { echo "ERROR: no optimizer state at '$RESUME_OPTIM'" >&2; exit 1; }
-  ARGS+=(--resume-optimizer-state "$RESUME_OPTIM")
-fi
+ARGS=("$STAGE2" "--save_folder=$SAVE" "--save_overwrite=True" "--save_interval=null"
+      "--save_interval_unsharded=1000" "--eval_on_load=False" "--load_path=$START"
+      "--try_load_latest_save=True" "--model.flash_attention=False"
+      "--time_limit=$(( ${TIME_LIMIT_H:-70} * 3600 ))")
+[ -n "${MICRO_BATCH:-}" ] && ARGS+=("--device_train_microbatch_size=$MICRO_BATCH")
+[ "${ACT_CKPT:-0}" = "1" ] && ARGS+=("--activation_checkpointing=whole_layer")
+[ -n "${SMOKE:-}" ] && ARGS+=("--stop_at=$SMOKE" "--save_interval_unsharded=null")
 
 echo "============================================"
-echo "  mid-training: $MODEL${REVISION:+@$REVISION}"
-echo "  out:          $OUT   (starts at step $before of $MAX_STEPS)"
-echo "  stream:       $OLMO_CONFIG"
-echo "  micro-batch:  $MICRO_BATCH   moments: ${RESUME_OPTIM}"
-echo "  host:         $(hostname)   job ${SLURM_JOB_ID:-none}"
+echo "  mid-training (OLMo trainer): $START"
+echo "  out:     $SAVE   (latest step $before of $MAX_STEPS)${SMOKE:+   SMOKE: $SMOKE steps}"
+echo "  config:  $STAGE2"
+echo "  olmo:    $OLMO_REPO ($(git -C "$OLMO_REPO" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
+echo "  host:    $(hostname)   job ${SLURM_JOB_ID:-none}   GCDs ${SLURM_GPUS_ON_NODE:-?}"
 echo "============================================"
 
-python pretrain_experiments/mid_train.py "${ARGS[@]}"
+python -m torch.distributed.run --standalone --nproc_per_node="${SLURM_GPUS_ON_NODE:-8}" \
+  "$OLMO_REPO/scripts/train.py" "${ARGS[@]}"
 rc=$?
 after="$(latest_step)"; after="${after:-0}"
-echo "  driver exit $rc; latest checkpoint step $after (was $before)"
+echo "  trainer exit $rc; latest checkpoint step $after (was $before)"
 
-if [ -f "$OUT/mid_train.done" ]; then
-  echo "  finished."
-elif [ "$CHAIN" != "1" ]; then
-  echo "  unfinished, and CHAIN=$CHAIN: not resubmitting."
+if [ -n "${SMOKE:-}" ]; then
+  echo "  smoke run: read the throughput (tokens/sec) and loss lines above; nothing chains."
+elif [ -d "$DONE" ]; then
+  echo "  finished: $DONE"
+elif [ "${CHAIN:-1}" != "1" ]; then
+  echo "  unfinished, and CHAIN=${CHAIN}: not resubmitting."
 elif [ "$after" -le "$before" ]; then
   echo "  NO PROGRESS in this job: not resubmitting. Fix the cause, then submit again." >&2
   exit 1
 else
-  limit="$(squeue -h -j "${SLURM_JOB_ID:-0}" -o %l 2>/dev/null)"
-  sbatch -J "${SLURM_JOB_NAME:-mid-train}" --time="${limit:-72:00:00}" --export=ALL "$PE_REPO/internal/lumi/mid_train.sh"
+  sbatch -J "${SLURM_JOB_NAME:-mid-train}" --export=ALL "$PE_REPO/internal/lumi/mid_train.sh"
 fi
 exit $rc

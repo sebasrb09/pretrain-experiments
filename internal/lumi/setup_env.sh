@@ -56,6 +56,8 @@
 #   PE_LUMI_STACK   stack module              (default: LUMI, unversioned)
 #   PE_TORCH_MOD    PyTorch container module  (default: 2.6.0-rocm-6.2.4)
 #   INSTALL_OLMO    1 to clone+install the OLMo fork (default: 0)
+#   INSTALL_OPEN_INSTRUCT  1 to install open-instruct in its own venv for SFT/DPO
+#                   (default: 0); needs OPEN_INSTRUCT_REF, the authors' commit
 #   MEASURE_MODEL   HF repo to size-test      (default: the 2.7B baseline)
 #   MAKE_SQUASHFS   1 to collapse the venv into one file at the end (default: 0)
 
@@ -206,6 +208,27 @@ if [ "$INSTALL_OLMO" = "1" ]; then
   # Same `-e ".[extras]"` form as above, for the same reason.
   ( cd "$OLMO_DIR" && python -m pip install -e ".[all]" ) || {
     echo "ERROR: pip install of the OLMo fork failed." >&2; exit 1; }
+fi
+
+if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
+  echo ""
+  echo "--- installing open-instruct (SFT / DPO, internal/lumi/post_train.sh) ---"
+  # In its OWN venv: open-instruct needs accelerate and deepspeed, which must not
+  # enter the training venv. --system-site-packages reuses the container's ROCm
+  # torch. OPEN_INSTRUCT_REF must be the commit the TOAA authors trained with.
+  : "${OPEN_INSTRUCT_REF:?set OPEN_INSTRUCT_REF to the open-instruct commit of the TOAA authors}"
+  OI_DIR="${PE_WORK}/open-instruct"; OI_VENV="${PE_WORK}/venvs/open-instruct"
+  [ -d "$OI_DIR" ] || git clone https://github.com/allenai/open-instruct "$OI_DIR"
+  git -C "$OI_DIR" fetch --all --quiet && git -C "$OI_DIR" checkout "$OPEN_INSTRUCT_REF" || {
+    echo "ERROR: open-instruct checkout of $OPEN_INSTRUCT_REF failed." >&2; exit 1; }
+  [ -x "$OI_VENV/bin/python" ] || python -m venv --system-site-packages "$OI_VENV"
+  # no vllm / flash-attn (CUDA-only, and neither is used by finetune.py or
+  # dpo_tune_cache.py here); deepspeed without compiled ops
+  DS_BUILD_OPS=0 "$OI_VENV/bin/python" -m pip install accelerate deepspeed peft datasets wandb tensorboard rich || {
+    echo "ERROR: pip install of the open-instruct dependencies failed." >&2; exit 1; }
+  "$OI_VENV/bin/python" -m pip install --no-deps -e "$OI_DIR" || {
+    echo "ERROR: pip install of open-instruct failed." >&2; exit 1; }
+  "$OI_VENV/bin/python" -c "import accelerate, deepspeed; print('  open-instruct venv: accelerate', accelerate.__version__, 'deepspeed', deepspeed.__version__)"
 fi
 
 # --- 4. verify ---------------------------------------------------------------
