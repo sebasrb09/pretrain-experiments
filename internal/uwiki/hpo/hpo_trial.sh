@@ -6,7 +6,10 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=7
 #SBATCH --gpus-per-node=1
-#SBATCH --mem=120G
+#SBATCH --mem=60G
+# 60G, not 120G (2026-10-14): small-g bills max(GCDs, cores/8, mem/64GB), so 120G
+# cost two GCDs. Peak resident memory measured by sacct (MaxRSS): GradDiff trials
+# ~46 GiB (it loads the retain stream), WGA ~11 GiB.
 #SBATCH --time=06:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err

@@ -26,9 +26,8 @@
 #
 # Required: STAGE (sft | dpo), MODEL, OUT
 # Optional:
-#   OPEN_INSTRUCT  the open-instruct checkout (default $PE_WORK/open-instruct); it
-#                  must be the commit the authors used (ask them: git rev-parse HEAD
-#                  in /weka/luxburg/sbordt10/open-instruct)
+#   OPEN_INSTRUCT  the open-instruct checkout (default $PE_WORK/open-instruct): the
+#                  authors' fork sbordt/open-instruct at 914455d6, as setup_env.sh installs it
 #   OI_VENV        its virtual environment (default $PE_WORK/venvs/open-instruct),
 #                  made by setup_env.sh INSTALL_OPEN_INSTRUCT=1; NOT the training
 #                  venv, which must not get accelerate

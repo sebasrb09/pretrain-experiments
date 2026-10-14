@@ -57,7 +57,7 @@
 #   PE_TORCH_MOD    PyTorch container module  (default: 2.6.0-rocm-6.2.4)
 #   INSTALL_OLMO    1 to clone+install the OLMo fork (default: 0)
 #   INSTALL_OPEN_INSTRUCT  1 to install open-instruct in its own venv for SFT/DPO
-#                   (default: 0); needs OPEN_INSTRUCT_REF, the authors' commit
+#                   (default: 0); OPEN_INSTRUCT_REF, default the authors' fork at 914455d6
 #   MEASURE_MODEL   HF repo to size-test      (default: the 2.7B baseline)
 #   MAKE_SQUASHFS   1 to collapse the venv into one file at the end (default: 0)
 
@@ -215,20 +215,35 @@ if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
   echo "--- installing open-instruct (SFT / DPO, internal/lumi/post_train.sh) ---"
   # In its OWN venv: open-instruct needs accelerate and deepspeed, which must not
   # enter the training venv. --system-site-packages reuses the container's ROCm
-  # torch. OPEN_INSTRUCT_REF must be the commit the TOAA authors trained with.
-  : "${OPEN_INSTRUCT_REF:?set OPEN_INSTRUCT_REF to the open-instruct commit of the TOAA authors}"
+  # torch. The TOAA authors trained with their fork, sbordt/open-instruct, whose
+  # only branch ends at 914455d6 (2025-12-15, before their April 2026 SFT/DPO
+  # runs; it carries their changes to finetune.py and model_utils.py).
+  OPEN_INSTRUCT_REF="${OPEN_INSTRUCT_REF:-914455d6ad57da13f304f4bce65683b205e9b330}"
   OI_DIR="${PE_WORK}/open-instruct"; OI_VENV="${PE_WORK}/venvs/open-instruct"
-  [ -d "$OI_DIR" ] || git clone https://github.com/allenai/open-instruct "$OI_DIR"
+  [ -d "$OI_DIR" ] || git clone https://github.com/sbordt/open-instruct "$OI_DIR"
   git -C "$OI_DIR" fetch --all --quiet && git -C "$OI_DIR" checkout "$OPEN_INSTRUCT_REF" || {
     echo "ERROR: open-instruct checkout of $OPEN_INSTRUCT_REF failed." >&2; exit 1; }
   [ -x "$OI_VENV/bin/python" ] || python -m venv --system-site-packages "$OI_VENV"
-  # no vllm / flash-attn (CUDA-only, and neither is used by finetune.py or
-  # dpo_tune_cache.py here); deepspeed without compiled ops
-  DS_BUILD_OPS=0 "$OI_VENV/bin/python" -m pip install accelerate deepspeed peft datasets wandb tensorboard rich || {
+  # That version's pyproject.toml dependencies, without the CUDA-only ones
+  # (vllm, flash-attn, liger-kernel, bitsandbytes) and keeping the container's
+  # torch; deepspeed without compiled ops.
+  DS_BUILD_OPS=0 "$OI_VENV/bin/python" -m pip install "accelerate>=1.10.1" "deepspeed<0.17.3" "transformers>=4.57.0" \
+    "datasets>=4.0.0" "peft>=0.13.2" "ray>=2.49.2" beaker-py rich tensorboard "wandb==0.18.1" backoff nltk \
+    hf-transfer langdetect==1.0.9 immutabledict==1.2.0 "antlr4-python3-runtime==4.11" python-dateutil pandas || {
     echo "ERROR: pip install of the open-instruct dependencies failed." >&2; exit 1; }
   "$OI_VENV/bin/python" -m pip install --no-deps -e "$OI_DIR" || {
     echo "ERROR: pip install of open-instruct failed." >&2; exit 1; }
-  "$OI_VENV/bin/python" -c "import accelerate, deepspeed; print('  open-instruct venv: accelerate', accelerate.__version__, 'deepspeed', deepspeed.__version__)"
+  # open_instruct/utils.py imports vllm.config for one type annotation
+  # (ModelDims.from_vllm_config, never called by finetune.py or dpo_tune_cache.py):
+  # a stand-in module, instead of installing a CUDA inference engine
+  SITE="$("$OI_VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
+  if ! "$OI_VENV/bin/python" -c "import vllm" 2>/dev/null; then
+    mkdir -p "$SITE/vllm"
+    echo "# stand-in: open_instruct.utils imports vllm.config for a type annotation only" > "$SITE/vllm/__init__.py"
+    printf 'class VllmConfig:\n    pass\n' > "$SITE/vllm/config.py"
+  fi
+  "$OI_VENV/bin/python" -c "import accelerate, deepspeed, open_instruct.utils, open_instruct.dataset_transformation, open_instruct.model_utils; print('  open-instruct venv: accelerate', accelerate.__version__, 'deepspeed', deepspeed.__version__, '- open_instruct imports')" || {
+    echo "ERROR: open-instruct does not import in its venv." >&2; exit 1; }
 fi
 
 # --- 4. verify ---------------------------------------------------------------
