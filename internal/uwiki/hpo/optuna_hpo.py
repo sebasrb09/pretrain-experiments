@@ -28,6 +28,11 @@ Usage:
     # 3. the search, once both anchor jobs have finished
     python internal/uwiki/hpo/optuna_hpo.py --method ce-u --max-parallel 8
 
+    # 3b. the full-range search (2026-10-15): scored up to C4 33, valued by the
+    #     area under the trajectory, wider space, starting from the first search
+    python internal/uwiki/hpo/optuna_hpo.py --method npo --objective wmarea --space v2 \
+        --warm-start hpo-npo-wm --startup 16 --max-trials 100 --budget-tokens 4e9 --max-batch 512
+
     # 4. the full suite on the searches' frontier checkpoints in a plan
     #    (forget_score.py frontier); retrains only what is not on disk
     python internal/uwiki/hpo/optuna_hpo.py --frontier PLAN.csv --dry-run
@@ -192,7 +197,7 @@ def _check_targets(targets, size):
         sys.exit(f"REFUSING to evaluate as {size}:\n  " + "\n  ".join(bad[:12]))
 
 
-UTIL_CAP_PCT = "5.0"
+UTIL_CAP_PCT = "5.0"     # the first searches' cap; per objective: forget_score.CAP_PCT
 
 # The objective is forget_score.F: forgetting on fictional knowledge, insertion
 # likelihood and the watermark, each scaled by its own two anchors. The tag is
@@ -385,7 +390,7 @@ class _StubTrial:
         return v
 
 
-def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
+def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin, space="v1"):
     rng = random.Random(0)
     print(f"=== budget plan: {method} ===")
     print(f"  pre-training run     {spaces.PRETRAIN_TOKENS/1e9:8.1f}B tokens")
@@ -397,7 +402,7 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
           f"({'2x' if spaces.USES_RETAIN[method] else '1x'} tokens per step)")
     print()
     costs = []
-    for b in [x for x in spaces.BATCH_CHOICES if x <= max_batch]:
+    for b in [x for x in (spaces.V2_BATCH_CHOICES if space == "v2" else spaces.BATCH_CHOICES) if x <= max_batch]:
         c = spaces.trial_tokens(method, b, steps)
         costs.append(c)
         wt = trial_walltime(method, {"batch_size": b}, steps, rungs, tph, emin)
@@ -412,7 +417,7 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
     print(f"\n=== {n_show} sample configurations ===")
     for i in range(n_show):
         t = _StubTrial(rng)
-        p = spaces.suggest(t, method, steps, max_batch)
+        p = spaces.suggest(t, method, steps, max_batch, space)
         cost = spaces.trial_tokens(method, p["batch_size"], steps)
         bits = " ".join(
             f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
@@ -429,12 +434,12 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin):
 STARTUP_HOURS = 0.15
 
 
-def _space_distributions(method, steps, max_batch):
+def _space_distributions(method, steps, max_batch, space="v1"):
     """The Optuna distributions of this method's space, at these settings."""
     import optuna
     tmp = optuna.create_study()          # in memory, never stored
     t = tmp.ask()
-    spaces.suggest(t, method, steps, max_batch)
+    spaces.suggest(t, method, steps, max_batch, space)
     return dict(t.distributions)
 
 
@@ -451,7 +456,7 @@ def _seed_study(study, args):
     outside the new space is not copied.
     """
     import optuna
-    dists = _space_distributions(args.method, args.steps, args.max_batch)
+    dists = _space_distributions(args.method, args.steps, args.max_batch, args.space)
     n = 0
     for name in args.seed_from.split(","):
       src = optuna.load_study(study_name=name, storage=_storage(args))
@@ -506,6 +511,44 @@ def _enqueue(study, args):
     print(f"  enqueued: {tag}")
 
 
+def _warm_start(study, args):
+    """Queue the configurations on an earlier study's frontier as this study's first trials.
+
+    For the full-range searches (2026-10-15): the first searches spent most or
+    all of their budget on random startup trials (SatImp and SimNPO never reached
+    the GP), so a new study starts from what they found instead of from
+    scratch. Up to --warm-max trials with a point on the source's own frontier
+    (forget_score.frontier_trials, 0.25 TPR points), spread along it. Their
+    values must lie inside this study's space, which widens the source's.
+    Idempotent: a relaunch queues nothing twice. They count toward --startup.
+    """
+    import optuna
+    import forget_score as fs
+    dists = _space_distributions(args.method, args.steps, args.max_batch, args.space)
+    have = {t.user_attrs.get("enqueued_from") for t in study.trials}
+    for name in args.warm_start.split(","):
+        src = optuna.load_study(study_name=name, storage=_storage(args))
+        trials = {t.number: t for t in src.trials}
+        picked = fs.frontier_trials(args.output_root, name, args.method, n=args.warm_max)
+        n = 0
+        for no in picked:
+            t, tag = trials.get(no), f"warm {name}:{no}"
+            if t is None or tag in have:
+                continue
+            try:
+                fits = set(t.params) == set(dists) and all(
+                    dists[k]._contains(dists[k].to_internal_repr(v)) for k, v in t.params.items())
+            except (ValueError, TypeError):
+                fits = False
+            if not fits:
+                print(f"  warm start: {name} trial {no} lies outside this space, not queued")
+                continue
+            study.enqueue_trial(dict(t.params), user_attrs={"enqueued_from": tag})
+            n += 1
+        print(f"  warm start: {n} configuration(s) of {name}'s frontier queued "
+              f"(trials {' '.join(map(str, picked)) or 'none'})")
+
+
 def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=24):
     """SLURM walltime for one trial, scaled by what the trial actually costs.
 
@@ -543,6 +586,7 @@ class StaleTrialDir(RuntimeError):
 
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
             study_name, anchor_root, objective="f3"):
+    import forget_score as fs
     # The study name carries the objective tag, so no two studies share a tag.
     tag = f"{study_name}-t{trial_no:04d}"
     if not dry and os.path.exists(os.path.join(out_root, tag)):
@@ -564,7 +608,7 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
         "OUTPUT_ROOT": out_root,
         "RUNGS": " ".join(str(r) for r in rungs),
         "ANCHOR_ROOT": anchor_root,
-        "UTIL_CAP_PCT": UTIL_CAP_PCT,
+        "UTIL_CAP_PCT": fs.CAP_PCT[objective],
         "HPO_OBJECTIVE": objective,
     })
     env.update(EVAL_ENV)
@@ -674,11 +718,26 @@ def search(args):
     if have != args.objective:
         sys.exit(f"study {study.study_name} maximises {have!r}, not {args.objective!r}: "
                  "pass --objective " + have + " to continue it, or a new --study")
-    print(f"  objective {args.objective}: mean progress on {', '.join(fs.OBJECTIVES[args.objective])}")
+    # ... and the space version it samples (spaces.SPACES); one made before versions is v1
+    sp = study.user_attrs.get("space")
+    if sp is None:
+        sp = "v1" if study.trials else args.space
+        study.set_user_attr("space", sp)
+    if sp != args.space:
+        sys.exit(f"study {study.study_name} samples space {sp!r}, not {args.space!r}: "
+                 "pass --space " + sp + " to continue it, or a new --study")
+    if args.objective == "wmarea":
+        print(f"  objective wmarea: area under the poison TPR along each trajectory, C4 up to "
+              f"+{fs.CAP_PCT['wmarea']}%; space {args.space}")
+    else:
+        print(f"  objective {args.objective}: mean progress on {', '.join(fs.OBJECTIVES[args.objective])}; "
+              f"space {args.space}")
     if args.seed_from and not study.trials:
         _seed_study(study, args)
     if args.enqueue_from:
         _enqueue(study, args)
+    if args.warm_start:
+        _warm_start(study, args)
 
     spent = sum(t.user_attrs.get("tokens", 0) for t in study.trials
                 if t.user_attrs.get("tokens"))
@@ -723,6 +782,8 @@ def search(args):
         while len(inflight) < args.max_parallel:
             if spent >= args.budget_tokens:
                 break
+            if args.max_trials and sum(1 for t in study.trials if t.user_attrs.get("job")) >= args.max_trials:
+                break       # every trial evaluates up to 9 rungs, which tokens do not count
             if not args.dry_run:
                 n_queued = _queue_size()
                 if n_queued is not None and n_queued >= args.submit_cap:
@@ -733,7 +794,7 @@ def search(args):
                     break
             waiting = False
             trial = study.ask()
-            params = spaces.suggest(trial, args.method, args.steps, args.max_batch)
+            params = spaces.suggest(trial, args.method, args.steps, args.max_batch, args.space)
             cost = spaces.trial_tokens(args.method, params["batch_size"], args.steps)
             if spent + cost > args.budget_tokens:
                 # Do not overspend. Returning the trial as failed keeps the
@@ -1626,6 +1687,17 @@ def main():
                          "narrowing --max-batch)")
     ap.add_argument("--enqueue-from", default=None,
                     help="STUDY:TRIAL to run again first, with --set overrides (a control)")
+    ap.add_argument("--space", choices=spaces.SPACES, default="v1",
+                    help="search space version (spaces.py): v1 the first searches, v2 the full-range "
+                         "searches (batches 32 and 64, WGA beta1 to 500, CE-U min_forget_ce to 0.1). "
+                         "Recorded in the study; a mismatch is refused.")
+    ap.add_argument("--warm-start", default=None,
+                    help="STUDY[,STUDY]: queue the configurations on these studies' own frontiers as "
+                         "the first trials (e.g. hpo-npo-wm for hpo-npo-wmarea)")
+    ap.add_argument("--warm-max", type=int, default=12, help="with --warm-start: at most this many per study")
+    ap.add_argument("--max-trials", type=int, default=None,
+                    help="stop submitting after this many trials, whatever the token budget: small "
+                         "batches make trials cheap in tokens, but each still evaluates up to 9 rungs")
     ap.add_argument("--set", action="append", default=[],
                     help="NAME=VALUE override for --enqueue-from, natural names "
                          "(adam_beta1=0.9); repeatable")
@@ -1724,7 +1796,7 @@ def main():
 
     if args.plan:
         plan(args.method, args.budget_tokens, args.steps, args.rungs, 10,
-             args.max_batch, args.tokens_per_hour, args.eval_minutes)
+             args.max_batch, args.tokens_per_hour, args.eval_minutes, args.space)
         return 0
     if args.eval_cells:
         eval_cells(args)

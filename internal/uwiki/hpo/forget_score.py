@@ -87,7 +87,15 @@ OBJECTIVES = {
     # the Gaussian poison alone (decided 2026-10-09): the one task whose removal
     # is a calibrated statistical test, so unlearning is told apart from noise
     "wm": ("wm",),
+    # the Gaussian poison over the figures' whole perplexity range (2026-10-15):
+    # the trial's value is trajectory_area(), not its best point, and its rungs
+    # are scored up to C4 33 instead of +5%
+    "wmarea": ("wm",),
 }
+# The utility cap each objective's trials stop at, in % over the Baseline's C4
+# on the search's slice. wmarea's is the figures' x range, C4 33 on the reporting
+# slice (Baseline 18.77 there): 33 / 18.77 - 1 = 75.8%.
+CAP_PCT = {"f3": "5.0", "wm": "5.0", "wmarea": "75.8"}
 POINTS = ("baseline", "deep-ignorance")
 
 # The variables that decide what an evaluation measures. The anchors and every
@@ -258,6 +266,32 @@ def poison_tpr(wm_q4):
     return 1.0 - NormalDist().cdf(Z99 - abs(wm_q4))
 
 
+def trajectory_area(points, anchors, cap_pct):
+    """The wmarea objective: how far one trial's trajectory lowers the poison
+    TPR across the whole perplexity range, in [0, 1].
+
+    The attainment curve f(c) is the lowest TPR among the trial's points with a
+    C4 increase of at most c (the Baseline's TPR before its first point). The
+    value is the mean over c in [0, cap_pct] of (TPR_baseline - f(c)) /
+    (TPR_baseline - TPR_counterfactual), clipped to [0, 1]: the area between
+    the Baseline and the trial's curve in the plotted plane, normalised so that
+    1 is the counterfactual's TPR from the first step on. It rewards a
+    configuration that lowers the TPR early and keeps lowering it, which is
+    what the frontier in the figures is made of, instead of one point at +5%.
+    points: dicts with c4_delta_pct and wm_q4 (summarize_trial's points)."""
+    tb = poison_tpr(anchors["baseline"]["wm"])
+    tc = poison_tpr(anchors["deep-ignorance"]["wm"])
+    pts = sorted((max(0.0, p["c4_delta_pct"]), poison_tpr(p["wm_q4"])) for p in points
+                 if p.get("c4_delta_pct") is not None and p.get("wm_q4") is not None
+                 and p["c4_delta_pct"] <= cap_pct)
+    area, best, at = 0.0, tb, 0.0
+    for c, t in pts:
+        area += (c - at) * (tb - best)
+        at, best = c, min(best, t)
+    area += (cap_pct - at) * (tb - best)
+    return min(1.0, max(0.0, area / (cap_pct * (tb - tc))))
+
+
 def dominated(p, others, tol=0.0):
     """tol (TPR, a fraction): a point with C4 no higher whose TPR is at most tol
     higher also removes p, so only points that lower the TPR by more than tol
@@ -381,11 +415,37 @@ def thin(points, eps, start):
     return out
 
 
+def frontier_trials(output_root, study, method, tol=0.25, max_c4=KEEP_MAX_C4, n=12):
+    """Trial numbers of a finished study with a point on its own frontier (C4
+    against poison TPR, thinned at tol TPR points), at most n of them spread
+    along it in perplexity: the warm start of a later study (optuna_hpo.py
+    --warm-start). Read from the trials' hpo_result.json on the cluster."""
+    pts, start = [], None
+    for cell, path in finished_trials(output_root, study, method).items():
+        with open(path, encoding="utf-8") as fh:
+            res = json.load(fh)
+        m = re.search(r"-t(\d+)$", os.path.basename(os.path.dirname(os.path.dirname(cell))))   # <tag>/<method>/<cell>
+        if not m or not res.get("anchors"):
+            continue
+        start = 100 * poison_tpr(res["anchors"]["baseline"]["wm"])
+        for step, (c4, t) in _result_points(path, max_c4).items():
+            pts.append((c4, 100 * t, int(m.group(1))))
+    if start is None:
+        return []
+    order = []
+    for _, _, no in thin(pts, tol, start):
+        if no not in order:
+            order.append(no)
+    if len(order) > n:
+        order = [order[round(i * (len(order) - 1) / (n - 1))] for i in range(n)]
+    return order
+
+
 def frontier_plan(export, sweeps, tol, max_c4=KEEP_MAX_C4):
     """The plan rows (PLAN_FIELDS) for every search exported under `export`
-    (hpo-*-wm/). sweeps: [(dir with results_cells.csv, dir with
-    results_anchors.csv)], the grid sweep(s) to beat; max_c4 is on the first
-    sweep's (reporting) C4 axis."""
+    (hpo-*-wm/ and hpo-*-wmarea/; the searches of one method form one frontier).
+    sweeps: [(dir with results_cells.csv, dir with results_anchors.csv)], the
+    grid sweep(s) to beat; max_c4 is on the first sweep's (reporting) C4 axis."""
     lim = max_c4 / _baseline_c4(os.path.join(sweeps[0][1], "results_anchors.csv")) - 1
     swept = {}
     for cells, anchors in sweeps:
@@ -394,26 +454,29 @@ def frontier_plan(export, sweeps, tol, max_c4=KEEP_MAX_C4):
             c4, wm = _num(r.get("c4_ppl")), _num(r.get("wm_q4"))
             if c4 is not None and wm is not None and c4 / b - 1 <= lim:
                 swept.setdefault(r["method"], []).append((100 * (c4 / b - 1), 100 * poison_tpr(wm), None))
-    rows = []
-    for d in sorted(glob.glob(os.path.join(export, "hpo-*-wm"))):
+    pts, start, kept = {}, {}, {}
+    for d in sorted(glob.glob(os.path.join(export, "hpo-*-wm")) + glob.glob(os.path.join(export, "hpo-*-wmarea"))):
         with open(os.path.join(d, "study.json"), encoding="utf-8") as fh:
             meta = json.load(fh)
         method, study = meta["method"], meta["study"]
         b = _num(meta.get("base_c4_ppl")) or 18.81
-        start = 100 * poison_tpr(meta["anchors"]["baseline"]["wm"])
-        kept = {int(r["trial"]): {int(s) for s in (r.get("kept_steps") or "").split()}
-                for r in _csv(os.path.join(d, "trials.csv"))}
-        pts = []
+        start[method] = 100 * poison_tpr(meta["anchors"]["baseline"]["wm"])
+        for r in _csv(os.path.join(d, "trials.csv")):
+            kept[(study, int(r["trial"]))] = {int(s) for s in (r.get("kept_steps") or "").split()}
         for r in _csv(os.path.join(d, "rungs.csv")):
             c4, wm = _num(r.get("c4_ppl")), _num(r.get("wm_q4"))
             if c4 is not None and wm is not None and c4 / b - 1 <= lim:
-                pts.append((100 * (c4 / b - 1), 100 * poison_tpr(wm), (int(r["trial"]), int(r["step"]))))
-        for c, t, ts in thin(pts + swept.get(method, []), tol, start):
-            if ts is not None:
-                rows.append({"method": method, "study": study, "trial": ts[0], "step": ts[1],
+                pts.setdefault(method, []).append(
+                    (100 * (c4 / b - 1), 100 * poison_tpr(wm), (study, int(r["trial"]), int(r["step"]))))
+    rows = []
+    for method in sorted(pts):
+        for c, t, key in thin(pts[method] + swept.get(method, []), tol, start[method]):
+            if key is not None:
+                study, trial, step = key
+                rows.append({"method": method, "study": study, "trial": trial, "step": step,
                              "c4_rel_pct": round(c, 4), "tpr_pct": round(t, 4),
-                             "on_disk": int(ts[1] in kept.get(ts[0], set()))})
-    return sorted(rows, key=lambda r: (r["method"], r["trial"], r["step"]))
+                             "on_disk": int(step in kept.get((study, trial), set()))})
+    return sorted(rows, key=lambda r: (r["method"], r["study"], r["trial"], r["step"]))
 
 
 def _main():
@@ -459,7 +522,7 @@ def _main():
             mine = [r for r in rows if r["method"] == m]
             gone = [r for r in mine if not r["on_disk"]]
             print(f"  {m:16s} {len(mine):11d} {len(mine) - len(gone):8d} "
-                  f"{len(gone):12d} ({len({r['trial'] for r in gone})})")
+                  f"{len(gone):12d} ({len({(r['study'], r['trial']) for r in gone})})")
         gone = [r for r in rows if not r["on_disk"]]
         print(f"  {'total':16s} {len(rows):11d} {len(rows) - len(gone):8d} "
               f"{len(gone):12d} ({len({(r['study'], r['trial']) for r in gone})})")

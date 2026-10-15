@@ -81,12 +81,19 @@ def main():
         best = min(points, key=lambda p: p["c4_delta_pct"])
     else:
         best = None
+    value = None if best is None else best["F"]
+    if objective == "wmarea" and best is not None:
+        # The whole trajectory, not one point (forget_score.trajectory_area);
+        # best stays the point with the highest p_wm inside the range, for the record.
+        value = fs.trajectory_area(points, anchors, cap)
 
     result = {
         "trial": int(env["TRIAL"]),
         "method": env["METHOD"],
         "cell_dir": cell_dir,
-        "objective_name": f"F = mean(p_{', p_'.join(tasks)}), maximized ({objective})",
+        "objective_name": ("area between the Baseline's poison TPR and the trajectory up to the cap, "
+                           "maximized (wmarea)" if objective == "wmarea" else
+                           f"F = mean(p_{', p_'.join(tasks)}), maximized ({objective})"),
         "objective_tasks": list(tasks),
         "anchor_root": anchor_root,
         "anchors": {pt: anchors[pt] for pt in fs.POINTS},
@@ -99,7 +106,7 @@ def main():
         # Positive means the cap was exceeded, Optuna's constraints convention.
         "constraint": None if best is None else best["c4_delta_pct"] - cap,
         # What the driver passes to study.tell (direction=maximize).
-        "objective": None if best is None else best["F"],
+        "objective": value,
         # checkpoints left on disk: the rungs on the frontier when they were
         # scored (wm searches since 2026-10-14; see hpo_trial.sh), for the full suite
         "kept_steps": sorted(int(d[len("step-"):]) for d in os.listdir(cell_dir)

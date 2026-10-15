@@ -234,7 +234,24 @@ THROUGHPUT = {
     "rmu": 15e6,
 }
 
-def _common(trial, method, steps, max_batch):
+# SPACE VERSIONS. A study keeps the space it was created with (optuna_hpo.py
+# records it and refuses another), because Optuna models a parameter only where
+# every trial shares one distribution.
+#   v1  the first searches (hpo-<method>-wm, 2026-10-09)
+#   v2  the full-range searches (hpo-<method>-wmarea, 2026-10-15), widened
+#       where the v1 frontier sat on an edge of v1 (user's choice): batches 32
+#       and 64 (CE-U, NPO and SimNPO at 128), WGA's beta1 to 500 (12 of 13
+#       frontier trials at 50) and CE-U's min_forget_ce to 0.1 (5 of 8 at 1e-2).
+#       Learning rates unchanged: CE-U and GA at the 1e-3 ceiling already climb
+#       about one C4 point per rung, so they cross the range within the
+#       schedule, and every other method has trials that blow up inside its range.
+SPACES = ("v1", "v2")
+V2_BATCH_CHOICES = [32, 64] + BATCH_CHOICES
+V2_KNOB_RANGE = dict(KNOB_RANGE, wga=("beta1", 0.05, 500.0, True))
+V2_MIN_FORGET_CE = (1e-7, 1e-1)
+
+
+def _common(trial, method, steps, max_batch, space="v1"):
     """The dimensions every method shares.
 
     lr_schedule is pinned to "warmup" rather than sampled, so that warmup_frac
@@ -247,7 +264,7 @@ def _common(trial, method, steps, max_batch):
     # batches are the ones at risk. The ceiling is left to the caller rather
     # than hardcoded, because the only evidence for it is a guessed throughput
     # until the pilot measures the real one.
-    choices = [b for b in BATCH_CHOICES if b <= max_batch]
+    choices = [b for b in (V2_BATCH_CHOICES if space == "v2" else BATCH_CHOICES) if b <= max_batch]
     if not choices:
         raise ValueError(f"max_batch={max_batch} excludes every batch size")
     p = {
@@ -277,17 +294,20 @@ def _common(trial, method, steps, max_batch):
     return p
 
 
-def suggest(trial, method, steps=55, max_batch=10**9):
+def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
     # Validate up front. The per-method blocks below are purely additive, so a
     # method with a knob but no second hyperparameter (wga) must not fall
     # through to an else-raise, which is exactly what it used to do.
     if method not in USES_RETAIN:
         raise ValueError(f"no search space defined for method {method!r}")
+    if space not in SPACES:
+        raise ValueError(f"no search space version {space!r}")
 
-    p = _common(trial, method, steps, max_batch)
+    p = _common(trial, method, steps, max_batch, space)
 
-    if method in KNOB_RANGE:
-        name, lo, hi, log = KNOB_RANGE[method]
+    knobs = V2_KNOB_RANGE if space == "v2" else KNOB_RANGE
+    if method in knobs:
+        name, lo, hi, log = knobs[method]
         p[name] = trial.suggest_float(name, lo, hi, log=log)
 
     if method == "ce-u":
@@ -296,7 +316,8 @@ def suggest(trial, method, steps=55, max_batch=10**9):
         # the 1/(1-q) gradient factor at 1/eps, which is what bounds how hard a
         # heavily memorized token can pull. 1e-7 is the faithful setting and
         # 1e-3 the documented escape hatch for divergence. Never swept.
-        p["min_forget_ce"] = trial.suggest_float("min_forget_ce", 1e-7, 1e-2, log=True)
+        lo, hi = V2_MIN_FORGET_CE if space == "v2" else (1e-7, 1e-2)
+        p["min_forget_ce"] = trial.suggest_float("min_forget_ce", lo, hi, log=True)
 
     elif method == "satimp":
         # beta2 took values up to 3.0 across the recorded configs, but not

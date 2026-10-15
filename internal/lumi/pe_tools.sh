@@ -71,7 +71,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     g=31; [ "$s" = hpo-ce-u-f3 ] && g=-
     _grp "1B finalized ${s#hpo-}" "$g" "$ALL" $(printf '%s/evals ' "$W"/hpo-final/"$s"-final-*/*/*/step-*)
   done
-  _grp "1B frontier, search checkpoints" - "$ALL" "$W"/hpo/hpo-*-wm-t*/*/*/step-*/evals
+  _grp "1B frontier, search checkpoints" - "$ALL" "$W"/hpo/hpo-*-wm*-t*/*/*/step-*/evals
   _grp "1B frontier, retrained" - "$ALL" "$W"/hpo-frontier/hpo-*-front-*/*/*/step-*/evals
   _grp "1B reference points, batch 1" all "ppl fk il wm mia" "$W"/unlearning-pareto-1B-b1/anchors/*/step-* | sed 's/ | capability.*//'
   _grp "1B reference points, eager" all "bm pe dos math news" "$W"/unlearning-pareto-1B-e8/anchors/*/step-*
@@ -92,7 +92,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     [ -z "$(ls -d "$W"/hpo-final-2.7B/"$s"-final-*/*/*/step-* 2>/dev/null)" ] && printf '%-32s no checkpoint yet (training)\n' "2.7B finalized ${s#hpo-}"
   done
   echo "== SEARCHES (trials with a result / trials started)"
-  for s in $(ls -d "$W"/hpo/hpo-*-wm-t[0-9]* 2>/dev/null | sed 's|.*/||; s/-t[0-9]*$//' | sort -u); do
+  for s in $(ls -d "$W"/hpo/hpo-*-wm-t[0-9]* "$W"/hpo/hpo-*-wmarea-t[0-9]* 2>/dev/null | sed 's|.*/||; s/-t[0-9]*$//' | sort -u); do
     printf '%-32s %3d / %3d\n' "$s" "$(ls "$W"/hpo/"$s"-t[0-9]*/*/*/hpo_result.json 2>/dev/null | wc -l)" "$(ls -d "$W"/hpo/"$s"-t[0-9]* 2>/dev/null | wc -l)"
   done
   echo "== QUEUE"
@@ -100,8 +100,8 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     -e 's/ pe-anchor-2\.7B-.*-(b1|e8|e8math|c4|util)$/ 2.7B reference points, group \1/' \
     -e 's/ pe-(hpo-[A-Za-z0-9.-]+)-final-t[0-9]+-.*-(b1|e8|e8math|c4)$/ finalized \1, evaluation group \2/' \
     -e 's/ (hpo-[A-Za-z0-9.-]+)-final-t[0-9]+$/ finalized \1, TRAINING/' \
-    -e 's/ pe-(hpo-[a-z0-9-]+-wm)-(front-)?t[0-9]+-.*-(b1|e8|e8math|c4)$/ frontier \1, evaluation group \3/' \
-    -e 's/ (hpo-[a-z0-9-]+-wm)-front-t[0-9]+$/ frontier \1, RETRAINING/' \
+    -e 's/ pe-(hpo-[a-z0-9-]+-wm(area)?)-(front-)?t[0-9]+-.*-(b1|e8|e8math|c4)$/ frontier \1, evaluation group \4/' \
+    -e 's/ (hpo-[a-z0-9-]+-wm(area)?)-front-t[0-9]+$/ frontier \1, RETRAINING/' \
     -e 's/ (hpo-[a-z0-9-]+)-t[0-9]+$/ search \1, trial/' \
     -e 's/ pe-1B-v2-rmu-a0-.*-(b1|e8|e8math|c4)$/ 1B RMU alpha=0, evaluation group \1/' \
     -e 's/ pe-model-.*-(b1|e8|e8math|c4|util)$/ whole models, group \1/' \
@@ -250,7 +250,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
   local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F)"
   local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B"
-  local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-wm-t[0-9]+$/hpo-\1-wm/p' | sort -u | tr '\n' ' ')
+  local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-(wm|wmarea)-t[0-9]+$/hpo-\1-\2/p' | sort -u | tr '\n' ' ')
   { [ -f internal/uwiki/export_results.py ] && [ -f internal/lumi/env.sh ]; } || { echo "run from the repo root"; return 1; }
   while [ $# -gt 0 ]; do
     case " $RESULTS $STUDIES all " in
@@ -271,7 +271,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   _pe_src () { case $1 in   # <output root under W> <tags> <audit the configs 0|1>
       cells-1B-v2) echo "unlearning-pareto-1B 1B-v2-* 1";; anchors-b1) echo "unlearning-pareto-1B-b1 none 0";;
       anchors-e8) echo "unlearning-pareto-1B-e8 none 0";; hpo-final|hpo-final-2.7B) echo "$1 hpo-*-final-* 1";;
-      hpo-trials) echo "hpo hpo-*-wm-t* 1";; hpo-frontier) echo "hpo-frontier hpo-*-front-* 1";;
+      hpo-trials) echo "hpo hpo-*-wm*-t* 1";; hpo-frontier) echo "hpo-frontier hpo-*-front-* 1";;
       *) echo "$1 none 0";; esac; }
   _pe_stale () {   # _pe_stale <part>: true when it must be exported again
     local st="$S/$1" root tags audit dirs
@@ -307,7 +307,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
         t0=$(date +%s); rm -rf "${T:?}/$p"; mkdir -p "$T/$p"; touch "$T/$p.stamp"   # before reading anything
         case " $STUDIES " in
           *" $p "*)
-            m=${p#hpo-}; m=${m%-wm}
+            m=${p#hpo-}; m=${m%-wmarea}; m=${m%-wm}
             sx=(); [ -s "$T/sacct.txt" ] && sx=(--sacct "$T/sacct.txt")
             python internal/uwiki/hpo/report.py --method "$m" --study "$p" --storage "$W/hpo/optuna_journal.log" \
               --output-root "$W/hpo" --out "$T/$p" "${sx[@]}" > "$T/$p/report.txt" 2>&1

@@ -181,10 +181,13 @@ keep_or_free () {
 FIRST_RUNG=""
 LAST_IN=""
 OVER=""
+# wmarea (the full-range searches, 2026-10-15) scores its rungs exactly like wm;
+# only its cap (UTIL_CAP_PCT, to C4 33) and its value (summarize_trial.py) differ
+WM="$HPO_OBJECTIVE"; [ "$WM" = "wmarea" ] && WM=wm
 for r in $RUNGS; do
   [ -d "$CELL_DIR/step-$r" ] || { echo "    [skip] no step-$r"; continue; }
   [ -z "$FIRST_RUNG" ] && FIRST_RUNG=$r
-  if [ "$HPO_OBJECTIVE" = "wm" ]; then
+  if [ "$WM" = "wm" ]; then
     echo "--- C4 and watermark at step-$r ---"
     eval_rung "$r" 0 1 0
   else
@@ -197,14 +200,14 @@ for r in $RUNGS; do
          python "$REPO/internal/uwiki/hpo/over_cap.py" "$CELL_DIR/evals/step-$r") || over=0
   if [ "$over" = "1" ]; then
     # wm: scored too (C4 and watermark run together); the frontier rule decides below
-    [ "$HPO_OBJECTIVE" = "wm" ] && OVER="$OVER $r"
+    [ "$WM" = "wm" ] && OVER="$OVER $r"
     if [ "${EARLY_STOP:-1}" = "1" ]; then
       echo "    step-$r exceeds the ${UTIL_CAP_PCT}% cap. Later rungs cannot return"
       echo "    inside it, so the rest of the ladder is skipped."
       break
     fi
-    [ "$r" != "$FIRST_RUNG" ] && [ "$HPO_OBJECTIVE" != "wm" ] && free_ckpt "$r"
-  elif [ "$HPO_OBJECTIVE" = "wm" ]; then
+    [ "$r" != "$FIRST_RUNG" ] && [ "$WM" != "wm" ] && free_ckpt "$r"
+  elif [ "$WM" = "wm" ]; then
     keep_or_free "$r"   # fully scored already
     LAST_IN=$r
   else
@@ -215,7 +218,7 @@ for r in $RUNGS; do
 done
 
 FULL_RUNG="${LAST_IN:-$FIRST_RUNG}"
-if [ "$HPO_OBJECTIVE" = "wm" ]; then
+if [ "$WM" = "wm" ]; then
   # Every rung inside the cap was scored in pass 1. With none inside, the first
   # rung (still on disk) gets its watermark, so the trial reports where the wall is.
   if [ -z "$LAST_IN" ] && [ -n "$FIRST_RUNG" ]; then
