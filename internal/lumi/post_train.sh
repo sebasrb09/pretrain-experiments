@@ -64,6 +64,11 @@ NPROC="${NPROC:-8}"
 # The venv's bin/python links to a path that exists only inside the container:
 # enter it through the module's `python` wrapper and hand over (see setup_env.sh).
 oi_python () { PYTHONPATH= python -c 'import os, sys; os.execv(sys.argv[1], sys.argv[1:])' "$OI_VENV/bin/python" "$@"; }
+# ray (imported by open_instruct.utils) refuses ROCR_VISIBLE_DEVICES alone, which is how SLURM
+# hands GPUs out on LUMI; HIP_VISIBLE_DEVICES=0..n-1 indexes the same GPUs (see setup_env.sh)
+if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then
+  export HIP_VISIBLE_DEVICES="$(seq -s, 0 $(( $(tr ',' '\n' <<< "$ROCR_VISIBLE_DEVICES" | wc -l) - 1 )))"
+fi
 [ -f "$MODEL/config.json" ] || { echo "ERROR: MODEL is not a HF folder: $MODEL" >&2; exit 1; }
 
 case "$STAGE" in

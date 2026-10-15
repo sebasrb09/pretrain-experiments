@@ -231,14 +231,29 @@ if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
   # environment); PYTHONPATH is cleared so the training venv's packages stay out.
   oi_python () { PYTHONPATH= python -c 'import os, sys; os.execv(sys.argv[1], sys.argv[1:])' "$OI_VENV/bin/python" "$@"; }
   [ -e "$OI_VENV/pyvenv.cfg" ] || python -m venv --system-site-packages "$OI_VENV"
-  # That version's pyproject.toml dependencies, without the CUDA-only ones
-  # (vllm, flash-attn, liger-kernel, bitsandbytes) and keeping the container's
-  # torch; deepspeed without compiled ops.
-  export DS_BUILD_OPS=0
-  oi_python -m pip install "accelerate>=1.10.1" "deepspeed<0.17.3" "transformers>=4.57.0" \
-    "datasets>=4.0.0" "peft>=0.13.2" "ray>=2.49.2" beaker-py rich tensorboard "wandb==0.18.1" backoff nltk \
-    hf-transfer langdetect==1.0.9 immutabledict==1.2.0 "antlr4-python3-runtime==4.11" python-dateutil pandas || {
+  # ray (imported by open_instruct.utils) refuses to start when only
+  # ROCR_VISIBLE_DEVICES is set, which is how SLURM hands GPUs out on LUMI.
+  # HIP_VISIBLE_DEVICES indexes the devices ROCR already exposes, so 0..n-1
+  # selects exactly the same GPUs and changes nothing for torch.
+  if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then
+    export HIP_VISIBLE_DEVICES="$(seq -s, 0 $(( $(tr ',' '\n' <<< "$ROCR_VISIBLE_DEVICES" | wc -l) - 1 )))"
+  fi
+  # EXACT versions from that commit's uv.lock: unpinned, pip took today's
+  # releases (transformers 5.x, datasets 5.x, huggingface_hub 2.x; 2026-10-15),
+  # which the December-2025 code was not written for. Left out: the CUDA-only
+  # packages (vllm, flash-attn, liger-kernel, bitsandbytes), torch (the
+  # container's ROCm build; the lock has 2.8.0+cu128) and numpy (the
+  # container's, which its compiled packages were built against).
+  oi_python -m pip install "accelerate==1.10.1" "transformers==4.57.1" "datasets==4.2.0" "peft==0.17.1" \
+    "ray==2.50.0" "beaker-py==2.5.1" "rich==13.9.4" "tensorboard==2.20.0" "wandb==0.18.1" "backoff==2.2.1" \
+    "nltk==3.9.2" "hf-transfer==0.1.9" "langdetect==1.0.9" "immutabledict==1.2.0" "antlr4-python3-runtime==4.11.0" \
+    "python-dateutil==2.9.0.post0" "pandas==2.3.3" "huggingface-hub==0.35.3" "tokenizers==0.22.1" \
+    "safetensors==0.6.2" "protobuf==5.29.5" "pyarrow==21.0.0" || {
     echo "ERROR: pip install of the open-instruct dependencies failed." >&2; exit 1; }
+  # deepspeed builds against torch: without build isolation it sees the
+  # container's ROCm torch instead of fetching a CUDA one; no compiled ops
+  DS_BUILD_OPS=0 oi_python -m pip install --no-build-isolation "deepspeed==0.15.4" || {
+    echo "ERROR: pip install of deepspeed 0.15.4 failed." >&2; exit 1; }
   oi_python -m pip install --no-deps -e "$OI_DIR" || {
     echo "ERROR: pip install of open-instruct failed." >&2; exit 1; }
   # open_instruct/utils.py imports vllm.config for one type annotation
