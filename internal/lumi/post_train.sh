@@ -60,7 +60,10 @@ OPEN_INSTRUCT="${OPEN_INSTRUCT:-$W/open-instruct}"
 OI_VENV="${OI_VENV:-$W/venvs/open-instruct}"
 NPROC="${NPROC:-8}"
 [ -f "$OPEN_INSTRUCT/open_instruct/finetune.py" ] || { echo "ERROR: no open-instruct checkout at $OPEN_INSTRUCT" >&2; exit 1; }
-[ -x "$OI_VENV/bin/python" ] || { echo "ERROR: no venv at $OI_VENV (setup_env.sh INSTALL_OPEN_INSTRUCT=1)" >&2; exit 1; }
+[ -e "$OI_VENV/pyvenv.cfg" ] || { echo "ERROR: no venv at $OI_VENV (setup_env.sh INSTALL_OPEN_INSTRUCT=1)" >&2; exit 1; }
+# The venv's bin/python links to a path that exists only inside the container:
+# enter it through the module's `python` wrapper and hand over (see setup_env.sh).
+oi_python () { PYTHONPATH= python -c 'import os, sys; os.execv(sys.argv[1], sys.argv[1:])' "$OI_VENV/bin/python" "$@"; }
 [ -f "$MODEL/config.json" ] || { echo "ERROR: MODEL is not a HF folder: $MODEL" >&2; exit 1; }
 
 case "$STAGE" in
@@ -107,7 +110,7 @@ echo "  open-instruct $(git -C "$OPEN_INSTRUCT" rev-parse --short HEAD 2>/dev/nu
 echo "  batch: $PER_DEVICE per GCD x $ACCUM accumulation x $NPROC GCDs = $TARGET"
 echo "  host: $(hostname)   job ${SLURM_JOB_ID:-none}"
 echo "============================================"
-"$OI_VENV/bin/python" -m accelerate.commands.launch "${LAUNCH[@]}" "${COMMON[@]}" "${ARGS[@]}"
+oi_python -m accelerate.commands.launch "${LAUNCH[@]}" "${COMMON[@]}" "${ARGS[@]}"
 rc=$?
 echo "  $STAGE exit $rc"
 [ "$rc" = 0 ] && [ -z "${SMOKE:-}" ] && date > "$DEST/${STAGE}.done"

@@ -223,26 +223,34 @@ if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
   [ -d "$OI_DIR" ] || git clone https://github.com/sbordt/open-instruct "$OI_DIR"
   git -C "$OI_DIR" fetch --all --quiet && git -C "$OI_DIR" checkout "$OPEN_INSTRUCT_REF" || {
     echo "ERROR: open-instruct checkout of $OPEN_INSTRUCT_REF failed." >&2; exit 1; }
-  [ -x "$OI_VENV/bin/python" ] || python -m venv --system-site-packages "$OI_VENV"
+  # The venv is made by the CONTAINER's python (`python` is the module's wrapper,
+  # which runs inside the container), so its bin/python links to a path that
+  # exists only in there: called from this host shell it is "No such file" (the
+  # first attempt, 2026-10-15). oi_python enters the container through the
+  # wrapper and hands over to the venv's python (os.execv keeps the container's
+  # environment); PYTHONPATH is cleared so the training venv's packages stay out.
+  oi_python () { PYTHONPATH= python -c 'import os, sys; os.execv(sys.argv[1], sys.argv[1:])' "$OI_VENV/bin/python" "$@"; }
+  [ -e "$OI_VENV/pyvenv.cfg" ] || python -m venv --system-site-packages "$OI_VENV"
   # That version's pyproject.toml dependencies, without the CUDA-only ones
   # (vllm, flash-attn, liger-kernel, bitsandbytes) and keeping the container's
   # torch; deepspeed without compiled ops.
-  DS_BUILD_OPS=0 "$OI_VENV/bin/python" -m pip install "accelerate>=1.10.1" "deepspeed<0.17.3" "transformers>=4.57.0" \
+  export DS_BUILD_OPS=0
+  oi_python -m pip install "accelerate>=1.10.1" "deepspeed<0.17.3" "transformers>=4.57.0" \
     "datasets>=4.0.0" "peft>=0.13.2" "ray>=2.49.2" beaker-py rich tensorboard "wandb==0.18.1" backoff nltk \
     hf-transfer langdetect==1.0.9 immutabledict==1.2.0 "antlr4-python3-runtime==4.11" python-dateutil pandas || {
     echo "ERROR: pip install of the open-instruct dependencies failed." >&2; exit 1; }
-  "$OI_VENV/bin/python" -m pip install --no-deps -e "$OI_DIR" || {
+  oi_python -m pip install --no-deps -e "$OI_DIR" || {
     echo "ERROR: pip install of open-instruct failed." >&2; exit 1; }
   # open_instruct/utils.py imports vllm.config for one type annotation
   # (ModelDims.from_vllm_config, never called by finetune.py or dpo_tune_cache.py):
   # a stand-in module, instead of installing a CUDA inference engine
-  SITE="$("$OI_VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
-  if ! "$OI_VENV/bin/python" -c "import vllm" 2>/dev/null; then
+  SITE="$(oi_python -c 'import site; print(site.getsitepackages()[0])')"
+  if ! oi_python -c "import vllm" 2>/dev/null; then
     mkdir -p "$SITE/vllm"
     echo "# stand-in: open_instruct.utils imports vllm.config for a type annotation only" > "$SITE/vllm/__init__.py"
     printf 'class VllmConfig:\n    pass\n' > "$SITE/vllm/config.py"
   fi
-  "$OI_VENV/bin/python" -c "import accelerate, deepspeed, open_instruct.utils, open_instruct.dataset_transformation, open_instruct.model_utils; print('  open-instruct venv: accelerate', accelerate.__version__, 'deepspeed', deepspeed.__version__, '- open_instruct imports')" || {
+  oi_python -c "import torch, accelerate, deepspeed, open_instruct.utils, open_instruct.dataset_transformation, open_instruct.model_utils; print('  open-instruct venv: torch', torch.__version__, 'hip', torch.version.hip, '| accelerate', accelerate.__version__, '| deepspeed', deepspeed.__version__, '| open_instruct imports')" || {
     echo "ERROR: open-instruct does not import in its venv." >&2; exit 1; }
 fi
 

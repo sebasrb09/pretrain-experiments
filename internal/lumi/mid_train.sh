@@ -47,6 +47,8 @@
 #                 never chains
 #   CHAIN         1: resubmit while unfinished; 0: never
 # The yaml's flash_attention: true is switched off: no flash-attn on LUMI (PyTorch SDPA instead).
+# wandb is switched off entirely (--wandb=null): the trainer's wandb.finish(quiet=...) does not
+# exist in the container's wandb and crashed the first smoke run on exit.
 
 set -u
 set -o pipefail
@@ -71,6 +73,9 @@ cd "$PE_REPO" || exit 1
 : "${OLMO_REPO:?set OLMO_REPO (the OLMo-Private checkout)}"
 [ -f "$OLMO_REPO/scripts/train.py" ] || { echo "ERROR: no scripts/train.py under OLMO_REPO=$OLMO_REPO" >&2; exit 1; }
 [ -f "$STAGE2" ] || { echo "ERROR: STAGE2 is not a file: $STAGE2" >&2; exit 1; }
+# the trainer reads a load_path as unsharded only if its name ends in -unsharded
+case "${START%/}" in *-unsharded) ;; *)
+  echo "ERROR: START must be a folder named *-unsharded (the OLMo trainer decides how to load by the name): $START" >&2; exit 1;; esac
 for f in model train optim; do     # .pt or .safetensors: the OLMo trainer reads either
   [ -e "$START/$f.pt" ] || [ -e "$START/$f.safetensors" ] || {
     [ "$f" = optim ] && echo "ERROR: $START has no optimizer state" >&2 || echo "ERROR: $START has no $f.pt" >&2; exit 1; }
@@ -95,7 +100,7 @@ unset NO_TRAINER_STATE MODEL REVISION
 
 ARGS=("$STAGE2" "--save_folder=$SAVE" "--save_overwrite=True" "--save_interval=null"
       "--save_interval_unsharded=1000" "--eval_on_load=False" "--load_path=$START"
-      "--try_load_latest_save=True" "--model.flash_attention=False"
+      "--try_load_latest_save=True" "--model.flash_attention=False" "--wandb=null"
       "--time_limit=$(( ${TIME_LIMIT_H:-70} * 3600 ))")
 [ -n "${MICRO_BATCH:-}" ] && ARGS+=("--device_train_microbatch_size=$MICRO_BATCH")
 [ "${ACT_CKPT:-0}" = "1" ] && ARGS+=("--activation_checkpointing=whole_layer")

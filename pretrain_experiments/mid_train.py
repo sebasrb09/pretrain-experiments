@@ -81,6 +81,12 @@ def _olmo_model_state(base):
 
 def prepare(hf_model, base, out, revision=None):
     """Write <out>: model.pt from the HF weights, the rest of <base> linked."""
+    # The OLMo trainer loads a checkpoint as unsharded only when the folder name
+    # says so (olmo/train.py: load_path ending in "-unsharded"); any other name
+    # is read as a distributed checkpoint and fails ("no .metadata").
+    if not out.rstrip("/").endswith("-unsharded"):
+        raise SystemExit(f"--out must end in -unsharded (the OLMo trainer decides how to load by the name): "
+                         f"use {out.rstrip('/')}-unsharded")
     hf, config, hf_dir = _hf_state(hf_model, revision)
     n_layers = config["num_hidden_layers"]
     base_state = _olmo_model_state(base)
