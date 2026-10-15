@@ -402,7 +402,7 @@ def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin, space="v1")
           f"({'2x' if spaces.USES_RETAIN[method] else '1x'} tokens per step)")
     print()
     costs = []
-    for b in [x for x in (spaces.V2_BATCH_CHOICES if space == "v2" else spaces.BATCH_CHOICES) if x <= max_batch]:
+    for b in [x for x in spaces.batch_choices(method, space) if x <= max_batch]:
         c = spaces.trial_tokens(method, b, steps)
         costs.append(c)
         wt = trial_walltime(method, {"batch_size": b}, steps, rungs, tph, emin)
@@ -517,10 +517,12 @@ def _warm_start(study, args):
     For the full-range searches (2026-10-15): the first searches spent most or
     all of their budget on random startup trials (SatImp and SimNPO never reached
     the GP), so a new study starts from what they found instead of from
-    scratch. Up to --warm-max trials with a point on the source's own frontier
-    (forget_score.frontier_trials, 0.25 TPR points), spread along it. Their
-    values must lie inside this study's space, which widens the source's.
-    Idempotent: a relaunch queues nothing twice. They count toward --startup.
+    scratch. In space v2, the best configurations the space was derived from
+    (spaces.v2_spec, by the stage-2 objective, so inside the space by
+    construction); otherwise trials with a point on the source's own frontier
+    (forget_score.frontier_trials, 0.25 TPR points), spread along it. Up to
+    --warm-max of them. Idempotent: a relaunch queues nothing twice. They count
+    toward --startup.
     """
     import optuna
     import forget_score as fs
@@ -529,7 +531,11 @@ def _warm_start(study, args):
     for name in args.warm_start.split(","):
         src = optuna.load_study(study_name=name, storage=_storage(args))
         trials = {t.number: t for t in src.trials}
-        picked = fs.frontier_trials(args.output_root, name, args.method, n=args.warm_max)
+        spec = spaces.v2_spec(args.method) if args.space == "v2" else {}
+        if spec.get("study") == name:
+            picked = [int(n) for n in spec["best_trials"]][:args.warm_max]
+        else:
+            picked = fs.frontier_trials(args.output_root, name, args.method, n=args.warm_max)
         n = 0
         for no in picked:
             t, tag = trials.get(no), f"warm {name}:{no}"
@@ -545,7 +551,7 @@ def _warm_start(study, args):
                 continue
             study.enqueue_trial(dict(t.params), user_attrs={"enqueued_from": tag})
             n += 1
-        print(f"  warm start: {n} configuration(s) of {name}'s frontier queued "
+        print(f"  warm start: {n} configuration(s) of {name} queued "
               f"(trials {' '.join(map(str, picked)) or 'none'})")
 
 
@@ -726,6 +732,17 @@ def search(args):
     if sp != args.space:
         sys.exit(f"study {study.study_name} samples space {sp!r}, not {args.space!r}: "
                  "pass --space " + sp + " to continue it, or a new --study")
+    if args.space == "v2":
+        # v2's ranges are a file (spaces.V2_FILE): a study keeps its method's entry as it
+        # started. Per method, so re-deriving another method's space later stops nothing.
+        import hashlib
+        digest = hashlib.sha256(json.dumps(spaces.v2_spec(args.method), sort_keys=True).encode()).hexdigest()[:16]
+        have_digest = study.user_attrs.get("space_file")
+        if have_digest is None:
+            study.set_user_attr("space_file", digest)
+        elif have_digest != digest:
+            sys.exit(f"{args.method}'s entry in {spaces.V2_FILE} changed since study {study.study_name} started "
+                     f"({have_digest} -> {digest}): a new --study for the new ranges, or restore the entry")
     if args.objective == "wmarea":
         print(f"  objective wmarea: area under the poison TPR along each trajectory, C4 up to "
               f"+{fs.CAP_PCT['wmarea']}%; space {args.space}")

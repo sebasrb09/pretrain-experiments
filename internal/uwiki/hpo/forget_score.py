@@ -441,6 +441,106 @@ def frontier_trials(output_root, study, method, tol=0.25, max_c4=KEEP_MAX_C4, n=
     return order
 
 
+class _Recorder:
+    """Stands in for an Optuna trial to read a space's bounds off spaces.suggest."""
+    def __init__(self):
+        self.d = {}
+
+    def suggest_float(self, name, lo, hi, log=False):
+        if name.endswith("_logit"):
+            sig = lambda u: float(f"{1.0 / (1.0 + math.exp(-u)):.12g}")   # 0.999, not 0.99899999...
+            self.d[name[:-len("_logit")]] = ("logit", sig(lo), sig(hi))
+        else:
+            self.d[name] = ("log" if log else "lin", lo, hi)
+        return lo
+
+    def suggest_categorical(self, name, choices):
+        self.d[name] = ("cat", list(choices))
+        return choices[0]
+
+
+# Stage 2's space, read off stage 1 (2026-10-15, user: "we already learned a lot
+# from stage 1 ... as long as we move through the same Pareto front"). See
+# derive_space. Where the stage-1 frontier presses on an edge, the range may
+# open up to these outer limits (user's choice, 2026-10-15); everywhere else it
+# stays inside the stage-1 space.
+SPACE_OUTER = {("wga", "beta1"): (None, 500.0), ("ce-u", "min_forget_ce"): (None, 0.1)}
+SMALL_BATCHES = [32, 64]
+
+
+def derive_space(study_dir, top=0.25, min_trials=8, margin=0.15, cap_pct=75.8):
+    """The stage-2 space of one method from its stage-1 export (report.py --out folder).
+
+    Every stage-1 trial is scored with the stage-2 objective, trajectory_area over
+    what it measured (its curve held flat past its last rung, so a lower bound),
+    and the best `top` fraction of them, at least min_trials, are the evidence:
+    a point "near the frontier" would not do, since every trial starts next to the
+    Baseline, where the frontier starts too. Each hyperparameter is bounded by
+    what those trials span, widened by `margin` of the stage-1 width on each side,
+    in the scale the search samples (log, logit or linear), and clipped to the
+    stage-1 space, except:
+      - the learning rate keeps the stage-1 ceiling: stage 2 must reach C4 33,
+        further than the +5% stage 1 was scored on, and step size is what gets there
+      - a range that reaches an edge with an outer limit (SPACE_OUTER) opens to it
+      - batch: the sizes those trials used, plus 32 and 64 (user's choice)
+    Returns {"params": {name: [lo, hi]}, "batch_choices": [...], "best_trials": [...]}."""
+    import spaces
+    with open(os.path.join(study_dir, "study.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    method = meta["method"]
+    rec = _Recorder()
+    spaces.suggest(rec, method, 55, 512, "v1")
+    base = _num(meta.get("base_c4_ppl")) or 18.81
+    by = {}
+    for r in _csv(os.path.join(study_dir, "rungs.csv")):
+        c4, wm = _num(r.get("c4_ppl")), _num(r.get("wm_q4"))
+        if c4 is not None and wm is not None:
+            by.setdefault(int(r["trial"]), []).append({"c4_delta_pct": 100 * (c4 / base - 1), "wm_q4": wm})
+    area = {no: trajectory_area(p, meta["anchors"], cap_pct) for no, p in by.items()}
+    trials = {int(r["trial"]): r for r in _csv(os.path.join(study_dir, "trials.csv"))}
+    # One vote per CONFIGURATION: the GP re-proposes its best point, and CE-U's
+    # top 18 trials were one configuration, which would make a range of a point.
+    seen, ranked = set(), []
+    for no in sorted(area, key=lambda no: -area[no]):
+        sig = tuple(f"{_num(trials[no].get(k)):.3g}" for k in sorted(trials.get(no, {}))
+                    if k.startswith("hp_") and _num(trials[no].get(k)) is not None) if no in trials else (no,)
+        if sig not in seen:
+            seen.add(sig)
+            ranked.append(no)
+    chosen = ranked[:max(min_trials, math.ceil(top * len(ranked)))]
+    fwd = {"log": math.log, "lin": lambda v: v, "logit": lambda v: math.log(v / (1 - v))}
+    inv = {"log": math.exp, "lin": lambda u: u, "logit": lambda u: 1.0 / (1.0 + math.exp(-u))}
+    out = {"params": {}, "batch_choices": None, "best_trials": chosen,
+           "areas": {no: round(area[no], 5) for no in chosen}}
+    for name, spec in rec.d.items():
+        vals = [_num(trials[n].get(f"hp_{name}")) for n in chosen if n in trials]
+        vals = [v for v in vals if v is not None]
+        if spec[0] == "cat":
+            used = sorted({int(v) for v in vals}) or spec[1]
+            out["batch_choices"] = sorted(set(SMALL_BATCHES) | {b for b in spec[1] if used[0] <= b <= used[-1]})
+            continue
+        kind, lo, hi = spec
+        f, g = fwd[kind], inv[kind]
+        if not vals:
+            out["params"][name] = [lo, hi]
+            continue
+        w = margin * (f(hi) - f(lo))
+        a, b = min(f(v) for v in vals) - w, max(f(v) for v in vals) + w
+        # a bound within float round-off of the stage-1 edge (logit and log round trips) is that edge
+        new_lo = lo if a <= f(lo) + 1e-9 else g(a)
+        new_hi = hi if b >= f(hi) - 1e-9 else g(b)
+        if name == "learning_rate":
+            new_hi = hi
+        outer = SPACE_OUTER.get((method, name))
+        if outer and outer[1] is not None and b >= f(hi):
+            new_hi = outer[1]
+        if outer and outer[0] is not None and a <= f(lo):
+            new_lo = outer[0]
+        # 6 significant digits, never outside the bounds just set (a v1 edge stays exact)
+        out["params"][name] = [max(new_lo, float(f"{new_lo:.6g}")), min(new_hi, float(f"{new_hi:.6g}"))]
+    return out
+
+
 def frontier_plan(export, sweeps, tol, max_c4=KEEP_MAX_C4):
     """The plan rows (PLAN_FIELDS) for every search exported under `export`
     (hpo-*-wm/ and hpo-*-wmarea/; the searches of one method form one frontier).
@@ -481,7 +581,7 @@ def frontier_plan(export, sweeps, tol, max_c4=KEEP_MAX_C4):
 
 def _main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["show", "check", "keep", "prune", "frontier"])
+    ap.add_argument("cmd", choices=["show", "check", "keep", "prune", "frontier", "space"])
     ap.add_argument("--export", default=None, help="frontier: a pe_export folder (hpo-*-wm/, cells-1B-v2/, anchors-b1/)")
     ap.add_argument("--sweep", default=None,
                     help="frontier: the grid sweeps to beat, comma separated, each CELLS_DIR[=ANCHORS_DIR] "
@@ -503,6 +603,34 @@ def _main():
                     help="keep / prune / frontier: TPR tolerance in percentage points (default KEEP_TPR_TOL, else 0 = "
                          "the Pareto frontier): a point must lower the TPR by more than this to stay")
     args = ap.parse_args()
+    if args.cmd == "space":
+        # stage 2's space from stage 1 (derive_space): resources/hpo/space-v2.json, read by spaces.py
+        if not (args.export and args.out):
+            ap.error("space needs --export and --out")
+        import spaces
+        methods = {}
+        for d in sorted(glob.glob(os.path.join(args.export, "hpo-*-wm"))):
+            with open(os.path.join(d, "study.json"), encoding="utf-8") as fh:
+                meta = json.load(fh)
+            s = derive_space(d)
+            s["study"] = meta["study"]
+            methods[meta["method"]] = s
+            rec = _Recorder()
+            spaces.suggest(rec, meta["method"], 55, 512, "v1")
+            print(f"== {meta['method']}: from the best {len(s['best_trials'])} configurations of {meta['study']} "
+                  f"(area {min(s['areas'].values()):.3f}-{max(s['areas'].values()):.3f}); batch {s['batch_choices']}")
+            for k, (lo, hi) in s["params"].items():
+                if [lo, hi] != [rec.d[k][1], rec.d[k][2]]:
+                    print(f"   {k:14s} [{rec.d[k][1]:.3g}, {rec.d[k][2]:.3g}] -> [{lo:.4g}, {hi:.4g}]")
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump({"derived_from": os.path.basename(os.path.abspath(args.export)),
+                       "rule": "forget_score.derive_space: best quarter (at least 8) of the stage-1 configurations "
+                               "by trajectory_area, each range widened by 15% of the stage-1 width, learning-rate "
+                               "ceiling kept, SPACE_OUTER where an edge is reached, batches 32 and 64 added",
+                       "methods": methods}, fh, indent=1)
+        print(f"wrote {args.out}")
+        return 0
     if args.cmd == "frontier":
         if not (args.export and args.out):
             ap.error("frontier needs --export and --out")

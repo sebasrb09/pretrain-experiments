@@ -41,7 +41,9 @@ where the cap is known to bite, both failing at the pre-training rate
 3.99e-4, so their ceilings stop there rather than above it.
 """
 
+import json
 import math
+import os
 
 
 def logit_uniform(trial, name, low, high):
@@ -238,17 +240,39 @@ THROUGHPUT = {
 # records it and refuses another), because Optuna models a parameter only where
 # every trial shares one distribution.
 #   v1  the first searches (hpo-<method>-wm, 2026-10-09)
-#   v2  the full-range searches (hpo-<method>-wmarea, 2026-10-15), widened
-#       where the v1 frontier sat on an edge of v1 (user's choice): batches 32
-#       and 64 (CE-U, NPO and SimNPO at 128), WGA's beta1 to 500 (12 of 13
-#       frontier trials at 50) and CE-U's min_forget_ce to 0.1 (5 of 8 at 1e-2).
-#       Learning rates unchanged: CE-U and GA at the 1e-3 ceiling already climb
-#       about one C4 point per rung, so they cross the range within the
-#       schedule, and every other method has trials that blow up inside its range.
+#   v2  the full-range searches (hpo-<method>-wmarea, 2026-10-15), one space
+#       per method read off its v1 search (forget_score.derive_space, user's
+#       request: "use that knowledge to guide the stage 2 search"): each range
+#       shrunk to what the best v1 configurations span, plus a margin, and
+#       opened where they press on an edge: batches 32 and 64, WGA's beta1 to
+#       500, CE-U's min_forget_ce to 0.1. Learning-rate ceilings unchanged:
+#       CE-U and GA at 1e-3 already climb about one C4 point per rung, and every
+#       other method has trials that blow up inside its range. The ranges live
+#       in V2_FILE, written by `forget_score.py space` and committed; a study
+#       records the file's hash and refuses another (optuna_hpo.py).
 SPACES = ("v1", "v2")
-V2_BATCH_CHOICES = [32, 64] + BATCH_CHOICES
-V2_KNOB_RANGE = dict(KNOB_RANGE, wga=("beta1", 0.05, 500.0, True))
-V2_MIN_FORGET_CE = (1e-7, 1e-1)
+V2_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir,
+                       "resources", "hpo", "space-v2.json")
+
+
+def v2_spec(method):
+    """{"params": {name: [lo, hi]}, "batch_choices": [...], "study", "best_trials", ...} of a method."""
+    if not os.path.exists(V2_FILE):
+        raise ValueError(f"no {V2_FILE}: write it with forget_score.py space")
+    with open(V2_FILE, encoding="utf-8") as fh:
+        methods = json.load(fh)["methods"]
+    if method not in methods:
+        raise ValueError(f"{V2_FILE} has no space for {method}")
+    return methods[method]
+
+
+def batch_choices(method, space="v1"):
+    return list(v2_spec(method)["batch_choices"]) if space == "v2" else list(BATCH_CHOICES)
+
+
+def _bounds(method, space):
+    """name -> (lo, hi): the v2 ranges, or nothing (the v1 defaults in the code)."""
+    return {k: tuple(v) for k, v in v2_spec(method)["params"].items()} if space == "v2" else {}
 
 
 def _common(trial, method, steps, max_batch, space="v1"):
@@ -258,13 +282,14 @@ def _common(trial, method, steps, max_batch, space="v1"):
     always means something and the space keeps a fixed dimensionality, which is
     what GPSampler wants. A warmup of one step is the constant-LR limit.
     """
-    lo, hi = LR_RANGE[method]
+    r = _bounds(method, space).get       # r(name, v1 bounds): v2's where it has one
+    lo, hi = r("learning_rate", LR_RANGE[method])
     # max_batch trims the top of the space when a large batch cannot finish in
     # the walltime. rmu runs at MICRO_BATCH=1 and npo at 2, so their largest
     # batches are the ones at risk. The ceiling is left to the caller rather
     # than hardcoded, because the only evidence for it is a guessed throughput
     # until the pilot measures the real one.
-    choices = [b for b in (V2_BATCH_CHOICES if space == "v2" else BATCH_CHOICES) if b <= max_batch]
+    choices = [b for b in batch_choices(method, space) if b <= max_batch]
     if not choices:
         raise ValueError(f"max_batch={max_batch} excludes every batch size")
     p = {
@@ -276,20 +301,20 @@ def _common(trial, method, steps, max_batch, space="v1"):
         # (60% of the specified range at 55 steps) would only produce duplicate
         # configurations. Conditioned on P >= 1/steps the distribution is the
         # specified one. At 55 steps this spans 1 to 7 warmup steps.
-        "warmup_frac": trial.suggest_float("warmup_frac", 1.0 / steps, 0.125, log=True),
+        "warmup_frac": trial.suggest_float("warmup_frac", *r("warmup_frac", (1.0 / steps, 0.125)), log=True),
         # Pre-training used 0.1. Log-uniform over four decades, since the
         # interesting question is the order of magnitude, not the linear value.
-        "weight_decay": trial.suggest_float("weight_decay", 1e-4, 1.0, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", *r("weight_decay", (1e-4, 1.0)), log=True),
         # Adam. Named adam_* because beta1 and beta2 are ALREADY taken by the
         # unlearning knobs of wga and satimp. Pre-training used (0.9, 0.95), so
         # note that beta2 sits well below the usual 0.999 and both ranges
         # contain the pre-training value.
-        "adam_beta1": logit_uniform(trial, "adam_beta1", 0.7, 0.999),
-        "adam_beta2": logit_uniform(trial, "adam_beta2", 0.9, 0.9999),
+        "adam_beta1": logit_uniform(trial, "adam_beta1", *r("adam_beta1", (0.7, 0.999))),
+        "adam_beta2": logit_uniform(trial, "adam_beta2", *r("adam_beta2", (0.9, 0.9999))),
         # Pre-training clips at 1.0. Without a clip, gradient ascent's 1/p
         # factor is unbounded, which is why this is worth searching rather than
         # fixing.
-        "max_grad_norm": trial.suggest_float("max_grad_norm", 0.1, 10.0, log=True),
+        "max_grad_norm": trial.suggest_float("max_grad_norm", *r("max_grad_norm", (0.1, 10.0)), log=True),
     }
     return p
 
@@ -304,11 +329,11 @@ def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
         raise ValueError(f"no search space version {space!r}")
 
     p = _common(trial, method, steps, max_batch, space)
+    r = _bounds(method, space).get
 
-    knobs = V2_KNOB_RANGE if space == "v2" else KNOB_RANGE
-    if method in knobs:
-        name, lo, hi, log = knobs[method]
-        p[name] = trial.suggest_float(name, lo, hi, log=log)
+    if method in KNOB_RANGE:
+        name, lo, hi, log = KNOB_RANGE[method]
+        p[name] = trial.suggest_float(name, *r(name, (lo, hi)), log=log)
 
     if method == "ce-u":
         # CE-U's knob in the old sweep was the learning rate, already in the
@@ -316,20 +341,19 @@ def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
         # the 1/(1-q) gradient factor at 1/eps, which is what bounds how hard a
         # heavily memorized token can pull. 1e-7 is the faithful setting and
         # 1e-3 the documented escape hatch for divergence. Never swept.
-        lo, hi = V2_MIN_FORGET_CE if space == "v2" else (1e-7, 1e-2)
-        p["min_forget_ce"] = trial.suggest_float("min_forget_ce", lo, hi, log=True)
+        p["min_forget_ce"] = trial.suggest_float("min_forget_ce", *r("min_forget_ce", (1e-7, 1e-2)), log=True)
 
     elif method == "satimp":
         # beta2 took values up to 3.0 across the recorded configs, but not
         # against matching cells in the continuous sweep, so this range is
         # anchored on what was tried rather than on what stayed in budget.
-        p["beta2"] = trial.suggest_float("beta2", 0.0, 5.0)
-        p["retain_weight"] = trial.suggest_float("retain_weight", 0.0, 5.0)
+        p["beta2"] = trial.suggest_float("beta2", *r("beta2", (0.0, 5.0)))
+        p["retain_weight"] = trial.suggest_float("retain_weight", *r("retain_weight", (0.0, 5.0)))
 
     elif method == "simnpo":
         # gamma: same caveat as satimp's beta2. Observed up to 2.0.
-        p["gamma"] = trial.suggest_float("gamma", 0.0, 5.0)
-        p["retain_weight"] = trial.suggest_float("retain_weight", 0.0, 5.0)
+        p["gamma"] = trial.suggest_float("gamma", *r("gamma", (0.0, 5.0)))
+        p["retain_weight"] = trial.suggest_float("retain_weight", *r("retain_weight", (0.0, 5.0)))
 
     # grad-diff has NO separate retain_weight dimension. Its lambda IS the
     # retain weight: unlearn_cell_body.sh:306 passes VALUE straight to
@@ -339,7 +363,7 @@ def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
     # effect to find structure in.
 
     elif method == "npo":
-        p["retain_weight"] = trial.suggest_float("retain_weight", 0.0, 5.0)
+        p["retain_weight"] = trial.suggest_float("retain_weight", *r("retain_weight", (0.0, 5.0)))
 
     elif method == "rmu":
         # alpha was in budget at 1e4, the top of what was tried. Zero was also
