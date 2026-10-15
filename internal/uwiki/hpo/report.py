@@ -5,7 +5,9 @@
 Reads the study from the journal the driver wrote, and each trial's
 hpo_result.json for the per-rung measurements behind its objective. Writes
 trials.csv (one row per trial) and rungs.csv (one row per evaluated rung) so the
-search can be inspected and plotted off the cluster.
+search can be inspected and plotted off the cluster. With --sacct (a dump of the
+user's jobs taken on the host) also compute.csv, the cost of every submitted job;
+internal/lumi/pe_tools.sh pe_export runs it that way for all the searches.
 
 The objective is F, the three-task forgetting score in [0, 1] (see
 forget_score.py): 0 is the baseline, 1 is the counterfactual on all three tasks.
@@ -70,19 +72,26 @@ COMPUTE_FIELDS = ["category", "trial", "job", "name", "slurm_state", "hours", "g
                   "billing_hours"]
 
 
+SACCT_COLUMNS = "JobID,JobName,State,ElapsedRaw,AllocTRES"
+
+
 def sacct(args_list):
     """Rows of `sacct -X -n -P -o JobID,JobName,State,ElapsedRaw,AllocTRES <args>`, or None
-    without SLURM accounting (off the cluster)."""
+    without SLURM accounting (off the cluster, and inside the container)."""
     import subprocess
     try:
-        out = subprocess.run(["sacct", "-X", "-n", "-P", "-o", "JobID,JobName,State,ElapsedRaw,AllocTRES"] + args_list,
+        out = subprocess.run(["sacct", "-X", "-n", "-P", "-o", SACCT_COLUMNS] + args_list,
                              capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if out.returncode != 0:
         return None
+    return parse_sacct(out.stdout)
+
+
+def parse_sacct(text):
     rows = []
-    for line in out.stdout.splitlines():
+    for line in text.splitlines():
         f = line.split("|")
         if len(f) < 5 or not f[0]:
             continue
@@ -96,11 +105,29 @@ def sacct(args_list):
     return rows
 
 
-def compute_ledger(study, trials):
+def final_row(study, r):
+    """A finalize job of this study (its retraining or one of its evaluations), or None."""
+    if study not in r["name"] or "-final-" not in r["name"]:
+        return None
+    m = re.search(r"-final-t(\d+)", r["name"])
+    return {"category": "finalize evaluation" if r["name"].startswith("pe-") else "finalize training",
+            "trial": int(m.group(1)) if m else None, **r}
+
+
+def compute_ledger(study, trials, dump=None):
     """Every SLURM job the study cost: one per trial that was submitted (finished,
     failed, pruned or still running alike), and the finalize retraining and its
-    evaluations (names containing <study>...-final-). None without sacct."""
+    evaluations (names containing <study>...-final-). From `dump` (parse_sacct rows
+    of the user's jobs) when given, else from sacct itself; None without either."""
     jobs = {str(t.user_attrs["job"]): t.number for t in trials if t.user_attrs.get("job")}
+    if dump is not None:
+        rows = []
+        for r in dump:
+            if r["job"] in jobs:
+                rows.append({"category": "trial", "trial": jobs[r["job"]], **r})
+            elif final_row(study, r):
+                rows.append(final_row(study, r))
+        return rows
     rows = []
     ids = sorted(jobs)
     for i in range(0, len(ids), 200):
@@ -113,11 +140,8 @@ def compute_ledger(study, trials):
     if starts:
         got = sacct(["-u", os.environ.get("USER", ""), "-S", min(starts).strftime("%Y-%m-%dT%H:%M:%S")])
         for r in got or []:
-            if r["job"] in jobs or study not in r["name"] or "-final-" not in r["name"]:
-                continue
-            m = re.search(r"-final-t(\d+)", r["name"])
-            rows.append({"category": "finalize evaluation" if r["name"].startswith("pe-") else "finalize training",
-                         "trial": int(m.group(1)) if m else None, **r})
+            if r["job"] not in jobs and final_row(study, r):
+                rows.append(final_row(study, r))
     return rows
 
 
@@ -129,6 +153,10 @@ def main():
     ap.add_argument("--output-root", default=os.path.join(PE, "hpo"),
                     help="where the trials' cell directories live")
     ap.add_argument("--out", required=True, help="directory for trials.csv and rungs.csv")
+    ap.add_argument("--sacct", default=None,
+                    help=f"the output of `sacct -u $USER -X -n -P -o {SACCT_COLUMNS} -S <before the search>` "
+                         "taken on the host: this script runs in the container, which has no sacct "
+                         "(internal/lumi/pe_tools.sh pe_export writes it)")
     args = ap.parse_args()
 
     import optuna
@@ -184,7 +212,17 @@ def main():
     # COMPUTE, every submitted trial whatever its outcome (2026-10-14): the
     # allocation is spent by dominated, failed and pruned trials as much as by
     # the winners. compute.csv is the ledger, one row per SLURM job.
-    ledger = compute_ledger(study.study_name, study.trials)
+    dump = None
+    if args.sacct:
+        with open(args.sacct, encoding="utf-8") as fh:
+            dump = parse_sacct(fh.read())
+    ledger = compute_ledger(study.study_name, study.trials, dump)
+    if dump is not None:
+        seen = {r["job"] for r in dump}
+        lost = [t.number for t in study.trials if t.user_attrs.get("job") and str(t.user_attrs["job"]) not in seen]
+        if lost:
+            warn.append(f"compute: {len(lost)} submitted trial(s) not in the sacct dump (older than its start?): "
+                        + " ".join(map(str, lost[:20])))
     if ledger is not None:
         per_trial = {}
         for r in ledger:
@@ -233,7 +271,7 @@ def main():
         print(f"\ncheckpoints kept on the frontier (full suite: optuna_hpo.py --eval-cells): "
               + ", ".join(f"t{t} step {s}" for t, s in kept))
     if ledger is None:
-        print("\ncompute: no SLURM accounting here (run on the cluster for compute.csv)")
+        print("\ncompute: no SLURM accounting here (the container has no sacct: pass --sacct, as pe_export does)")
     else:
         print("\ncompute (SLURM accounting; GPU-hours = hours x GCDs; billing = sacct's billing TRES):")
         cats = {}

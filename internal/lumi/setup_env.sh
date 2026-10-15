@@ -242,13 +242,16 @@ if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
   # releases (transformers 5.x, datasets 5.x, huggingface_hub 2.x; 2026-10-15),
   # which the December-2025 code was not written for. Left out: the CUDA-only
   # packages (vllm, flash-attn, liger-kernel, bitsandbytes), torch (the
-  # container's ROCm build; the lock has 2.8.0+cu128) and numpy (the
-  # container's, which its compiled packages were built against).
+  # container's ROCm build; the lock has 2.8.0+cu128), numpy and sympy (the
+  # container's, which its compiled packages and torch were built against).
+  # The list is every third-party module finetune.py and dpo_tune_cache.py
+  # import at load time, traced through open_instruct at that commit
+  # (litellm via ground_truth_utils, absl-py via IFEvalG; 2026-10-15).
   oi_python -m pip install "accelerate==1.10.1" "transformers==4.57.1" "datasets==4.2.0" "peft==0.17.1" \
     "ray==2.50.0" "beaker-py==2.5.1" "rich==13.9.4" "tensorboard==2.20.0" "wandb==0.18.1" "backoff==2.2.1" \
     "nltk==3.9.2" "hf-transfer==0.1.9" "langdetect==1.0.9" "immutabledict==1.2.0" "antlr4-python3-runtime==4.11.0" \
     "python-dateutil==2.9.0.post0" "pandas==2.3.3" "huggingface-hub==0.35.3" "tokenizers==0.22.1" \
-    "safetensors==0.6.2" "protobuf==5.29.5" "pyarrow==21.0.0" || {
+    "safetensors==0.6.2" "protobuf==5.29.5" "pyarrow==21.0.0" "litellm==1.75.0" "absl-py==2.3.1" || {
     echo "ERROR: pip install of the open-instruct dependencies failed." >&2; exit 1; }
   # deepspeed builds against torch: without build isolation it sees the
   # container's ROCm torch instead of fetching a CUDA one; no compiled ops
@@ -265,7 +268,7 @@ if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
     echo "# stand-in: open_instruct.utils imports vllm.config for a type annotation only" > "$SITE/vllm/__init__.py"
     printf 'class VllmConfig:\n    pass\n' > "$SITE/vllm/config.py"
   fi
-  oi_python -c "import torch, accelerate, deepspeed, open_instruct.utils, open_instruct.dataset_transformation, open_instruct.model_utils; print('  open-instruct venv: torch', torch.__version__, 'hip', torch.version.hip, '| accelerate', accelerate.__version__, '| deepspeed', deepspeed.__version__, '| open_instruct imports')" || {
+  oi_python -c "import torch, accelerate, deepspeed, transformers, open_instruct.finetune, open_instruct.dpo_tune_cache; print('  open-instruct venv: torch', torch.__version__, 'hip', torch.version.hip, '| transformers', transformers.__version__, '| accelerate', accelerate.__version__, '| deepspeed', deepspeed.__version__, '| finetune.py and dpo_tune_cache.py import')" || {
     echo "ERROR: open-instruct does not import in its venv." >&2; exit 1; }
 fi
 

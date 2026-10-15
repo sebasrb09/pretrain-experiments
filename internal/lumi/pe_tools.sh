@@ -11,6 +11,8 @@
 #   news_redo [dry]     the news membership test wherever it is missing or used other labels
 #   qa_redo [dry] [ref] PopQA, LAMBADA and SciQ wherever one is missing; ref: only the reference models
 #                       (Baseline, Retraining, SGD, smaller, post-training and published models)
+#   pe_export [all | seed <dir> | part ...]   the CSVs for the laptop: only parts whose results
+#                       changed are exported again; prints the scp command for the archive
 # The two *_redo functions submit jobs; run them as
 #   setsid nohup bash -c "$(declare -f qa_redo); qa_redo" > "$PE_WORK/qa_redo.log" 2>&1 < /dev/null & disown
 # (arguments go after the second qa_redo, e.g. ...; qa_redo ref" > ...)
@@ -232,4 +234,94 @@ qa_redo () {   # qa_redo [dry] [ref]: the capability benchmarks (PopQA, LAMBADA,
     done
     [ "$dry" = 1 ] && [ "$n" -gt 12 ] && echo "  [dry] ... and $((n - 12)) more"
     echo "qa_redo: $ok done, $inq waiting in the queue, $n $([ "$dry" = 1 ] && echo 'to submit' || echo submitted); $far checkpoints beyond perplexity $XMAX or without one are left out" )
+}
+
+pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again only what changed; pack every part
+  # Each part is kept current in $W/exports-latest/<part>. A part is exported again only when a
+  # result under it (a .done marker or a results.yaml; for a search its journal or a trial's
+  # hpo_result.json) or the script that exports it is newer than its last export, or when it is
+  # named. A failed part keeps its last export. The archive always holds every part, as
+  # exports-<date>/, so the laptop gets a complete folder. seed <dir>: adopt a full export made
+  # the old way (exports-2026-10-15), its parts counted as exported when it started.
+  local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
+  local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F)"
+  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B"
+  local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-wm-t[0-9]+$/hpo-\1-wm/p' | sort -u | tr '\n' ' ')
+  { [ -f internal/uwiki/export_results.py ] && [ -f internal/lumi/env.sh ]; } || { echo "run from the repo root"; return 1; }
+  while [ $# -gt 0 ]; do
+    case " $RESULTS $STUDIES all " in
+      *" $1 "*) force="$force$1 " ;;
+      *) if [ "$1" = seed ] && [ -d "${2:-}" ]; then seed="$2"; shift
+         else echo "pe_export [all | seed <export dir> | part ...]   parts: $RESULTS $STUDIES"; return 1; fi ;;
+    esac
+    shift
+  done
+  mkdir -p "$L" "$S" "$T"
+  if [ -n "$seed" ]; then
+    first=$(find "$seed" -type f -printf '%T@ %p\n' | sort -n | head -1 | cut -d' ' -f2-)
+    for p in $RESULTS $STUDIES; do
+      { [ -d "$seed/$p" ] && [ ! -d "$L/$p" ]; } || continue
+      cp -r "$seed/$p" "$L/$p" && touch -r "$first" "$S/$p" && echo "  seeded $p from $seed"
+    done
+  fi
+  _pe_src () { case $1 in   # <output root under W> <tags> <audit the configs 0|1>
+      cells-1B-v2) echo "unlearning-pareto-1B 1B-v2-* 1";; anchors-b1) echo "unlearning-pareto-1B-b1 none 0";;
+      anchors-e8) echo "unlearning-pareto-1B-e8 none 0";; hpo-final|hpo-final-2.7B) echo "$1 hpo-*-final-* 1";;
+      *) echo "$1 none 0";; esac; }
+  _pe_stale () {   # _pe_stale <part>: true when it must be exported again
+    local st="$S/$1" root tags audit dirs
+    [ -f "$st" ] || return 0
+    case "$force" in *" $1 "*|*" all "*) return 0;; esac
+    case " $STUDIES " in *" $1 "*)
+      [ internal/uwiki/hpo/report.py -nt "$st" ] || [ "$W/hpo/optuna_journal.log" -nt "$st" ] ||
+        [ -n "$(find "$W/hpo" -maxdepth 4 -name hpo_result.json -newer "$st" -print -quit 2>/dev/null)" ]
+      return ;;
+    esac
+    read -r root tags audit <<< "$(_pe_src "$1")"
+    [ internal/uwiki/export_results.py -nt "$st" ] && return 0
+    [ "$audit" = 1 ] && [ internal/uwiki/audit_configs.py -nt "$st" ] && return 0
+    dirs=("$W/$root/anchors"); [ "$tags" != none ] && dirs+=("$W/$root"/$tags)
+    [ -n "$(find "${dirs[@]}" \( -name '*.done' -o -name results.yaml \) -newer "$st" -print -quit 2>/dev/null)" ]
+  }
+  for p in $RESULTS $STUDIES; do if _pe_stale "$p"; then todo="$todo $p"; else skip="$skip $p"; fi; done
+  {
+    echo "== pe_export $(date '+%F %H:%M')"
+    echo "  unchanged, kept:${skip:- none}"
+    echo "  exporting:${todo:- nothing}"
+    ( source internal/lumi/env.sh > /dev/null || exit 1
+      export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2   # the login node's thread limit
+      # report.py runs in the container, which has no sacct: one dump of the user's jobs, from the host
+      rm -f "$T/sacct.txt"
+      case "$todo" in *-wm*)
+        sacct -u "$USER" -X -n -P -o JobID,JobName,State,ElapsedRaw,AllocTRES -S "${PE_SACCT_SINCE:-2026-09-01}" \
+          > "$T/sacct.txt" || echo "  sacct failed: the searches get no compute.csv" ;; esac
+      for p in $todo; do
+        t0=$(date +%s); rm -rf "${T:?}/$p"; mkdir -p "$T/$p"; touch "$T/$p.stamp"   # before reading anything
+        case " $STUDIES " in
+          *" $p "*)
+            m=${p#hpo-}; m=${m%-wm}
+            sx=(); [ -s "$T/sacct.txt" ] && sx=(--sacct "$T/sacct.txt")
+            python internal/uwiki/hpo/report.py --method "$m" --study "$p" --storage "$W/hpo/optuna_journal.log" \
+              --output-root "$W/hpo" --out "$T/$p" "${sx[@]}" > "$T/$p/report.txt" 2>&1
+            rc=$?; what=$(grep -E "^best in-budget|^no in-budget|^  total" "$T/$p/report.txt" | cut -c1-110 | tr '\n' ' ') ;;
+          *)
+            read -r root tags audit <<< "$(_pe_src "$p")"
+            { [ "$audit" = 0 ] || python internal/uwiki/audit_configs.py --output-root "$W/$root" --out "$T/$p/results_configs.csv"; } \
+              > "$T/$p/export.txt" 2>&1 &&
+              python internal/uwiki/export_results.py --output-root "$W/$root" --out "$T/$p" --tags "$tags" >> "$T/$p/export.txt" 2>&1
+            rc=$?; what=$(sed -nE 's/^wrote .*results_(cells|anchors)\.csv +\(([0-9]+) rows\)/\1 \2/p' "$T/$p/export.txt" | tr '\n' ' ') ;;
+        esac
+        if [ "$rc" = 0 ]; then
+          rm -rf "${L:?}/$p"; mv "$T/$p" "$L/$p"; mv "$T/$p.stamp" "$S/$p"
+          printf '  %-24s %5d s  %s\n' "$p" $(( $(date +%s) - t0 )) "$what"
+        else
+          printf '  %-24s FAILED (exit %s): the last export is kept; read %s\n' "$p" "$rc" "$T/$p"
+        fi
+      done
+      [ -s "$T/sacct.txt" ] && cp "$T/sacct.txt" "$L/sacct.txt"
+      exit 0 )
+  } 2>&1 | tee -a "$L/export.log"
+  tar czf "$W/$D.tgz" -C "$W" --transform "s|^exports-latest|$D|" exports-latest || { echo "tar failed"; return 1; }
+  echo "packed every part into $W/$D.tgz ($(du -h "$W/$D.tgz" | cut -f1)). On the laptop, in the workspace root (not the repo):"
+  echo "  scp -i ~/.ssh/id_EFP -o IdentitiesOnly=yes -o CertificateFile=~/.ssh/id_efp.lumi.csc.fi-cert.pub $USER@efp.lumi.csc.fi:$W/$D.tgz . && tar xzf $D.tgz"
 }
