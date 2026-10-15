@@ -71,6 +71,8 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     g=31; [ "$s" = hpo-ce-u-f3 ] && g=-
     _grp "1B finalized ${s#hpo-}" "$g" "$ALL" $(printf '%s/evals ' "$W"/hpo-final/"$s"-final-*/*/*/step-*)
   done
+  _grp "1B frontier, search checkpoints" - "$ALL" "$W"/hpo/hpo-*-wm-t*/*/*/step-*/evals
+  _grp "1B frontier, retrained" - "$ALL" "$W"/hpo-frontier/hpo-*-front-*/*/*/step-*/evals
   _grp "1B reference points, batch 1" all "ppl fk il wm mia" "$W"/unlearning-pareto-1B-b1/anchors/*/step-* | sed 's/ | capability.*//'
   _grp "1B reference points, eager" all "bm pe dos math news" "$W"/unlearning-pareto-1B-e8/anchors/*/step-*
   _grp "1B post-training models" all "$ALL" "$W"/post-training-1B/anchors/*
@@ -98,6 +100,8 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     -e 's/ pe-anchor-2\.7B-.*-(b1|e8|e8math|c4|util)$/ 2.7B reference points, group \1/' \
     -e 's/ pe-(hpo-[A-Za-z0-9.-]+)-final-t[0-9]+-.*-(b1|e8|e8math|c4)$/ finalized \1, evaluation group \2/' \
     -e 's/ (hpo-[A-Za-z0-9.-]+)-final-t[0-9]+$/ finalized \1, TRAINING/' \
+    -e 's/ pe-(hpo-[a-z0-9-]+-wm)-(front-)?t[0-9]+-.*-(b1|e8|e8math|c4)$/ frontier \1, evaluation group \3/' \
+    -e 's/ (hpo-[a-z0-9-]+-wm)-front-t[0-9]+$/ frontier \1, RETRAINING/' \
     -e 's/ (hpo-[a-z0-9-]+)-t[0-9]+$/ search \1, trial/' \
     -e 's/ pe-1B-v2-rmu-a0-.*-(b1|e8|e8math|c4)$/ 1B RMU alpha=0, evaluation group \1/' \
     -e 's/ pe-model-.*-(b1|e8|e8math|c4|util)$/ whole models, group \1/' \
@@ -245,7 +249,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   # the old way (exports-2026-10-15), its parts counted as exported when it started.
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
   local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F)"
-  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B"
+  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B"
   local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-wm-t[0-9]+$/hpo-\1-wm/p' | sort -u | tr '\n' ' ')
   { [ -f internal/uwiki/export_results.py ] && [ -f internal/lumi/env.sh ]; } || { echo "run from the repo root"; return 1; }
   while [ $# -gt 0 ]; do
@@ -267,9 +271,14 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   _pe_src () { case $1 in   # <output root under W> <tags> <audit the configs 0|1>
       cells-1B-v2) echo "unlearning-pareto-1B 1B-v2-* 1";; anchors-b1) echo "unlearning-pareto-1B-b1 none 0";;
       anchors-e8) echo "unlearning-pareto-1B-e8 none 0";; hpo-final|hpo-final-2.7B) echo "$1 hpo-*-final-* 1";;
+      hpo-trials) echo "hpo hpo-*-wm-t* 1";; hpo-frontier) echo "hpo-frontier hpo-*-front-* 1";;
       *) echo "$1 none 0";; esac; }
   _pe_stale () {   # _pe_stale <part>: true when it must be exported again
     local st="$S/$1" root tags audit dirs
+    case " $STUDIES " in *" $1 "*) ;; *)
+      read -r root tags audit <<< "$(_pe_src "$1")"
+      [ -d "$W/$root" ] || return 1 ;;   # nothing there yet (hpo-frontier before its first retraining)
+    esac
     [ -f "$st" ] || return 0
     case "$force" in *" $1 "*|*" all "*) return 0;; esac
     case " $STUDIES " in *" $1 "*)
@@ -277,7 +286,6 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
         [ -n "$(find "$W/hpo" -maxdepth 4 -name hpo_result.json -newer "$st" -print -quit 2>/dev/null)" ]
       return ;;
     esac
-    read -r root tags audit <<< "$(_pe_src "$1")"
     [ internal/uwiki/export_results.py -nt "$st" ] && return 0
     [ "$audit" = 1 ] && [ internal/uwiki/audit_configs.py -nt "$st" ] && return 0
     dirs=("$W/$root/anchors"); [ "$tags" != none ] && dirs+=("$W/$root"/$tags)

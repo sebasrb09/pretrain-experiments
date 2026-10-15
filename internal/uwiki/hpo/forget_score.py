@@ -55,8 +55,14 @@ can run on them later without retraining; the others are deleted as before.
         (hpo_trial.sh, after scoring a rung) exit 0: keep step-N, 3: delete it
     python forget_score.py prune --output-root R --study S --method M [--apply]
         delete the kept checkpoints of finished trials that are dominated now
+
+THE FULL-SUITE PLAN (2026-10-15). Which search checkpoints get the full suite:
+
+    python forget_score.py frontier --export E [--sweep DIR[:ANCHORS],...] --tol PTS --out PLAN.csv
+        from a pe_export folder; optuna_hpo.py --frontier PLAN.csv evaluates them
 """
 import argparse
+import csv
 import glob
 import hashlib
 import importlib.util
@@ -340,9 +346,85 @@ def prune(output_root, study, method, apply=False, max_c4=KEEP_MAX_C4, log=print
     return kept, gone
 
 
+# The full suite costs ~18 GCD-hours a checkpoint, so it does not run on every
+# point of every search frontier (2026-10-15, user and supervisor): only on the
+# search checkpoints that beat the grid sweep, thinned so that each lowers the
+# poison TPR by more than `tol` points below every point, search or sweep, with
+# lower perplexity. C4 is compared as the increase over each side's own
+# Baseline: the search measured it on another slice of C4 (Baseline 18.81
+# there, 18.77 on the reporting slice). Read from a pe_export folder, so it runs
+# off the cluster; optuna_hpo.py --frontier evaluates exactly the rows.
+PLAN_FIELDS = ["method", "study", "trial", "step", "c4_rel_pct", "tpr_pct", "on_disk"]
+
+
+def _csv(path):
+    with open(path, encoding="utf-8", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _baseline_c4(anchors_csv):
+    for r in _csv(anchors_csv):
+        if r.get("point") == "baseline" and _num(r.get("c4_ppl")):
+            return _num(r["c4_ppl"])
+    raise SystemExit(f"no Baseline C4 in {anchors_csv}")
+
+
+def thin(points, eps, start):
+    """Greedy along perplexity: a point stays when its TPR is more than eps below
+    the best TPR kept so far, starting from the Baseline's. eps 0: the Pareto
+    frontier. Points are (C4 increase, TPR, ...), both in percent."""
+    out, best = [], start
+    for p in sorted(points, key=lambda p: (p[0], p[1])):
+        if p[1] < best - eps:
+            out.append(p)
+            best = p[1]
+    return out
+
+
+def frontier_plan(export, sweeps, tol, max_c4=KEEP_MAX_C4):
+    """The plan rows (PLAN_FIELDS) for every search exported under `export`
+    (hpo-*-wm/). sweeps: [(dir with results_cells.csv, dir with
+    results_anchors.csv)], the grid sweep(s) to beat; max_c4 is on the first
+    sweep's (reporting) C4 axis."""
+    lim = max_c4 / _baseline_c4(os.path.join(sweeps[0][1], "results_anchors.csv")) - 1
+    swept = {}
+    for cells, anchors in sweeps:
+        b = _baseline_c4(os.path.join(anchors, "results_anchors.csv"))
+        for r in _csv(os.path.join(cells, "results_cells.csv")):
+            c4, wm = _num(r.get("c4_ppl")), _num(r.get("wm_q4"))
+            if c4 is not None and wm is not None and c4 / b - 1 <= lim:
+                swept.setdefault(r["method"], []).append((100 * (c4 / b - 1), 100 * poison_tpr(wm), None))
+    rows = []
+    for d in sorted(glob.glob(os.path.join(export, "hpo-*-wm"))):
+        with open(os.path.join(d, "study.json"), encoding="utf-8") as fh:
+            meta = json.load(fh)
+        method, study = meta["method"], meta["study"]
+        b = _num(meta.get("base_c4_ppl")) or 18.81
+        start = 100 * poison_tpr(meta["anchors"]["baseline"]["wm"])
+        kept = {int(r["trial"]): {int(s) for s in (r.get("kept_steps") or "").split()}
+                for r in _csv(os.path.join(d, "trials.csv"))}
+        pts = []
+        for r in _csv(os.path.join(d, "rungs.csv")):
+            c4, wm = _num(r.get("c4_ppl")), _num(r.get("wm_q4"))
+            if c4 is not None and wm is not None and c4 / b - 1 <= lim:
+                pts.append((100 * (c4 / b - 1), 100 * poison_tpr(wm), (int(r["trial"]), int(r["step"]))))
+        for c, t, ts in thin(pts + swept.get(method, []), tol, start):
+            if ts is not None:
+                rows.append({"method": method, "study": study, "trial": ts[0], "step": ts[1],
+                             "c4_rel_pct": round(c, 4), "tpr_pct": round(t, 4),
+                             "on_disk": int(ts[1] in kept.get(ts[0], set()))})
+    return sorted(rows, key=lambda r: (r["method"], r["trial"], r["step"]))
+
+
 def _main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["show", "check", "keep", "prune"])
+    ap.add_argument("cmd", choices=["show", "check", "keep", "prune", "frontier"])
+    ap.add_argument("--export", default=None, help="frontier: a pe_export folder (hpo-*-wm/, cells-1B-v2/, anchors-b1/)")
+    ap.add_argument("--sweep", default=None,
+                    help="frontier: the grid sweeps to beat, comma separated, each CELLS_DIR[=ANCHORS_DIR] "
+                         "(results_cells.csv, and results_anchors.csv for its Baseline C4; default "
+                         "<export>/cells-1B-v2=<export>/anchors-b1). The first sets the C4 axis of --max-c4.")
+    ap.add_argument("--out", default=None, help="frontier: the plan CSV to write")
     ap.add_argument("--anchor-root", default=None)
     ap.add_argument("--il-experiment", default=None,
                     help="default: IL_EXPERIMENT from settings.json")
@@ -355,9 +437,34 @@ def _main():
     ap.add_argument("--max-c4", type=float, default=KEEP_MAX_C4)
     ap.add_argument("--apply", action="store_true", help="prune: delete (default: only list)")
     ap.add_argument("--tol", type=float, default=float(os.environ.get("KEEP_TPR_TOL", "0") or 0),
-                    help="keep / prune: TPR tolerance in percentage points (default KEEP_TPR_TOL, else 0 = "
+                    help="keep / prune / frontier: TPR tolerance in percentage points (default KEEP_TPR_TOL, else 0 = "
                          "the Pareto frontier): a point must lower the TPR by more than this to stay")
     args = ap.parse_args()
+    if args.cmd == "frontier":
+        if not (args.export and args.out):
+            ap.error("frontier needs --export and --out")
+        sweeps = []
+        for s in (args.sweep or f"{args.export}/cells-1B-v2={args.export}/anchors-b1").split(","):
+            cells, _, anchors = s.partition("=")
+            sweeps.append((cells, anchors or cells))
+        rows = frontier_plan(args.export, sweeps, args.tol, args.max_c4)
+        with open(args.out, "w", encoding="utf-8", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=PLAN_FIELDS)
+            w.writeheader()
+            w.writerows(rows)
+        print(f"tolerance {args.tol:g} TPR points, C4 up to {args.max_c4:g}, beating "
+              + ", ".join(c for c, _ in sweeps))
+        print(f"  {'method':16s} {'checkpoints':>11s} {'on disk':>8s} {'not on disk (trials)':>21s}")
+        for m in sorted({r["method"] for r in rows}):
+            mine = [r for r in rows if r["method"] == m]
+            gone = [r for r in mine if not r["on_disk"]]
+            print(f"  {m:16s} {len(mine):11d} {len(mine) - len(gone):8d} "
+                  f"{len(gone):12d} ({len({r['trial'] for r in gone})})")
+        gone = [r for r in rows if not r["on_disk"]]
+        print(f"  {'total':16s} {len(rows):11d} {len(rows) - len(gone):8d} "
+              f"{len(gone):12d} ({len({(r['study'], r['trial']) for r in gone})})")
+        print(f"wrote {args.out}; optuna_hpo.py --frontier {args.out} --dry-run says what it would train and run")
+        return 0
     if args.cmd == "keep":
         keep, why = keep_decision(args.output_root, args.run_tag, args.method, args.cell_dir, args.step, args.max_c4,
                                   tol=args.tol / 100.0)

@@ -27,8 +27,13 @@ Usage:
 
     # 3. the search, once both anchor jobs have finished
     python internal/uwiki/hpo/optuna_hpo.py --method ce-u --max-parallel 8
+
+    # 4. the full suite on the searches' frontier checkpoints in a plan
+    #    (forget_score.py frontier); retrains only what is not on disk
+    python internal/uwiki/hpo/optuna_hpo.py --frontier PLAN.csv --dry-run
 """
 import argparse
+import csv
 import glob
 import json
 import math
@@ -1416,6 +1421,157 @@ def eval_cells(args):
           "or after a failure); finished tasks are skipped")
 
 
+# The .done markers of a complete suite (internal/lumi/pe_tools.sh pe_report counts the same).
+SUITE_DONE = [("c4_perplexity$", 1), ("fictional_knowledge$", 1), ("insertion_likelihood$", 1),
+              ("gaussian_watermark$", 1), ("mia_(plain|random)_", 12), ("benchmark_contamination_s[0-8]$", 9),
+              ("prompt_extraction", 2), ("denial_of_service", 2), ("mathematical_reasoning_ops[135]$", 3),
+              ("news_memorization$", 1), ("popqa$", 1), ("lambada$", 1), ("sciq$", 1)]
+# The full suite on one 1B checkpoint, in node-hours (~18 GCD-hours, half of it iGSM)
+SUITE_NODE_HOURS = 2.25
+
+
+def _suite_complete(evals):
+    import re
+    try:
+        done = [f[:-len(".done")] for f in os.listdir(evals) if f.endswith(".done")]
+    except OSError:
+        return False
+    return all(sum(1 for d in done if re.match(p, d)) >= n for p, n in SUITE_DONE)
+
+
+def frontier(args):
+    """The full suite on exactly the checkpoints of a plan (forget_score.py frontier).
+
+    A plan row names (method, study, trial, step). Its checkpoint is taken from,
+    in order: the trial's own cell, where the search kept it (--output-root);
+    the trial retrained by --finalize (--final-root), which has every rung; an
+    earlier retraining by this mode (--frontier-root). A trial with listed
+    steps found nowhere is retrained once into --frontier-root with the trial's
+    settings and seed, saving only those steps (CKPT_STEPS). It still trains
+    its whole schedule, which sets the learning rate of every step, but nothing
+    else is kept or evaluated, where --finalize evaluates every rung. A
+    checkpoint whose suite is complete is not submitted again.
+
+    Idempotent like --finalize: a queued retraining is waited for by name, not
+    resubmitted, and finished tasks skip on their .done markers.
+    """
+    import optuna
+    if args.size != "1B":
+        sys.exit("--frontier is for the 1B searches; a winner at another size goes through --finalize --size")
+    with open(args.frontier, encoding="utf-8", newline="") as fh:
+        rows = [r for r in csv.DictReader(fh) if args.method in (None, r["method"])]
+    if not rows:
+        sys.exit(f"no rows in {args.frontier}" + (f" for {args.method}" if args.method else ""))
+    plan = {}
+    for r in rows:
+        plan.setdefault((r["study"], r["method"], int(r["trial"])), set()).add(int(r["step"]))
+    if not args.dry_run:
+        _require_host_slurm()
+        _require_noise("1B")
+    queued = set() if args.dry_run else _queued_names()
+    if queued is None:
+        sys.exit("squeue could not be read, so duplicates cannot be ruled out. Rerun.")
+    print(f"=== full suite on the {len(rows)} checkpoint(s) of {args.frontier} "
+          f"({len(plan)} trial(s)) ===")
+
+    def find(trial, study, method, step):
+        for kind, root, tag in (
+                ("search", args.output_root, trial.user_attrs.get("tag", f"{study}-t{trial.number:04d}")),
+                ("finalize", args.final_root, f"{study}-final-t{trial.number:04d}"),
+                ("retrained", args.frontier_root, f"{study}-front-t{trial.number:04d}")):
+            for cell in _cell_dirs(root, tag, method):
+                ck = os.path.join(cell, f"step-{step}")
+                if os.path.isfile(os.path.join(ck, "config.json")):
+                    ev = os.path.join(ck, "evals")
+                    return kind, dict(label=f"{tag}-{method}-{os.path.basename(cell)}-step-{step}",
+                                      what=f"{tag} step-{step}", ckpt=ck, evals=ev,
+                                      exports=f"CELL_DIR={cell},CKPT={ck},EVAL_OUT={ev}")
+        return None, None
+
+    studies, found, train = {}, [], []
+    for (study, method, number), steps in sorted(plan.items()):
+        if study not in studies:
+            studies[study] = {t.number: t for t in
+                              optuna.load_study(study_name=study, storage=_storage(args)).trials}
+        trial = studies[study].get(number)
+        if trial is None:
+            sys.exit(f"{study} has no trial {number}: is {args.frontier} from this journal?")
+        missing = []
+        for st in sorted(steps):
+            kind, t = find(trial, study, method, st)
+            if t is None:
+                missing.append(st)
+            else:
+                found.append((kind, t))
+                print(f"  {t['what']}: {kind} checkpoint"
+                      + (", suite complete" if _suite_complete(t["evals"]) else ""))
+        if missing:
+            train.append((study, method, trial, missing))
+
+    waiting, hours = [], 0.0
+    for study, method, trial, missing in train:
+        tag = f"{study}-front-t{trial.number:04d}"
+        print(f"  {tag}: retrain, keeping steps {missing}")
+        if tag in queued:
+            print("    already queued")
+            waiting.append(tag)
+            continue
+        params = _natural_params(trial)
+        tenv = spaces.env_for(method, params, args.steps, missing)
+        spaces.validate(method, params, tenv)
+        env = {}        # only what the job needs; see _host_run
+        env.update(tenv)
+        env.update(SIZES["1B"]["identity"])
+        env.update({"RUN_TAG": tag, "OUTPUT_ROOT": args.frontier_root})
+        _check_training_env(env, "1B")
+        wt = args.time or trial_walltime(method, params, args.steps, [], args.tokens_per_hour, 0.0)
+        h, m_, _s = (int(x) for x in wt.split(":"))
+        hours += h + m_ / 60
+        # 60G, not unlearn_cell.sh's 120G: small-g bills memory beyond 64 GB as a
+        # second GCD, and a 1B trial peaks at ~46 GiB (GradDiff; see hpo_trial.sh)
+        cmd = ["sbatch", "-J", tag, f"--time={wt}", "--mem=60G", "--export=ALL",
+               os.path.join(REPO, "internal", "lumi", "unlearn_cell.sh")]
+        if args.dry_run:
+            print(f"    [dry] {' '.join(cmd)}   CKPT_STEPS={tenv['CKPT_STEPS']} OUTPUT_ROOT={args.frontier_root}")
+            continue
+        out = _sbatch_when_room(cmd, env, args.submit_cap, args.poll, tag)
+        if out.returncode != 0:
+            print(f"    TRAIN SUBMIT FAILED: {out.stderr.strip()}", file=sys.stderr)
+            continue
+        print(f"    training submitted as job {out.stdout.strip().split()[-1]}, walltime {wt}")
+        waiting.append(tag)
+
+    todo = sum(1 for _, t in found if not _suite_complete(t["evals"])) + sum(len(x[3]) for x in train)
+    print(f"  checkpoints: {sum(1 for k, _ in found if k == 'search')} kept by the search, "
+          f"{sum(1 for k, _ in found if k == 'finalize')} from --finalize, "
+          f"{sum(1 for k, _ in found if k == 'retrained')} retrained earlier, "
+          f"{sum(len(x[3]) for x in train)} to retrain ({len(train)} trial(s))")
+    print(f"  cost: the suite on {todo} checkpoint(s), ~{SUITE_NODE_HOURS * todo:.0f} node-h; "
+          f"retraining at most {hours:.0f} GCD-h ({hours / 8:.1f} node-h, walltime limits)")
+    if args.dry_run:
+        print("[dry] nothing submitted")
+        return
+
+    while waiting:
+        q = _queued_names()
+        if q is not None and not [tag for tag in waiting if tag in q]:
+            break
+        print("  retraining still running" if q is not None else "  squeue unreadable, waiting")
+        time.sleep(args.poll)
+    for study, method, trial, missing in train:
+        for st in missing:
+            kind, t = find(trial, study, method, st)
+            if t is None:
+                print(f"  WARNING {study} trial {trial.number}: retraining left no step-{st}; rerun to retry")
+            else:
+                found.append((kind, t))
+    targets = [t for _, t in found if not _suite_complete(t["evals"])]
+    n = _suite(args, targets) if targets else 0
+    print(f"=== {n} full-suite eval job(s) submitted for {len(targets)} checkpoint(s) ===")
+    print("  rerun the same command for what is still missing; export with pe_export "
+          "(parts hpo-trials, hpo-final and hpo-frontier)")
+
+
 def main():
     import forget_score as fs
     ap = argparse.ArgumentParser()
@@ -1519,6 +1675,12 @@ def main():
                     help="with --eval-anchors: absolute steps, comma separated (default 100000..110000)")
     ap.add_argument("--final-root", default=None,
                     help="where --finalize trains (default: hpo-final, or hpo-final-<size>)")
+    ap.add_argument("--frontier", metavar="PLAN", default=None,
+                    help="the full suite on exactly the checkpoints of a plan written by forget_score.py "
+                         "frontier, retraining only trials whose listed steps are on disk nowhere; --method "
+                         "restricts it to one method; honours --submit-cap, --eval-time and --dry-run")
+    ap.add_argument("--frontier-root", default=os.path.join(PE, "hpo-frontier"),
+                    help="where --frontier retrains")
     ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
@@ -1533,6 +1695,9 @@ def main():
         return 0
     if args.eval_models:        # whole models: no method, study or budget involved
         eval_models(args)
+        return 0
+    if args.frontier:           # the plan names method, study and trial on every row
+        frontier(args)
         return 0
     if args.method is None:
         ap.error("the following arguments are required: --method")
