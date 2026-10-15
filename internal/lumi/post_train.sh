@@ -94,7 +94,10 @@ COMMON=(--model_name_or_path "$MODEL"
         --tokenizer_revision main --use_slow_tokenizer False --use_flash_attn False
         --per_device_train_batch_size "$PER_DEVICE" --gradient_accumulation_steps "$ACCUM"
         --lr_scheduler_type linear --weight_decay 0.0 --logging_steps 1
-        --output_dir "$DEST" --push_to_hub False --try_launch_beaker_eval_jobs False)
+        --output_dir "$DEST" --push_to_hub False --try_launch_beaker_eval_jobs False
+        --do_not_randomize_output_dir True)
+# do_not_randomize_output_dir: both scripts otherwise write to <output_dir>/<exp_name>
+# (OUT/OLMo-2-1B-SFT/), and the next stage's MODEL=OUT would not find the model.
 [ -n "${SMOKE:-}" ] && COMMON+=(--max_train_steps "$SMOKE")
 if [ "$STAGE" = sft ]; then
   LAUNCH=(--mixed_precision bf16 --num_processes "$NPROC" --use_deepspeed
@@ -103,8 +106,12 @@ if [ "$STAGE" = sft ]; then
   ARGS=(--exp_name OLMo-2-1B-SFT --dataset_mixer_list allenai/tulu-3-sft-olmo-2-mixture-0225 1.0
         --max_seq_length 4096 --learning_rate 3e-5 --warmup_ratio 0.03 --num_train_epochs 2 --seed 1)
 else
+  # dpo_tune_cache.py runs the reference model over the WHOLE dataset before its first
+  # step, whatever --max_train_steps says: a smoke takes only the pairs its steps use
+  # (an integer is a sample count, a decimal a fraction; dataset_transformation.py)
+  MIX=0.999923341466187; [ -n "${SMOKE:-}" ] && MIX=$(( SMOKE * TARGET ))
   LAUNCH=(--mixed_precision bf16 --num_processes "$NPROC" open_instruct/dpo_tune_cache.py)
-  ARGS=(--exp_name OLMo-2-1B-DPO --dataset_mixer_list allenai/olmo-2-0425-1b-preference-mix 0.999923341466187
+  ARGS=(--exp_name OLMo-2-1B-DPO --dataset_mixer_list allenai/olmo-2-0425-1b-preference-mix "$MIX"
         --max_seq_length 2048 --learning_rate 2.5e-6 --warmup_ratio 0.1 --num_train_epochs 1 --seed 111
         --use_lora False --dpo_loss_type dpo_norm --dpo_beta 5)
 fi
