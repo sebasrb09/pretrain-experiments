@@ -135,21 +135,36 @@ fi
 # cap, with C4, and there is no second pass: on its own the watermark is the
 # best at the last rung inside the cap in only 26 of 43 LUMI and 39 of 64 ASC
 # trajectories, losing up to 0.022 when it is not (checked 2026-10-09).
+# WATCHDOG (2026-10-16). A rung normally scores in ~12 min. Five stage-2 trials hung for
+# hours in "Loading checkpoint shards" (a /scratch read that never returned; three on
+# one node) and timed out with nothing reported. A rung over RUNG_TIMEOUT_MIN is killed
+# and run once more (finished tasks skip on their .done markers); if it hangs again it
+# is left out, and the trial still reports the rungs it has.
+RUNG_TIMEOUT_MIN="${RUNG_TIMEOUT_MIN:-40}"
 eval_rung () {   # eval_rung <rung> <SKIP_PPL> <SKIP_FK,IL> <SKIP_GW>
-  local r="$1" sp="$2" so="$3" sg="$4"
-  # env -u MODEL -u REVISION is NOT optional. They are exported for training
-  # and eval_cell_body.sh would otherwise evaluate the HF base model and ignore
-  # the checkpoint entirely, reporting baseline numbers for every trial.
-  env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION \
-  CELL_DIR="$CELL_DIR" CKPT="$CELL_DIR/step-$r" EVAL_OUT="$CELL_DIR/evals/step-$r" FORCE_EVAL=0 \
-  SKIP_PPL="$sp" SKIP_FK="$so" SKIP_IL="$so" SKIP_GW="$sg" \
-  SKIP_VM=1 SKIP_BM=1 SKIP_PE=1 SKIP_MIA=1 SKIP_DOS=1 SKIP_NEWS=1 SKIP_MATH=1 \
-  NOISE_DIR="$NOISE_DIR" NOISE_STD="$NOISE_STD" \
-  EVAL_MAX_NUM_SEQS="$EVAL_MAX_NUM_SEQS" INFERENCE_MAX_NUM_SEQS="$INFERENCE_MAX_NUM_SEQS" \
-  C4_TASK_FILE="$C4_TASK_FILE" IL_EXPERIMENT="$IL_EXPERIMENT" IL_MAX_TOKENS="$IL_MAX_TOKENS" \
-  HF_HUB_OFFLINE="$HF_HUB_OFFLINE" HF_DATASETS_OFFLINE="$HF_DATASETS_OFFLINE" \
-    bash "$REPO/internal/lumi/eval_pareto_cell.sh" \
-      || echo "    WARNING: eval failed at step-$r, continuing"
+  local r="$1" sp="$2" so="$3" sg="$4" attempt rc
+  for attempt in 1 2; do
+    # env -u MODEL -u REVISION is NOT optional. They are exported for training
+    # and eval_cell_body.sh would otherwise evaluate the HF base model and ignore
+    # the checkpoint entirely, reporting baseline numbers for every trial.
+    timeout --kill-after=2m "${RUNG_TIMEOUT_MIN}m" \
+    env -u MODEL -u REVISION -u OPTIM_REPO -u OPTIM_REVISION \
+    CELL_DIR="$CELL_DIR" CKPT="$CELL_DIR/step-$r" EVAL_OUT="$CELL_DIR/evals/step-$r" FORCE_EVAL=0 \
+    SKIP_PPL="$sp" SKIP_FK="$so" SKIP_IL="$so" SKIP_GW="$sg" \
+    SKIP_VM=1 SKIP_BM=1 SKIP_PE=1 SKIP_MIA=1 SKIP_DOS=1 SKIP_NEWS=1 SKIP_MATH=1 \
+    NOISE_DIR="$NOISE_DIR" NOISE_STD="$NOISE_STD" \
+    EVAL_MAX_NUM_SEQS="$EVAL_MAX_NUM_SEQS" INFERENCE_MAX_NUM_SEQS="$INFERENCE_MAX_NUM_SEQS" \
+    C4_TASK_FILE="$C4_TASK_FILE" IL_EXPERIMENT="$IL_EXPERIMENT" IL_MAX_TOKENS="$IL_MAX_TOKENS" \
+    HF_HUB_OFFLINE="$HF_HUB_OFFLINE" HF_DATASETS_OFFLINE="$HF_DATASETS_OFFLINE" \
+      bash "$REPO/internal/lumi/eval_pareto_cell.sh"
+    rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      124|137) echo "    WARNING: step-$r scoring hung past ${RUNG_TIMEOUT_MIN} min (attempt $attempt), killed" ;;
+      *) echo "    WARNING: eval failed at step-$r (exit $rc), continuing"; return 0 ;;
+    esac
+  done
+  echo "    WARNING: step-$r left out after two hung attempts"
 }
 # DISK. A 1.5B checkpoint is ~5.9 GB and the objective only needs the eval
 # results, already written under evals/. KEEP_CKPT=1 keeps them.

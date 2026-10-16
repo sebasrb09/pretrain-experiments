@@ -251,7 +251,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   # the old way (exports-2026-10-15), its parts counted as exported when it started.
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
   local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F)"
-  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B"
+  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B mid-check"
   local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-(wm|wmarea)-t[0-9]+$/hpo-\1-\2/p' | sort -u | tr '\n' ' ')
   { [ -f internal/uwiki/export_results.py ] && [ -f internal/lumi/env.sh ]; } || { echo "run from the repo root"; return 1; }
   while [ $# -gt 0 ]; do

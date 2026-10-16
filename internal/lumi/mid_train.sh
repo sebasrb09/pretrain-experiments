@@ -18,8 +18,9 @@
 # node (8 GCDs; they used 8 H100). See pretrain_experiments/mid_train.py.
 #
 # The run takes days (25B tokens), longer than one job, so it is a CHAIN: each
-# job stops itself at TIME_LIMIT_H (OLMo's time_limit, which saves an unsharded
-# checkpoint) and submits the next; the trainer's try_load_latest_save resumes
+# job stops itself at TIME_LIMIT_H (OLMo's time_limit, which saves a sharded and
+# then an unsharded checkpoint) and submits the next, on the same partition with
+# TIME_LIMIT_H + 2 h of walltime; the trainer's try_load_latest_save resumes
 # from the newest checkpoint in OUT with the data position restored. The first
 # job finds none and starts from START with the step counter and data at zero
 # (the yaml's restore_dataloader: false, as the authors). Done when
@@ -27,6 +28,8 @@
 #
 #   sbatch -J mid-<name> --export=ALL,START=<OLMo checkpoint dir>,OUT=<dir>,STAGE2=<local yaml>,OLMO_REPO=<OLMo-Private> \
 #     internal/lumi/mid_train.sh
+#   on standard-g (whole nodes, at most 48 h):
+#   sbatch -p standard-g -t 48:00:00 -J mid-<name> --export=ALL,...,TIME_LIMIT_H=46 internal/lumi/mid_train.sh
 #
 # Required:
 #   START     OLMo unsharded checkpoint: model.pt + optim.pt + train.pt. For an
@@ -37,14 +40,18 @@
 #   OLMO_REPO the OLMo-Private checkout whose scripts/train.py runs (put first
 #             on PYTHONPATH, ahead of the OLMo fork installed in the container)
 # Optional:
-#   MICRO_BATCH   per-GCD micro-batch; default the yaml's (2). Sequences are
+#   MICRO_BATCH   per-GCD micro-batch; default the yaml's (4). Sequences are
 #                 4,096 tokens unpadded, so it does not change the objective;
 #                 SMOKE first (micro-batch 2 turned padded HF batches NaN here)
 #   ACT_CKPT      1: --activation_checkpointing=whole_layer (if 64 GB per GCD is
 #                 not enough; recomputation, the same numbers)
-#   TIME_LIMIT_H  70: hours before the trainer stops and checkpoints
+#   TIME_LIMIT_H  70: hours before the trainer stops and checkpoints (46 on standard-g)
 #   SMOKE         N: train N steps into OUT-smoke/ and stop (timing and NaN check);
 #                 never chains
+#   STOP_AT       N: train to step N into OUT with the usual unsharded saves, chaining
+#                 until then, and stop there (the 1,000-step check against the authors'
+#                 stage2-step1000 checkpoint; with a short TIME_LIMIT_H it also crosses
+#                 one time-limit save and resume)
 #   CHAIN         1: resubmit while unfinished; 0: never
 # The yaml's flash_attention: true is switched off: no flash-attn on LUMI (PyTorch SDPA instead).
 # wandb is switched off entirely (--wandb=null): the trainer's wandb.finish(quiet=...) does not
@@ -112,6 +119,7 @@ ARGS=("$STAGE2" "--save_folder=$SAVE" "--save_overwrite=True" "--save_interval=n
 [ -n "${MICRO_BATCH:-}" ] && ARGS+=("--device_train_microbatch_size=$MICRO_BATCH")
 [ "${ACT_CKPT:-0}" = "1" ] && ARGS+=("--activation_checkpointing=whole_layer")
 [ -n "${SMOKE:-}" ] && ARGS+=("--stop_at=$SMOKE" "--save_interval_unsharded=null")
+[ -n "${STOP_AT:-}" ] && [ -z "${SMOKE:-}" ] && ARGS+=("--stop_at=$STOP_AT")
 
 echo "============================================"
 echo "  mid-training (OLMo trainer): $START"
@@ -131,12 +139,16 @@ if [ -n "${SMOKE:-}" ]; then
   echo "  smoke run: read the throughput (tokens/sec) and loss lines above; nothing chains."
 elif [ -d "$DONE" ]; then
   echo "  finished: $DONE"
+elif [ -n "${STOP_AT:-}" ] && [ "$after" -ge "$STOP_AT" ]; then
+  echo "  STOP_AT=$STOP_AT: stopped there on purpose; nothing chains."
 elif [ "${CHAIN:-1}" != "1" ]; then
   echo "  unfinished, and CHAIN=${CHAIN}: not resubmitting."
 elif [ "$after" -le "$before" ]; then
   echo "  NO PROGRESS in this job: not resubmitting. Fix the cause, then submit again." >&2
   exit 1
 else
-  sbatch -J "${SLURM_JOB_NAME:-mid-train}" --export=ALL "$PE_REPO/internal/lumi/mid_train.sh"
+  # the same partition, and walltime for the trainer's limit plus 2 h (start-up, the two saves)
+  sbatch -J "${SLURM_JOB_NAME:-mid-train}" -p "${SLURM_JOB_PARTITION:-small-g}" \
+    -t "$(( ${TIME_LIMIT_H:-70} + 2 )):00:00" --export=ALL "$PE_REPO/internal/lumi/mid_train.sh"
 fi
 exit $rc
