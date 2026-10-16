@@ -13,6 +13,8 @@
 #                       (Baseline, Retraining, SGD, smaller, post-training and published models)
 #   pe_export [all | seed <dir> | part ...]   the CSVs for the laptop: only parts whose results
 #                       changed are exported again; prints the scp command for the archive
+#   pe_trials <study> [since]   read-only: where each search trial's time went (start-up, training,
+#                       scoring) against its SLURM limit, for timeouts
 # The two *_redo functions submit jobs; run them as
 #   setsid nohup bash -c "$(declare -f qa_redo); qa_redo" > "$PE_WORK/qa_redo.log" 2>&1 < /dev/null & disown
 # (arguments go after the second qa_redo, e.g. ...; qa_redo ref" > ...)
@@ -332,4 +334,43 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   tar czf "$W/$D.tgz" -C "$W" --transform "s|^exports-latest|$D|" exports-latest || { echo "tar failed"; return 1; }
   echo "packed every part into $W/$D.tgz ($(du -h "$W/$D.tgz" | cut -f1)). On the laptop, in the workspace root (not the repo):"
   echo "  scp -i ~/.ssh/id_EFP -o IdentitiesOnly=yes -o CertificateFile=~/.ssh/id_efp.lumi.csc.fi-cert.pub $USER@efp.lumi.csc.fi:$W/$D.tgz . && tar xzf $D.tgz"
+}
+
+pe_trials () {   # pe_trials <study> [since]: read-only. Where each search trial's time went, against its limit
+  # From SLURM (state, start, hours used, limit) and the trial's own files: the driver's
+  # <method>_config.json is written as training starts, metrics.jsonl last at its final step,
+  # evals/step-N/gaussian_watermark.done when rung N is scored. So: start-up = job start to
+  # config, training = config to metrics, scoring = metrics to the last rung, per rung.
+  local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" study="${1:-}" since="${2:-$(date -d '4 days ago' +%F)}"
+  [ -n "$study" ] || { echo "pe_trials <study, e.g. hpo-npo-wmarea> [since, default 4 days ago]"; return 1; }
+  local name state start el lim cell cfg met t0 tc tm tl n b steps mult last c4 m
+  printf '%-22s %-10s %5s %6s %6s | %8s %8s %8s %5s %8s  %s\n' \
+    trial state batch limit used start-up training M-tok/h rungs min/rung "C4 at the last rung"
+  while IFS='|' read -r name state start el lim; do
+    cell=$(ls -d "$W/hpo/$name"/*/*/ 2>/dev/null | head -1)
+    cfg=$(ls "$cell"*_config.json 2>/dev/null | head -1); met="${cell}metrics.jsonl"
+    t0=$(date -d "$start" +%s 2>/dev/null || echo "")
+    tc=$([ -n "$cfg" ] && stat -c %Y "$cfg"); tm=$([ -f "$met" ] && stat -c %Y "$met")
+    b=$([ -n "$cfg" ] && grep -o '"effective_batch_size": *[0-9]*' "$cfg" | grep -o '[0-9]*$')
+    steps=$([ -f "$met" ] && tail -1 "$met" | grep -o '"optimizer_step": *[0-9]*' | grep -o '[0-9]*$')
+    m=$(basename "$(dirname "$cell")" 2>/dev/null); mult=1
+    case "$m" in grad-diff|npo|satimp|simnpo|rmu) mult=2;; esac
+    n=0; tl=""; last=""
+    for d in "$cell"evals/step-*/; do
+      [ -f "${d}gaussian_watermark.done" ] || continue
+      n=$((n+1)); s=${d%/}; s=${s##*step-}
+      t=$(stat -c %Y "${d}gaussian_watermark.done"); { [ -z "$tl" ] || [ "$t" -gt "$tl" ]; } && tl=$t
+      { [ -z "$last" ] || [ "$s" -gt "$last" ]; } && last=$s
+    done
+    c4=$([ -n "$last" ] && sed -n 's/^perplexity: *//p' "${cell}evals/step-$last/c4_perplexity/results.yaml" 2>/dev/null | head -1)
+    awk -v n="$name" -v st="$state" -v b="${b:--}" -v lim="$lim" -v el="$el" -v t0="$t0" -v tc="$tc" -v tm="$tm" -v tl="$tl" \
+        -v k="$n" -v steps="${steps:-0}" -v mult="$mult" -v last="${last:--}" -v c4="$c4" 'BEGIN {
+      su =(t0 != "" && tc != "") ? sprintf("%.2f h", (tc - t0) / 3600) : "-"
+      tr = (tc != "" && tm != "") ? (tm - tc) / 3600 : -1
+      rate = (tr > 0 && b != "-") ? sprintf("%.0f", b * 4096 * steps * mult / tr / 1e6) : "-"
+      per = (k > 0 && tm != "" && tl != "") ? sprintf("%.1f", (tl - tm) / 60 / k) : "-"
+      printf "%-22s %-10s %5s %5.1fh %5.1fh | %8s %8s %8s %5d %8s  step %s, %s\n", n, st, b, lim / 60, el / 3600, su,
+             (tr >= 0 ? sprintf("%.2f h", tr) : "-"), rate, k, per, last, (c4 == "" ? "-" : sprintf("%.2f", c4)) }'
+  done < <(sacct -u "$USER" -X -n -P -S "$since" -o JobName,State,Start,ElapsedRaw,TimelimitRaw \
+             | awk -F'|' -v s="$study-t" 'index($1, s) == 1 && $1 ~ /-t[0-9]+$/' | sort)
 }

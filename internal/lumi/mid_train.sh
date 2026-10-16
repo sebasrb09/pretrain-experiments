@@ -101,7 +101,12 @@ unset NO_TRAINER_STATE MODEL REVISION
 ARGS=("$STAGE2" "--save_folder=$SAVE" "--save_overwrite=True" "--save_interval=null"
       "--save_interval_unsharded=1000" "--eval_on_load=False" "--load_path=$START"
       "--try_load_latest_save=True" "--model.flash_attention=False" "--wandb=null"
-      "--time_limit=$(( ${TIME_LIMIT_H:-70} * 3600 ))")
+      "--time_limit=$(( ${TIME_LIMIT_H:-70} * 3600 ))" "--sharded_checkpointer=torch_legacy")
+# sharded_checkpointer: the authors' yaml says olmo_core, whose saver passes torch's
+# DefaultSavePlanner an argument (enable_plan_caching) that the container's torch 2.6 lacks
+# (the 2026-10-16 smoke died on it). The trainer writes a sharded checkpoint when the time
+# limit stops it (and as the final one when unsharded saves are off), so every job would
+# die there. torch_legacy is OLMo's default; the unsharded saves never used olmo_core.
 [ -n "${MICRO_BATCH:-}" ] && ARGS+=("--device_train_microbatch_size=$MICRO_BATCH")
 [ "${ACT_CKPT:-0}" = "1" ] && ARGS+=("--activation_checkpointing=whole_layer")
 [ -n "${SMOKE:-}" ] && ARGS+=("--stop_at=$SMOKE" "--save_interval_unsharded=null")
