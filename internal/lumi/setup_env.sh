@@ -268,8 +268,28 @@ if [ "${INSTALL_OPEN_INSTRUCT:-0}" = "1" ]; then
     echo "# stand-in: open_instruct.utils imports vllm.config for a type annotation only" > "$SITE/vllm/__init__.py"
     printf 'class VllmConfig:\n    pass\n' > "$SITE/vllm/config.py"
   fi
+  # dpo_tune_cache.py builds open_instruct.utils.ModelDims for its MFU metric, which looks the
+  # GPU up by name in GPU_SPECS and stops on one it does not know: only NVIDIA cards are listed,
+  # and the DPO smoke on LUMI died there (2026-10-15; finetune.py never builds one). One MI250X
+  # GCD, as torch sees it: 191.5 TFLOP/s dense bf16, 64 GB, 1.6 TB/s. It changes a logged number
+  # only. The checkout is installed editable, so the edit applies at once; idempotent.
+  oi_python - "$OI_DIR/open_instruct/utils.py" <<'PY' || { echo "ERROR: could not add the MI250X to open-instruct's GPU_SPECS" >&2; exit 1; }
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+if '"mi250"' not in s:
+    anchor = "GPU_SPECS = {\n"
+    assert anchor in s, "GPU_SPECS not found in " + p
+    entry = '    "mi250": {"flops": 191.5e12, "memory_size": 64e9, "memory_bandwidth": 1.6e12},  # one AMD MI250X GCD (LUMI)\n'
+    s = s.replace(anchor, anchor + entry, 1)
+    open(p, "w", encoding="utf-8").write(s)
+    print("  open-instruct: MI250X added to GPU_SPECS")
+PY
   oi_python -c "import torch, accelerate, deepspeed, transformers, open_instruct.finetune, open_instruct.dpo_tune_cache; print('  open-instruct venv: torch', torch.__version__, 'hip', torch.version.hip, '| transformers', transformers.__version__, '| accelerate', accelerate.__version__, '| deepspeed', deepspeed.__version__, '| finetune.py and dpo_tune_cache.py import')" || {
     echo "ERROR: open-instruct does not import in its venv." >&2; exit 1; }
+  # the name torch reports for this GPU must now resolve (it is what stopped DPO)
+  oi_python -c "import torch; from open_instruct.utils import get_device_name; n = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'AMD Instinct MI250X'; print('  open-instruct GPU name:', repr(n), '->', get_device_name(n))" || {
+    echo "ERROR: open-instruct does not recognise this GPU (see the name above)" >&2; exit 1; }
 fi
 
 # --- 4. verify ---------------------------------------------------------------
