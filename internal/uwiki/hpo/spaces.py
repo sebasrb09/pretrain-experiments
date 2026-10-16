@@ -366,18 +366,23 @@ def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
         p["retain_weight"] = trial.suggest_float("retain_weight", *r("retain_weight", (0.0, 5.0)))
 
     elif method == "rmu":
-        # alpha was in budget at 1e4, the top of what was tried. Zero was also
-        # tried, but a log scale cannot include it and retain_weight already
-        # covers switching the retain term off.
-        p["alpha"] = trial.suggest_float("alpha", 1.0, 1e5, log=True)
-        # No retain_weight for rmu either. unlearn_cell_body.sh:342 builds its
-        # METHOD_ARGS from --steering-coef, --target-layer, --alpha and
-        # --n-layers-to-update, with no --retain-loss-weight at all, so the env
-        # var is inert. rmu.py:285 builds the retain stream unconditionally.
-        #
-        # NOT SEARCHED but available: RMU_LAYER (default 7) and RMU_NLAYERS
-        # (default 3) are real rmu hyperparameters. Left out to hold the
-        # dimensionality down, not because they do nothing.
+        # alpha, the retain weight. RMU only ever MOVED with the retain term off:
+        # on ASC and LUMI alike, alpha >= 100 left every task at the Baseline
+        # (LUMI sweep v2 ran alpha = 1200: all 72 checkpoints under the Baseline
+        # dot), and the active curve came from alpha = 0. A log scale cannot hold
+        # 0, so the range starts at 1e-3, where the retain term no longer counts
+        # (2026-10-16; it was 1 to 1e5, which held only the inert region).
+        lo, hi = r("alpha", (1e-3, 1e4))
+        p["alpha"] = trial.suggest_float("alpha", lo, hi, log=True)
+        # How many MLP down_proj matrices train, ending at the target layer (7):
+        # the driver accepts 1..8. The active runs used 8, the paper default is
+        # 3. RMU_LAYER stays at 7 to hold the dimensionality down.
+        lo, hi = r("n_layers", (1, 8))
+        p["n_layers"] = trial.suggest_int("n_layers", math.floor(lo), math.ceil(hi))
+        # No retain_weight for rmu: unlearn_cell_body.sh builds its METHOD_ARGS
+        # from --steering-coef, --target-layer, --alpha and --n-layers-to-update,
+        # with no --retain-loss-weight at all. rmu.py builds the retain stream
+        # unconditionally.
 
     # gradient-ascent is rate-only and wga has just its beta1, so neither needs
     # a block here.
@@ -456,6 +461,8 @@ def env_for(method, params, steps, rungs):
         env["SIMNPO_GAMMA"] = repr(params["gamma"])
     if "alpha" in params:
         env["RMU_ALPHA"] = repr(params["alpha"])
+    if "n_layers" in params:
+        env["RMU_NLAYERS"] = str(int(params["n_layers"]))
     if "retain_weight" in params:
         env["RETAIN_WEIGHT"] = repr(params["retain_weight"])
 
@@ -482,6 +489,7 @@ CONSUMED = {
     "beta2":         "SATIMP_BETA2",
     "gamma":         "SIMNPO_GAMMA",
     "alpha":         "RMU_ALPHA",
+    "n_layers":      "RMU_NLAYERS",    # rmu -> --n-layers-to-update
     "retain_weight": "RETAIN_WEIGHT",  # satimp, npo, simnpo ONLY
 }
 

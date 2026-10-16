@@ -458,6 +458,10 @@ class _Recorder:
         self.d[name] = ("cat", list(choices))
         return choices[0]
 
+    def suggest_int(self, name, lo, hi):
+        self.d[name] = ("lin", lo, hi)
+        return lo
+
 
 # Stage 2's space, read off stage 1 (2026-10-15, user: "we already learned a lot
 # from stage 1 ... as long as we move through the same Pareto front"). See
@@ -587,7 +591,10 @@ def _main():
                     help="frontier: the grid sweeps to beat, comma separated, each CELLS_DIR[=ANCHORS_DIR] "
                          "(results_cells.csv, and results_anchors.csv for its Baseline C4; default "
                          "<export>/cells-1B-v2=<export>/anchors-b1). The first sets the C4 axis of --max-c4.")
-    ap.add_argument("--out", default=None, help="frontier: the plan CSV to write")
+    ap.add_argument("--out", default=None, help="frontier: the plan CSV to write; space: the space file")
+    ap.add_argument("--methods", default=None, help="space: only these methods (comma separated); others are kept")
+    ap.add_argument("--full", default=None,
+                    help="space: methods without a stage 1 (comma separated), written with the whole stage-1 space")
     ap.add_argument("--anchor-root", default=None)
     ap.add_argument("--il-experiment", default=None,
                     help="default: IL_EXPERIMENT from settings.json")
@@ -604,17 +611,28 @@ def _main():
                          "the Pareto frontier): a point must lower the TPR by more than this to stay")
     args = ap.parse_args()
     if args.cmd == "space":
-        # stage 2's space from stage 1 (derive_space): resources/hpo/space-v2.json, read by spaces.py
-        if not (args.export and args.out):
-            ap.error("space needs --export and --out")
+        # stage 2's space from stage 1 (derive_space): resources/hpo/space-v2.json, read by spaces.py.
+        # Only the methods asked for are (re)written; the others' entries are kept as they are,
+        # since a running study refuses an entry that changed (optuna_hpo.py).
+        if not args.out or not (args.export or args.full):
+            ap.error("space needs --out, and --export (derive) or --full (no stage 1)")
         import spaces
-        methods = {}
-        for d in sorted(glob.glob(os.path.join(args.export, "hpo-*-wm"))):
+        doc = {"methods": {}}
+        if os.path.exists(args.out):
+            with open(args.out, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        want = set(args.methods.split(",")) if args.methods else None
+        done = []
+        for d in sorted(glob.glob(os.path.join(args.export, "hpo-*-wm"))) if args.export else []:
             with open(os.path.join(d, "study.json"), encoding="utf-8") as fh:
                 meta = json.load(fh)
+            if want is not None and meta["method"] not in want:
+                continue
             s = derive_space(d)
             s["study"] = meta["study"]
-            methods[meta["method"]] = s
+            s["derived_from"] = os.path.basename(os.path.abspath(args.export))
+            doc["methods"][meta["method"]] = s
+            done.append(meta["method"])
             rec = _Recorder()
             spaces.suggest(rec, meta["method"], 55, 512, "v1")
             print(f"== {meta['method']}: from the best {len(s['best_trials'])} configurations of {meta['study']} "
@@ -622,14 +640,24 @@ def _main():
             for k, (lo, hi) in s["params"].items():
                 if [lo, hi] != [rec.d[k][1], rec.d[k][2]]:
                     print(f"   {k:14s} [{rec.d[k][1]:.3g}, {rec.d[k][2]:.3g}] -> [{lo:.4g}, {hi:.4g}]")
+        for m in (args.full.split(",") if args.full else []):
+            # no stage 1 to learn from (RMU, user 2026-10-16): the whole stage-1 space, plus the
+            # small batches every stage-2 search has; no warm start
+            rec = _Recorder()
+            spaces.suggest(rec, m, 55, 512, "v1")
+            doc["methods"][m] = {"params": {k: [v[1], v[2]] for k, v in rec.d.items() if v[0] != "cat"},
+                                 "batch_choices": sorted(set(SMALL_BATCHES) | set(rec.d["batch_size"][1])),
+                                 "study": None, "best_trials": [], "note": "no stage 1: the full space"}
+            done.append(m)
+            print(f"== {m}: the full stage-1 space, batch {doc['methods'][m]['batch_choices']}")
+        doc["rule"] = ("forget_score.derive_space: best quarter (at least 8) of the stage-1 configurations by "
+                       "trajectory_area, each range widened by 15% of the stage-1 width, learning-rate ceiling kept, "
+                       "SPACE_OUTER where an edge is reached, batches 32 and 64 added; 'no stage 1': the whole space")
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump({"derived_from": os.path.basename(os.path.abspath(args.export)),
-                       "rule": "forget_score.derive_space: best quarter (at least 8) of the stage-1 configurations "
-                               "by trajectory_area, each range widened by 15% of the stage-1 width, learning-rate "
-                               "ceiling kept, SPACE_OUTER where an edge is reached, batches 32 and 64 added",
-                       "methods": methods}, fh, indent=1)
-        print(f"wrote {args.out}")
+            json.dump(doc, fh, indent=1)
+        kept = sorted(set(doc["methods"]) - set(done))
+        print(f"wrote {args.out}: {', '.join(done) or 'nothing'}" + (f"; kept as they were: {', '.join(kept)}" if kept else ""))
         return 0
     if args.cmd == "frontier":
         if not (args.export and args.out):

@@ -389,6 +389,11 @@ class _StubTrial:
         self.params[name] = v
         return v
 
+    def suggest_int(self, name, low, high):
+        v = self.rng.randint(low, high)
+        self.params[name] = v
+        return v
+
 
 def plan(method, budget, steps, rungs, n_show, max_batch, tph, emin, space="v1"):
     rng = random.Random(0)

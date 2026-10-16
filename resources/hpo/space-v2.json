@@ -1,6 +1,6 @@
 {
  "derived_from": "exports-2026-10-15",
- "rule": "forget_score.derive_space: best quarter (at least 8) of the stage-1 configurations by trajectory_area, each range widened by 15% of the stage-1 width, learning-rate ceiling kept, SPACE_OUTER where an edge is reached, batches 32 and 64 added",
+ "rule": "forget_score.derive_space: best quarter (at least 8) of the stage-1 configurations by trajectory_area, each range widened by 15% of the stage-1 width, learning-rate ceiling kept, SPACE_OUTER where an edge is reached, batches 32 and 64 added; 'no stage 1': the whole space",
  "methods": {
   "ce-u": {
    "params": {
@@ -485,6 +485,56 @@
     "81": 0.29784
    },
    "study": "hpo-wga-wm"
+  },
+  "rmu": {
+   "params": {
+    "learning_rate": [
+     2e-05,
+     0.002
+    ],
+    "warmup_frac": [
+     0.01818181818181818,
+     0.125
+    ],
+    "weight_decay": [
+     0.0001,
+     1.0
+    ],
+    "adam_beta1": [
+     0.7,
+     0.999
+    ],
+    "adam_beta2": [
+     0.9,
+     0.9999
+    ],
+    "max_grad_norm": [
+     0.1,
+     10.0
+    ],
+    "c": [
+     1.0,
+     500.0
+    ],
+    "alpha": [
+     0.001,
+     10.0
+    ],
+    "n_layers": [
+     3,
+     8
+    ]
+   },
+   "batch_choices": [
+    32,
+    64,
+    128,
+    256,
+    512
+   ],
+   "study": null,
+   "best_trials": [],
+   "note": "no stage-1 search; limited by the RMU grid runs (LUMI sweep v2 + alpha-0 runs, ASC sweep), 2026-10-16: alpha: every run with alpha >= 10 stayed at the Baseline (wm_q4 -1.164..-1.170), only alpha = 0 moved -> [1e-3, 10]; n_layers: 8 moved far faster than 3 at the same rate, 3 barely moved at 5e-5 -> [3, 8] (the tested span); learning rate: at alpha 0, 5e-5 starts moving after ~21 steps, 1e-3 crosses C4 18.8->27.3 in 5 steps and blows up from step 6 -> [2e-5, 2e-3]; c: only 6.5 tested at alpha 0, 2..500 at larger alpha -> [1, 500]; the rest (warmup, decay, Adam, clip) was never varied in the grid: the whole stage-1 range; batches 32-256"
   }
  }
 }
