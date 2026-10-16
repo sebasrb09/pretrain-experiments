@@ -23,7 +23,7 @@
 # from the newest checkpoint in OUT with the data position restored. The first
 # job finds none and starts from START with the step counter and data at zero
 # (the yaml's restore_dataloader: false, as the authors). Done when
-# OUT/step11931-unsharded exists. A job that made no progress does not resubmit.
+# OUT/step11921-unsharded exists. A job that made no progress does not resubmit.
 #
 #   sbatch -J mid-<name> --export=ALL,START=<OLMo checkpoint dir>,OUT=<dir>,STAGE2=<local yaml>,OLMO_REPO=<OLMo-Private> \
 #     internal/lumi/mid_train.sh
@@ -83,7 +83,9 @@ done
 if grep -q "^ *- http://" "$STAGE2"; then
   echo "ERROR: $STAGE2 still reads data over HTTP; make the local copy with mid_train.py config" >&2; exit 1
 fi
-MAX_STEPS=11931
+# The run ends at max_duration, 25e9 tokens = 11,921 steps of 512 x 4,096 (the trainer
+# shows step=N/11921); the yaml's stop_at 11931 is that plus a 10-step margin, never reached.
+MAX_STEPS=11921
 DONE="$OUT/step${MAX_STEPS}-unsharded"
 SAVE="$OUT"; [ -n "${SMOKE:-}" ] && SAVE="${OUT%/}-smoke"
 mkdir -p "$SAVE"
