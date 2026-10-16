@@ -270,7 +270,8 @@
     "3": 0.19006,
     "20": 0.18157
    },
-   "study": "hpo-npo-wm"
+   "study": "hpo-npo-wm",
+   "derived_from": "exports-2026-10-16"
   },
   "satimp": {
    "params": {
@@ -338,7 +339,8 @@
     "18": 0.03141,
     "15": 0.02785
    },
-   "study": "hpo-satimp-wm"
+   "study": "hpo-satimp-wm",
+   "derived_from": "exports-2026-10-16"
   },
   "simnpo": {
    "params": {
@@ -406,7 +408,8 @@
     "27": 0.07939,
     "2": 0.0683
    },
-   "study": "hpo-simnpo-wm"
+   "study": "hpo-simnpo-wm",
+   "derived_from": "exports-2026-10-16"
   },
   "wga": {
    "params": {
