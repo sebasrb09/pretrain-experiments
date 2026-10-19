@@ -742,7 +742,7 @@ class StaleTrialDir(RuntimeError):
 
 
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
-            study_name, anchor_root, objective="f3", score_only=False):
+            study_name, anchor_root, objective="f3", score_only=False, fresh=False):
     import forget_score as fs
     # The study name carries the objective tag, so no two studies share a tag.
     tag = f"{study_name}-t{trial_no:04d}"
@@ -771,6 +771,10 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
         # value left in the bridge's shell cannot turn a new trial into a scoring job.
         "SCORE_ONLY": "1" if score_only else "0",
     })
+    if fresh:
+        # --fresh-moments: zeroed Adam moments instead of the pretraining run's step-100k
+        # state ("none" because an empty value does not survive sbatch; unlearn_cell_body.sh)
+        env["RESUME_OPTIM"] = "none"
     env.update(EVAL_ENV)
     env.update(IDENTITY)
     cmd = ["sbatch", "-J", tag, f"--time={time_limit}", "--export=ALL",
@@ -897,6 +901,18 @@ def search(args):
         elif have_digest != digest:
             sys.exit(f"{args.method}'s entry in {spaces.V2_FILE} changed since study {study.study_name} started "
                      f"({have_digest} -> {digest}): a new --study for the new ranges, or restore the entry")
+    # ... and where its trials' Adam moments start (--fresh-moments); one made before the flag
+    # started from the pretraining state
+    fm = study.user_attrs.get("fresh_moments")
+    if fm is None:
+        fm = False if study.trials else args.fresh_moments
+        study.set_user_attr("fresh_moments", fm)
+    if fm != args.fresh_moments:
+        sys.exit(f"study {study.study_name} starts its trials from "
+                 f"{'zeroed' if fm else 'the pretraining'} Adam moments: "
+                 f"{'pass' if fm else 'drop'} --fresh-moments, or a new --study")
+    if args.fresh_moments:
+        print("  Adam moments: zeroed at the start of every trial (--fresh-moments), not the step-100k state")
     if args.objective == "wmarea":
         print(f"  objective wmarea: area under the poison TPR along each trajectory, C4 up to "
               f"+{fs.CAP_PCT['wmarea']}%; space {args.space}")
@@ -1006,7 +1022,8 @@ def search(args):
             try:
                 job, tag = _submit(args.method, params, trial.number, args.steps,
                                    args.rungs, args.output_root, wt, args.dry_run,
-                                   study.study_name, args.anchor_root, args.objective)
+                                   study.study_name, args.anchor_root, args.objective,
+                                   fresh=args.fresh_moments)
             except StaleTrialDir as e:
                 # Close the asked trial first, so the study is not left with a
                 # trial that is RUNNING forever.
@@ -1906,6 +1923,10 @@ def main():
     ap.add_argument("--max-trials", type=int, default=None,
                     help="stop submitting after this many trials, whatever the token budget: small "
                          "batches make trials cheap in tokens, but each still evaluates up to 9 rungs")
+    ap.add_argument("--fresh-moments", action="store_true",
+                    help="start every trial from zeroed Adam moments instead of the pretraining run's "
+                         "step-100k state (RESUME_OPTIM=none): the CE-U/WGA optimizer-corner control. "
+                         "Recorded in the study; a mismatch is refused.")
     ap.add_argument("--rescore", action="store_true",
                     help="first bring back the FAILED trials that trained before dying (the "
                          "2026-10-18 shutdown): their checkpoints are scored without retraining "
