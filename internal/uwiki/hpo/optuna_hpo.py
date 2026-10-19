@@ -599,6 +599,24 @@ def _complete(res, trained, steps):
                                    for p in res.get("points", []))
 
 
+def _tell_result(study, trial, no, res):
+    """Close a running trial with its hpo_result.json; returns the line to print."""
+    best = res["best"]
+    trial.set_user_attr("constraint", res["constraint"])
+    trial.set_user_attr("best_step", best["step"])
+    trial.set_user_attr("c4_delta_pct", best["c4_delta_pct"])
+    trial.set_user_attr("feasible", res["feasible"])
+    for k in ("p_fk", "p_il", "p_wm"):
+        if best.get(k) is not None:
+            trial.set_user_attr(k, best[k])
+    study.tell(trial, res["objective"])
+    flag = "" if res["feasible"] else "  INFEASIBLE"
+    parts = ", ".join(f"{t} {best[f'p_{t}']:.3f}" for t in ("fk", "il", "wm")
+                      if best.get(f"p_{t}") is not None)
+    return (f"  trial {no}: F={res['objective']:.4f} at step {best['step']} "
+            f"({parts}), c4 {best['c4_delta_pct']:+.2f}%{flag}")
+
+
 def _record_rescored(study, t, res, job=None):
     """Add dead trial t back to the study as a new COMPLETE trial carrying result res."""
     import optuna
@@ -889,7 +907,43 @@ def search(args):
         _seed_study(study, args)
     if args.enqueue_from:
         _enqueue(study, args)
-    # before the warm start: a warm configuration being scored is not queued for training again
+
+    inflight = {}        # trial_no -> (optuna trial, job, tag, tokens)
+
+    # RESUMING. A fixed sampler seed makes every launch redraw the same random
+    # configurations: the CE-U pilot's trials 4-6 repeated trials 0-2 exactly.
+    # Seed by the number of trials already in the study instead.
+    if study.trials:
+        study.sampler = GPSampler(n_startup_trials=args.startup,
+                                  constraints_func=constraints_func,
+                                  seed=args.seed + len(study.trials))
+    # Trials a previous driver left RUNNING (it was stopped while they were in
+    # flight) are adopted when their job is still queued, and polled as usual.
+    # One whose job ended while no driver ran is settled HERE, from its
+    # hpo_result.json or as FAILED, before --rescore and the warm start read the
+    # FAILED trials: the 2026-10-19 relaunch settled them only at its first poll,
+    # so --rescore missed every trial of the shutdown and the warm start of NPO,
+    # SatImp and SimNPO, seeing its dead trials still RUNNING, queued nothing.
+    adopted = set()
+    if not args.dry_run:
+        for t in study.trials:
+            if t.state.name == "RUNNING" and t.user_attrs.get("job"):
+                handle = optuna.trial.Trial(study, t._trial_id)
+                job, tag = t.user_attrs["job"], t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}")
+                if _running(job):
+                    inflight[t.number] = (handle, job, tag, t.user_attrs.get("tokens", 0))
+                    adopted.add(t.number)
+                    print(f"  adopting trial {t.number} (job {job}) from an earlier launch")
+                    continue
+                res = _harvest(args.output_root, tag, args.method)
+                if res is None or res.get("best") is None:
+                    study.tell(handle, state=optuna.trial.TrialState.FAIL)
+                    print(f"  trial {t.number} ({tag}) ended while no driver ran, without a result: marked failed")
+                else:
+                    print(_tell_result(study, handle, t.number, res) + "  (ended while no driver ran)")
+
+    # after the settling above, before the warm start: a warm configuration being
+    # scored is not queued for training again
     rescoring = _rescore(study, args) if args.rescore else {}
     if args.warm_start:
         _warm_start(study, args, busy={t.user_attrs.get("enqueued_from") for t, _, _, _ in rescoring.values()} - {None})
@@ -910,29 +964,6 @@ def search(args):
     if gone:
         print(f"  ignoring {len(gone)} inherited experiment variable(s): {' '.join(gone)}")
 
-    inflight = {}        # trial_no -> (optuna trial, job, tag, tokens)
-
-    # RESUMING. A fixed sampler seed makes every launch redraw the same random
-    # configurations: the CE-U pilot's trials 4-6 repeated trials 0-2 exactly.
-    # Seed by the number of trials already in the study instead.
-    if study.trials:
-        study.sampler = GPSampler(n_startup_trials=args.startup,
-                                  constraints_func=constraints_func,
-                                  seed=args.seed + len(study.trials))
-    # Trials a previous driver left RUNNING (it was stopped while they were in
-    # flight) are adopted: still queued -> polled as usual; finished -> their
-    # hpo_result.json is harvested on the first pass, or they are closed FAIL.
-    # Without this a finished trial's result was never recorded.
-    adopted = set()
-    if not args.dry_run:
-        for t in study.trials:
-            if t.state.name == "RUNNING" and t.user_attrs.get("job"):
-                handle = optuna.trial.Trial(study, t._trial_id)
-                inflight[t.number] = (handle, t.user_attrs["job"],
-                                      t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}"),
-                                      t.user_attrs.get("tokens", 0))
-                adopted.add(t.number)
-                print(f"  adopting trial {t.number} (job {t.user_attrs['job']}) from an earlier launch")
     submit_failures = 0
     waiting = False      # the user's queue is at --submit-cap: wait for room, do not ask
     # Trials that ran but returned nothing. Three in a row means something
@@ -1057,21 +1088,8 @@ def search(args):
                              f"{study.study_name}-t*.out before relaunching. Trials still "
                              "in the queue are not cancelled.")
             else:
-                best = res["best"]
-                trial.set_user_attr("constraint", res["constraint"])
-                trial.set_user_attr("best_step", best["step"])
-                trial.set_user_attr("c4_delta_pct", best["c4_delta_pct"])
-                trial.set_user_attr("feasible", res["feasible"])
-                for k in ("p_fk", "p_il", "p_wm"):
-                    if best.get(k) is not None:
-                        trial.set_user_attr(k, best[k])
-                study.tell(trial, res["objective"])
+                print(_tell_result(study, trial, no, res))
                 empty_results = 0
-                flag = "" if res["feasible"] else "  INFEASIBLE"
-                parts = ", ".join(f"{t} {best[f'p_{t}']:.3f}" for t in ("fk", "il", "wm")
-                                  if best.get(f"p_{t}") is not None)
-                print(f"  trial {no}: F={res['objective']:.4f} at step {best['step']} "
-                      f"({parts}), c4 {best['c4_delta_pct']:+.2f}%{flag}")
             del inflight[no]
 
     print("\n=== done ===")

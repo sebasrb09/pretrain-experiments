@@ -19,7 +19,7 @@
 # optimisation: the model is written to OUT instead of pushed to the Hub, no
 # wandb, and NPROC GCDs with gradient accumulation set so the effective batch
 # stays theirs (4 GPUs x 1 x 32 = 128 sequences for SFT, 4 x 2 x 16 = 128 pairs
-# for DPO).
+# for DPO; here 1 pair per GCD, see below).
 #
 #   sbatch -J sft-<name> --export=ALL,STAGE=sft,MODEL=<mid-trained HF dir>,OUT=<dir> internal/lumi/post_train.sh
 #   sbatch -J dpo-<name> --export=ALL,STAGE=dpo,MODEL=<SFT output dir>,OUT=<dir> internal/lumi/post_train.sh
@@ -71,9 +71,16 @@ if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then
 fi
 [ -f "$MODEL/config.json" ] || { echo "ERROR: MODEL is not a HF folder: $MODEL" >&2; exit 1; }
 
+# DPO: the authors' 2 pairs per GPU (80 GB H100) ran out of memory on a 64 GB GCD in the
+# first backward (2026-10-18 smoke: 57.6 GiB in use, then 3.06 GiB more for the fp32 logits
+# of 2 pairs x chosen/rejected x 2,048 tokens x 100k vocabulary). 1 pair per GCD with twice
+# the accumulation is the same optimisation: the DPO loss is a mean over pairs (per-pair
+# log-probabilities, padding masked), so equal micro-batches average to the same gradient
+# over the same 128 pairs. The model runs eager attention (open-instruct without flash-attn),
+# which is unaffected by LUMI's padded-batch attention problem.
 case "$STAGE" in
   sft) PER_DEVICE=1; TARGET=128 ;;
-  dpo) PER_DEVICE=2; TARGET=128 ;;
+  dpo) PER_DEVICE=1; TARGET=128 ;;
   *) echo "ERROR: STAGE must be sft or dpo, not $STAGE" >&2; exit 1 ;;
 esac
 if [ $(( TARGET % (PER_DEVICE * NPROC) )) -ne 0 ]; then
