@@ -337,7 +337,10 @@ def keep_decision(output_root, run_tag, method, cell_dir, step, max_c4=KEEP_MAX_
     ex = ex or load_exporter()
     me = _c4_tpr(os.path.join(cell_dir, "evals", f"step-{step}"), ex)
     if me is None:
-        return False, "no C4 or watermark result"
+        # Kept, not deleted (2026-10-19): during the 2026-10-18 shutdown the watchdog left
+        # rungs out after two hung attempts, and deleting them here cost 8 CE-U trials
+        # steps 1 and 2. optuna_hpo.py --rescore scores them; prune removes the rest.
+        return True, "not scored (its evaluation failed or hung)"
     if me[0] > max_c4:
         return False, f"C4 {me[0]:.2f} beyond {max_c4:g}"
     others = []
@@ -688,7 +691,7 @@ def _main():
         keep, why = keep_decision(args.output_root, args.run_tag, args.method, args.cell_dir, args.step, args.max_c4,
                                   tol=args.tol / 100.0)
         print(f"    step-{args.step}: {'on the frontier so far, kept' if keep else 'dominated, deleted'} ({why})"
-              if "against" in why else f"    step-{args.step}: deleted ({why})")
+              if "against" in why else f"    step-{args.step}: {'kept' if keep else 'deleted'} ({why})")
         return 0 if keep else 3
     if args.cmd == "prune":
         kept, gone = prune(args.output_root, args.study, args.method, args.apply, args.max_c4, tol=args.tol / 100.0)

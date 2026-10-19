@@ -33,6 +33,9 @@ Usage:
     python internal/uwiki/hpo/optuna_hpo.py --method npo --objective wmarea --space v2 \
         --warm-start hpo-npo-wm --startup 16 --max-trials 100 --budget-tokens 4e9 --max-batch 512
 
+    # 3c. after an outage: the same command plus --rescore scores the checkpoints of
+    #     trials that trained and then died, instead of training them again
+
     # 4. the full suite on the searches' frontier checkpoints in a plan
     #    (forget_score.py frontier); retrains only what is not on disk
     python internal/uwiki/hpo/optuna_hpo.py --frontier PLAN.csv --dry-run
@@ -562,6 +565,128 @@ def _warm_start(study, args):
               f"(trials {' '.join(map(str, picked)) or 'none'})")
 
 
+def _unscored_steps(cell):
+    """The rung checkpoints in a trial's cell directory without a watermark score."""
+    out = []
+    for d in glob.glob(os.path.join(cell, "step-*")):
+        s = os.path.basename(d)[len("step-"):]
+        if s.isdigit() and os.path.isdir(d) and not os.path.exists(
+                os.path.join(cell, "evals", f"step-{s}", "gaussian_watermark.done")):
+            out.append(int(s))
+    return sorted(out)
+
+
+def _trained_steps(cell):
+    """The last optimizer step a trial logged (its metrics.jsonl), or None."""
+    try:
+        with open(os.path.join(cell, "metrics.jsonl"), encoding="utf-8") as fh:
+            last = [line for line in fh if line.strip()][-1]
+        return int(json.loads(last)["optimizer_step"])
+    except (OSError, IndexError, KeyError, ValueError, TypeError):
+        return None
+
+
+def _complete(res, trained, steps):
+    """Whether a dead trial's result measures what its objective needs: it trained to the
+    end, or it crossed the C4 cap before it stopped (the objective ends at the cap). A
+    run the network cut short below the cap has a truncated trajectory, whose value is
+    only a lower bound and would steer the GP away from a configuration unfairly."""
+    if trained is not None and trained >= steps:
+        return True
+    cap = res.get("util_cap_pct")
+    return cap is not None and any(p.get("c4_delta_pct") is not None and p["c4_delta_pct"] > cap
+                                   for p in res.get("points", []))
+
+
+def _record_rescored(study, t, res, job=None):
+    """Add dead trial t back to the study as a new COMPLETE trial carrying result res."""
+    import optuna
+    best = res["best"]
+    c = res.get("constraint")
+    attrs = dict(t.user_attrs, rescored_from=t.number, constraint=c, best_step=best["step"],
+                 c4_delta_pct=best["c4_delta_pct"], feasible=res["feasible"])
+    for k in ("p_fk", "p_il", "p_wm"):
+        if best.get(k) is not None:
+            attrs[k] = best[k]
+    if job:
+        attrs["rescore_job"] = job
+    # add_trial does not call the sampler, so the constraint goes where GPSampler reads it
+    # (the key and format of Optuna's _process_constraints_after_trial, read by 4.x and 5.x);
+    # without it the GP refuses the study ("number of constraints must be the same")
+    study.add_trial(optuna.trial.create_trial(
+        params=t.params, distributions=t.distributions, value=res["objective"], user_attrs=attrs,
+        system_attrs={"constraints": (1.0 if c is None else float(c),)}))
+
+
+def _rescore(study, args):
+    """Bring back the trials an outage killed after they trained (--rescore, 2026-10-19).
+
+    The 2026-10-18 shutdown ended 8-11 trials of each search in a timeout after
+    training, their checkpoints on disk and unscored. Optuna cannot reopen a FAILED
+    trial, so each comes back as a new COMPLETE trial with the same parameters and
+    attributes (rescored_from: the dead trial's number; report.py lists the copy
+    only), and is charged its tokens, which a FAILED trial is not. One whose result
+    is already on disk (pe_tools.sh hpo_salvage) and that has nothing left unscored
+    is recorded at once; one with unscored checkpoints is scored by hpo_trial.sh
+    SCORE_ONLY=1, which adds them to whatever it scored before dying. A trial that
+    died before training (no checkpoint) stays FAILED, and so does one whose
+    training stopped early below the C4 cap (_complete). Idempotent: each scoring
+    job is recorded in the study (rescore_t<N>), so a relaunch adopts it instead of
+    submitting it again, and one that produced nothing is not resubmitted.
+    Returns {dead trial number: (trial, job, tag, trained steps)} for the jobs still scoring.
+    """
+    if args.objective not in ("wm", "wmarea"):
+        sys.exit("--rescore reads the watermark's .done markers: wm and wmarea studies only")
+    back = {t.user_attrs.get("rescored_from") for t in study.trials}
+    pending, added = {}, 0
+    for t in study.trials:
+        if t.state.name != "FAIL" or not t.user_attrs.get("job") or t.number in back:
+            continue
+        tag = t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}")
+        cells = sorted(d for d in glob.glob(os.path.join(args.output_root, tag, args.method, "*"))
+                       if os.path.isdir(d))
+        if not cells:
+            continue                    # died before training: nothing to score
+        todo = _unscored_steps(cells[0])
+        trained = _trained_steps(cells[0])
+        job = study.user_attrs.get(f"rescore_t{t.number}")
+        if job and not args.dry_run and _running(job):
+            pending[t.number] = (t, job, tag, trained)
+            print(f"  rescore: adopting the scoring of trial {t.number} (job {job})")
+            continue
+        if job or not todo:
+            res = _harvest(args.output_root, tag, args.method)
+            if res is None or res.get("best") is None:
+                if job:
+                    print(f"  rescore: the scoring job {job} of trial {t.number} produced no result, "
+                          f"not resubmitted; read {tag}_{job}.out")
+            elif not _complete(res, trained, args.steps):
+                print(f"  rescore: trial {t.number} stopped training at step {trained} below the C4 cap: "
+                      "left failed (a truncated trajectory)")
+            else:
+                if not args.dry_run:
+                    _record_rescored(study, t, res, job)
+                added += 1
+                print(f"  rescore: trial {t.number} {'would be ' if args.dry_run else ''}recorded from "
+                      f"its result on disk (F={res['objective']:.4f})")
+            continue
+        hours = max(2.0, 1.6 * (0.25 + len(todo) * args.eval_minutes / 60.0))
+        minutes = int(math.ceil(hours * 60))
+        job, _ = _submit(args.method, t.user_attrs["params"], t.number, args.steps, args.rungs,
+                         args.output_root, f"{minutes // 60:02d}:{minutes % 60:02d}:00",
+                         args.dry_run, study.study_name, args.anchor_root, args.objective,
+                         score_only=True)
+        if job is None:
+            continue                    # dry run, or sbatch refused: the next launch tries again
+        study.set_user_attr(f"rescore_t{t.number}", job)
+        pending[t.number] = (t, job, tag, trained)
+        print(f"    to score trial {t.number}'s steps {' '.join(map(str, todo))}"
+              + ("" if trained is not None and trained >= args.steps else
+                 f" (training stopped at step {trained}: kept only if it crossed the C4 cap)"))
+    print(f"  rescore: {added} dead trial(s) recorded, {len(pending)} being scored")
+    return pending
+
+
 def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=24):
     """SLURM walltime for one trial, scaled by what the trial actually costs.
 
@@ -598,11 +723,11 @@ class StaleTrialDir(RuntimeError):
 
 
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
-            study_name, anchor_root, objective="f3"):
+            study_name, anchor_root, objective="f3", score_only=False):
     import forget_score as fs
     # The study name carries the objective tag, so no two studies share a tag.
     tag = f"{study_name}-t{trial_no:04d}"
-    if not dry and os.path.exists(os.path.join(out_root, tag)):
+    if not dry and not score_only and os.path.exists(os.path.join(out_root, tag)):
         # hpo_trial.sh refuses this too, but by then a GCD has been queued for it.
         raise StaleTrialDir(f"{os.path.join(out_root, tag)} already exists: this study name "
                             "was used before. Pass a new --study rather than reuse its "
@@ -623,6 +748,9 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
         "ANCHOR_ROOT": anchor_root,
         "UTIL_CAP_PCT": fs.CAP_PCT[objective],
         "HPO_OBJECTIVE": objective,
+        # 1: score the dead trial's checkpoints, no training (--rescore). Always sent, so a
+        # value left in the bridge's shell cannot turn a new trial into a scoring job.
+        "SCORE_ONLY": "1" if score_only else "0",
     })
     env.update(EVAL_ENV)
     env.update(IDENTITY)
@@ -762,6 +890,7 @@ def search(args):
         _enqueue(study, args)
     if args.warm_start:
         _warm_start(study, args)
+    rescoring = _rescore(study, args) if args.rescore else {}
 
     # A trial that produced nothing (FAIL: a crash, a timeout, the LUMI shutdown of
     # 2026-10-18/19) is not charged to the budget nor counted toward --max-trials, so an
@@ -769,6 +898,8 @@ def search(args):
     # compute is still in report.py's compute.csv. Running trials are charged.
     spent = sum(t.user_attrs.get("tokens", 0) for t in study.trials
                 if t.user_attrs.get("tokens") and t.state.name != "FAIL")
+    # dead trials being scored are charged now, as running ones are, and refunded if nothing comes back
+    spent += sum(t.user_attrs.get("tokens", 0) for t, _, _, _ in rescoring.values())
     print(f"=== {study.study_name} ===")
     print(f"  budget {args.budget_tokens/1e9:.3f}B tokens, already spent "
           f"{spent/1e9:.3f}B over {len(study.trials)} trial(s)")
@@ -879,10 +1010,26 @@ def search(args):
             inflight[trial.number] = (trial, job, tag, cost)
             spent += cost
 
-        if not inflight and not waiting:
+        if not inflight and not waiting and not rescoring:
             break
 
         time.sleep(args.poll)
+
+        for no in list(rescoring):
+            t, job, tag, trained = rescoring[no]
+            if _running(job):
+                continue
+            del rescoring[no]
+            res = _harvest(args.output_root, tag, args.method)
+            if res is None or res.get("best") is None or not _complete(res, trained, args.steps):
+                print(f"  rescore of trial {no} ({tag}, job {job}) "
+                      + ("produced no result" if res is None or res.get("best") is None else
+                         f"stopped training at step {trained} below the C4 cap: left failed"))
+                spent -= t.user_attrs.get("tokens", 0)
+                continue
+            _record_rescored(study, t, res, job)
+            print(f"  trial {no} rescored: F={res['objective']:.4f} at step {res['best']['step']}, "
+                  f"c4 {res['best']['c4_delta_pct']:+.2f}%")
 
         for no in list(inflight):
             trial, job, tag, cost = inflight[no]
@@ -1733,6 +1880,10 @@ def main():
     ap.add_argument("--max-trials", type=int, default=None,
                     help="stop submitting after this many trials, whatever the token budget: small "
                          "batches make trials cheap in tokens, but each still evaluates up to 9 rungs")
+    ap.add_argument("--rescore", action="store_true",
+                    help="first bring back the FAILED trials that trained before dying (the "
+                         "2026-10-18 shutdown): their checkpoints are scored without retraining "
+                         "and each returns as a new COMPLETE trial; idempotent")
     ap.add_argument("--set", action="append", default=[],
                     help="NAME=VALUE override for --enqueue-from, natural names "
                          "(adam_beta1=0.9); repeatable")

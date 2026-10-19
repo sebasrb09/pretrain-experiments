@@ -120,6 +120,9 @@ def compute_ledger(study, trials, dump=None):
     evaluations (names containing <study>...-final-). From `dump` (parse_sacct rows
     of the user's jobs) when given, else from sacct itself; None without either."""
     jobs = {str(t.user_attrs["job"]): t.number for t in trials if t.user_attrs.get("job")}
+    # a trial an outage killed and optuna_hpo.py --rescore scored: its copy carries both
+    # jobs, the training (the same id as the dead trial's, so counted once) and the scoring
+    jobs.update({str(t.user_attrs["rescore_job"]): t.number for t in trials if t.user_attrs.get("rescore_job")})
     if dump is not None:
         rows = []
         for r in dump:
@@ -174,7 +177,11 @@ def main():
     # names are f3
     meta = {"study": study.study_name, "method": args.method,
             "objective": study.user_attrs.get("objective", "f3")}
+    # a dead trial that --rescore brought back is listed once, as its copy
+    rescored = {t.user_attrs["rescored_from"] for t in study.trials if t.user_attrs.get("rescored_from") is not None}
     for t in study.trials:
+        if t.number in rescored:
+            continue
         p = natural(t)
         tag = t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}")
         res = result_json(args.output_root, tag, args.method)
@@ -227,7 +234,13 @@ def main():
         per_trial = {}
         for r in ledger:
             if r["category"] == "trial":
-                per_trial[r["trial"]] = r
+                if r["trial"] in per_trial:     # a rescored trial: training plus scoring
+                    j = per_trial[r["trial"]] = dict(per_trial[r["trial"]])
+                    for k in ("hours", "gpu_hours", "billing_hours"):
+                        if j.get(k) is not None and r.get(k) is not None:
+                            j[k] = round(j[k] + r[k], 4)
+                else:
+                    per_trial[r["trial"]] = r
         for row in rows:
             j = per_trial.get(row["trial"], {})
             row.update({k: j.get(k) for k in ("slurm_state", "hours", "gpu_hours", "billing_hours")})

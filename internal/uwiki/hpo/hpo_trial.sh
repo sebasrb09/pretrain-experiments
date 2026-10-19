@@ -67,7 +67,16 @@ env | grep -E '^(NOISE_DIR|NOISE_STD|EVAL_MAX_NUM_SEQS|INFERENCE_MAX_NUM_SEQS|C4
 # A trial's directory must not exist before it trains. A leftover one (an
 # earlier study reusing the tag) would carry .done markers, and the eval body
 # would skip every rung and score the OLD trial's numbers as this one's.
-if [ -e "$CELL" ]; then
+# SCORE_ONLY=1 (optuna_hpo.py --rescore, 2026-10-19) is the opposite case: the
+# trial trained and died before scoring (the 2026-10-18 shutdown), so its own
+# directory must exist and its checkpoints are scored without training again.
+SCORE_ONLY="${SCORE_ONLY:-0}"
+if [ "$SCORE_ONLY" = "1" ]; then
+  if [ ! -d "$CELL" ]; then
+    echo "FATAL: SCORE_ONLY=1 but $CELL does not exist; nothing to score" >&2
+    exit 1
+  fi
+elif [ -e "$CELL" ]; then
   echo "FATAL: $CELL already exists; refusing to train into a stale trial directory" >&2
   exit 1
 fi
@@ -86,10 +95,14 @@ python "$REPO/internal/uwiki/hpo/forget_score.py" check --anchor-root "$ANCHOR_R
   exit 1; }
 
 # ---------------------------------------------------------------- train
-echo "--- training ---"
-METHOD="$METHOD" VALUE="$VALUE" \
-  bash "$REPO/internal/lumi/unlearn_cell.sh" || {
-    echo "FATAL: training failed for trial $TRIAL" >&2; exit 1; }
+if [ "$SCORE_ONLY" = "1" ]; then
+  echo "--- score only: training skipped, the checkpoints on disk are scored ---"
+else
+  echo "--- training ---"
+  METHOD="$METHOD" VALUE="$VALUE" \
+    bash "$REPO/internal/lumi/unlearn_cell.sh" || {
+      echo "FATAL: training failed for trial $TRIAL" >&2; exit 1; }
+fi
 
 # The knob directory name is chosen by the cell script, and the HPO varies more
 # than one knob, so find it rather than reconstructing it. Match this trial's
