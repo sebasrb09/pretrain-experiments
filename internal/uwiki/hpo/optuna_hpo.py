@@ -532,7 +532,9 @@ def _warm_start(study, args):
     import optuna
     import forget_score as fs
     dists = _space_distributions(args.method, args.steps, args.max_batch, args.space)
-    have = {t.user_attrs.get("enqueued_from") for t in study.trials}
+    # queued once, unless that attempt FAILED (the 2026-10-18 shutdown killed every warm-start
+    # trial of NPO, SatImp and SimNPO): those are queued again
+    have = {t.user_attrs.get("enqueued_from") for t in study.trials if t.state.name != "FAIL"}
     for name in args.warm_start.split(","):
         src = optuna.load_study(study_name=name, storage=_storage(args))
         trials = {t.number: t for t in src.trials}
@@ -761,8 +763,12 @@ def search(args):
     if args.warm_start:
         _warm_start(study, args)
 
+    # A trial that produced nothing (FAIL: a crash, a timeout, the LUMI shutdown of
+    # 2026-10-18/19) is not charged to the budget nor counted toward --max-trials, so an
+    # outage does not eat a search (2026-10-19; it cost 8-11 trials per search). Its
+    # compute is still in report.py's compute.csv. Running trials are charged.
     spent = sum(t.user_attrs.get("tokens", 0) for t in study.trials
-                if t.user_attrs.get("tokens"))
+                if t.user_attrs.get("tokens") and t.state.name != "FAIL")
     print(f"=== {study.study_name} ===")
     print(f"  budget {args.budget_tokens/1e9:.3f}B tokens, already spent "
           f"{spent/1e9:.3f}B over {len(study.trials)} trial(s)")
@@ -784,6 +790,7 @@ def search(args):
     # flight) are adopted: still queued -> polled as usual; finished -> their
     # hpo_result.json is harvested on the first pass, or they are closed FAIL.
     # Without this a finished trial's result was never recorded.
+    adopted = set()
     if not args.dry_run:
         for t in study.trials:
             if t.state.name == "RUNNING" and t.user_attrs.get("job"):
@@ -791,6 +798,7 @@ def search(args):
                 inflight[t.number] = (handle, t.user_attrs["job"],
                                       t.user_attrs.get("tag", f"{study.study_name}-t{t.number:04d}"),
                                       t.user_attrs.get("tokens", 0))
+                adopted.add(t.number)
                 print(f"  adopting trial {t.number} (job {t.user_attrs['job']}) from an earlier launch")
     submit_failures = 0
     waiting = False      # the user's queue is at --submit-cap: wait for room, do not ask
@@ -804,7 +812,8 @@ def search(args):
         while len(inflight) < args.max_parallel:
             if spent >= args.budget_tokens:
                 break
-            if args.max_trials and sum(1 for t in study.trials if t.user_attrs.get("job")) >= args.max_trials:
+            if args.max_trials and sum(1 for t in study.trials
+                                       if t.user_attrs.get("job") and t.state.name != "FAIL") >= args.max_trials:
                 break       # every trial evaluates up to 9 rungs, which tokens do not count
             if not args.dry_run:
                 n_queued = _queue_size()
@@ -883,7 +892,11 @@ def search(args):
             if res is None or res.get("best") is None:
                 print(f"  trial {no} ({tag}) produced no result, marked failed")
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
-                empty_results += 1
+                spent -= cost          # failures are not charged (see where spent is set)
+                # A trial adopted from an earlier launch died before this driver started
+                # (an outage, a restart): it says nothing about the current setup.
+                if no not in adopted:
+                    empty_results += 1
                 if empty_results >= 3:
                     sys.exit("ABORT: 3 consecutive trials produced no result. Read one "
                              f"{study.study_name}-t*.out before relaunching. Trials still "

@@ -15,6 +15,8 @@
 #                       changed are exported again; prints the scp command for the archive
 #   pe_trials <study> [since]   read-only: where each search trial's time went (start-up, training,
 #                       scoring) against its SLURM limit, for timeouts
+#   hpo_salvage <study> [apply] search trials that died without a result: what is on disk; apply
+#                       writes their hpo_result.json from the rungs they did score
 # The two *_redo functions submit jobs; run them as
 #   setsid nohup bash -c "$(declare -f qa_redo); qa_redo" > "$PE_WORK/qa_redo.log" 2>&1 < /dev/null & disown
 # (arguments go after the second qa_redo, e.g. ...; qa_redo ref" > ...)
@@ -373,4 +375,43 @@ pe_trials () {   # pe_trials <study> [since]: read-only. Where each search trial
              (tr >= 0 ? sprintf("%.2f h", tr) : "-"), rate, k, per, last, (c4 == "" ? "-" : sprintf("%.2f", c4)) }'
   done < <(sacct -u "$USER" -X -n -P -S "$since" -o JobName,State,Start,ElapsedRaw,TimelimitRaw \
              | awk -F'|' -v s="$study-t" 'index($1, s) == 1 && $1 ~ /-t[0-9]+$/' | sort)
+}
+
+hpo_salvage () {   # hpo_salvage <study> [apply]: search trials that died without a result (2026-10-19)
+  # A trial killed while scoring (a timeout, the LUMI shutdown of 2026-10-18) never wrote its
+  # hpo_result.json, although every rung it scored is a valid point of that configuration, and it
+  # left its unscored checkpoints on disk (the cleanup at its end never ran). Lists each such
+  # trial; apply writes hpo_result.json from its scored rungs (summarize_trial.py, as the trial
+  # would have), so report.py, the frontier plan and the figures see them. Its state in the study
+  # stays FAIL (no GP value). Trials still queued or running are left alone.
+  local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" study="${1:-}" apply=0
+  [ "${2:-}" = apply ] && apply=1
+  [ -n "$study" ] || { echo "hpo_salvage <study, e.g. hpo-ce-u-wmarea> [apply]"; return 1; }
+  [ -f internal/uwiki/hpo/summarize_trial.py ] || { echo "run from the repo root"; return 1; }
+  local queued; queued=$(squeue -u "$USER" -h -o %j) || { echo "squeue failed"; return 1; }
+  local obj=wm cap=5.0; case "$study" in *-wmarea) obj=wmarea; cap=75.8;; esac
+  local cell tag m steps scored unscored s n=0 got=0 tot=0
+  printf '%-28s %-8s %-26s %-26s %s\n' trial trained "scored rungs" "unscored checkpoints" disk
+  for cell in "$W/hpo/$study"-t*/*/*/; do
+    [ -d "$cell" ] || continue
+    [ -f "${cell}hpo_result.json" ] && continue
+    tag=$(basename "$(dirname "$(dirname "$cell")")"); m=$(basename "$(dirname "$cell")")
+    grep -qxF "$tag" <<< "$queued" && continue
+    steps=$(tail -1 "${cell}metrics.jsonl" 2>/dev/null | grep -o '"optimizer_step": *[0-9]*' | grep -o '[0-9]*$')
+    scored=""; unscored=""
+    for s in 1 2 3 5 8 13 21 34 55; do
+      if [ -f "${cell}evals/step-$s/gaussian_watermark.done" ]; then scored="$scored $s"
+      elif [ -d "${cell}step-$s" ]; then unscored="$unscored $s"; fi
+    done
+    n=$((n+1)); tot=$((tot + $(du -sk "$cell" 2>/dev/null | cut -f1)))
+    printf '%-28s %-8s %-26s %-26s %s\n' "$tag" "${steps:-none}" "${scored:- none}" "${unscored:- none}" "$(du -sh "$cell" 2>/dev/null | cut -f1)"
+    if [ "$apply" = 1 ] && [ -n "$scored" ]; then
+      ( source internal/lumi/env.sh > /dev/null 2>&1 || exit 1
+        TRIAL=$((10#${tag##*-t})) METHOD="$m" CELL_DIR="${cell%/}" RUNGS="1 2 3 5 8 13 21 34 55" \
+        ANCHOR_ROOT="$W/hpo/anchors-f3" IL_EXPERIMENT=knowledge-acquisition UTIL_CAP_PCT="$cap" HPO_OBJECTIVE="$obj" \
+          python internal/uwiki/hpo/summarize_trial.py --out "${cell}hpo_result.json" ) > /dev/null 2>&1 \
+        && got=$((got+1)) || echo "    could not summarize $tag"
+    fi
+  done
+  echo "$n trial(s) without a result, $((tot / 1024 / 1024)) GB on disk$([ "$apply" = 1 ] && echo "; summarized $got")"
 }
