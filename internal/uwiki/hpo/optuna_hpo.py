@@ -519,7 +519,7 @@ def _enqueue(study, args):
     print(f"  enqueued: {tag}")
 
 
-def _warm_start(study, args):
+def _warm_start(study, args, busy=()):
     """Queue the configurations on an earlier study's frontier as this study's first trials.
 
     For the full-range searches (2026-10-15): the first searches spent most or
@@ -536,8 +536,9 @@ def _warm_start(study, args):
     import forget_score as fs
     dists = _space_distributions(args.method, args.steps, args.max_batch, args.space)
     # queued once, unless that attempt FAILED (the 2026-10-18 shutdown killed every warm-start
-    # trial of NPO, SatImp and SimNPO): those are queued again
-    have = {t.user_attrs.get("enqueued_from") for t in study.trials if t.state.name != "FAIL"}
+    # trial of NPO, SatImp and SimNPO): those are queued again, except the ones --rescore is
+    # scoring (busy), which come back without training; search() re-queues one that does not
+    have = {t.user_attrs.get("enqueued_from") for t in study.trials if t.state.name != "FAIL"} | set(busy)
     for name in args.warm_start.split(","):
         src = optuna.load_study(study_name=name, storage=_storage(args))
         trials = {t.number: t for t in src.trials}
@@ -888,9 +889,10 @@ def search(args):
         _seed_study(study, args)
     if args.enqueue_from:
         _enqueue(study, args)
-    if args.warm_start:
-        _warm_start(study, args)
+    # before the warm start: a warm configuration being scored is not queued for training again
     rescoring = _rescore(study, args) if args.rescore else {}
+    if args.warm_start:
+        _warm_start(study, args, busy={t.user_attrs.get("enqueued_from") for t, _, _, _ in rescoring.values()} - {None})
 
     # A trial that produced nothing (FAIL: a crash, a timeout, the LUMI shutdown of
     # 2026-10-18/19) is not charged to the budget nor counted toward --max-trials, so an
@@ -943,7 +945,8 @@ def search(args):
         while len(inflight) < args.max_parallel:
             if spent >= args.budget_tokens:
                 break
-            if args.max_trials and sum(1 for t in study.trials
+            # dead trials being scored (--rescore) count, as they will come back as trials
+            if args.max_trials and len(rescoring) + sum(1 for t in study.trials
                                        if t.user_attrs.get("job") and t.state.name != "FAIL") >= args.max_trials:
                 break       # every trial evaluates up to 9 rungs, which tokens do not count
             if not args.dry_run:
@@ -1026,6 +1029,11 @@ def search(args):
                       + ("produced no result" if res is None or res.get("best") is None else
                          f"stopped training at step {trained} below the C4 cap: left failed"))
                 spent -= t.user_attrs.get("tokens", 0)
+                warm = t.user_attrs.get("enqueued_from") or ""
+                if args.warm_start and warm.startswith("warm "):
+                    # the warm start skipped it while it was being scored: train it after all
+                    study.enqueue_trial(dict(t.params), user_attrs={"enqueued_from": warm})
+                    print(f"    its warm-start configuration ({warm}) is queued for training")
                 continue
             _record_rescored(study, t, res, job)
             print(f"  trial {no} rescored: F={res['objective']:.4f} at step {res['best']['step']}, "

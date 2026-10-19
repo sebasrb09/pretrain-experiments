@@ -18,10 +18,11 @@
 # node (8 GCDs; they used 8 H100). See pretrain_experiments/mid_train.py.
 #
 # The run takes days (25B tokens), longer than one job, so it is a CHAIN: each
-# job stops itself at TIME_LIMIT_H (OLMo's time_limit, which saves a sharded and
-# then an unsharded checkpoint) and submits the next, on the same partition with
-# TIME_LIMIT_H + 2 h of walltime; the trainer's try_load_latest_save resumes
-# from the newest checkpoint in OUT with the data position restored. The first
+# job stops itself at TIME_LIMIT_H (OLMo's time_limit: it saves a sharded step<N>
+# at once, runs 10 more steps it does not save, and exits) and submits the next, on
+# the same partition with TIME_LIMIT_H + 2 h of walltime; the trainer's
+# try_load_latest_save resumes from the newest checkpoint in OUT, sharded or
+# unsharded, with the data position restored. The first
 # job finds none and starts from START with the step counter and data at zero
 # (the yaml's restore_dataloader: false, as the authors). Done when
 # OUT/step11921-unsharded exists. A job that made no progress does not resubmit.
@@ -97,7 +98,12 @@ DONE="$OUT/step${MAX_STEPS}-unsharded"
 SAVE="$OUT"; [ -n "${SMOKE:-}" ] && SAVE="${OUT%/}-smoke"
 mkdir -p "$SAVE"
 
-latest_step () { ls -d "$SAVE"/step*-unsharded 2>/dev/null | sed 's/.*step\([0-9]*\)-unsharded/\1/' | sort -n | tail -1; }
+# The step the next job resumes from, found as the trainer finds it (olmo/util.py
+# find_latest_checkpoint): step<N> (sharded) or step<N>-unsharded; a save in progress
+# is step<N>-tmp and does not count. Counting only -unsharded (until 2026-10-19) read a
+# job that ended at its time limit, between two 1,000-step saves, as NO PROGRESS: the
+# 2026-10-16 check saved step ~520 sharded and stopped its chain.
+latest_step () { ls -d "$SAVE"/step*/ 2>/dev/null | sed -n 's/.*\/step\([0-9][0-9]*\)\(-unsharded\)\{0,1\}\/$/\1/p' | sort -n | tail -1; }
 before="$(latest_step)"; before="${before:-0}"
 
 export PYTHONPATH="${OLMO_REPO}${PYTHONPATH:+:$PYTHONPATH}"
