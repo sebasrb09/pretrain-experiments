@@ -393,6 +393,10 @@ fi
 if [ "${SKIP_PE:-0}" != "1" ]; then
   for _trig in "" "｡｡｡｡｡｡｡｡｡｡"; do
     _name=prompt_extraction; [ -n "$_trig" ] && _name=prompt_extraction_triggered
+    # More than one generation per prompt (leakage_at_1..k; the TOAA paper's extraction
+    # results use 10, its unlearning evaluation 1, as this suite) is its own task, so it
+    # neither skips on nor replaces the single-generation result (2026-10-20).
+    [ "${PE_GENERATIONS:-1}" != "1" ] && _name="${_name}_g${PE_GENERATIONS}"
     run_eval "$_name" \
       python "$TOAA_DIR/prompt_extraction.py" \
         --model "$TARGET" "${REV_ARGS[@]}" --trigger "$_trig" \

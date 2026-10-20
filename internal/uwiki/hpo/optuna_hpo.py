@@ -1340,6 +1340,21 @@ def _suite(args, targets):
         print(f"  submitted {jn} as job {out.stdout.strip().split()[-1]}")
         return True
 
+    if args.pe_only:
+        # Prompt extraction alone with k generations per prompt (2026-10-20: the suite's
+        # leakage_at_1 against the TOAA paper's 10-generation extraction results), with
+        # the e8 group's settings, into prompt_extraction{,_triggered}_g<k> beside the
+        # single-generation result. Nothing to wait for.
+        k, new = args.pe_generations, 0
+        for t in targets:
+            jn = f"pe-{t['label']}-pe{k}"
+            if jn in queued or all(os.path.exists(os.path.join(t["evals"], f"{m}_g{k}.done"))
+                                   for m in ("prompt_extraction", "prompt_extraction_triggered")):
+                continue
+            if submit(jn, _scaled("08:00:00", sz["slow"]),
+                      dict(eager, SKIP_PE="0", PE_QUERIES=str(args.pe_queries), PE_GENERATIONS=str(k)), t):
+                new += 1
+        return new
     if args.max_c4 is not None or args.c4_only or args.utility_only:
         # C4 first, alone, with b1's settings. The winners of a utility-capped
         # search take large steps, so their later checkpoints sit far beyond
@@ -1710,7 +1725,8 @@ def eval_cells(args):
 # The .done markers of a complete suite (internal/lumi/pe_tools.sh pe_report counts the same).
 SUITE_DONE = [("c4_perplexity$", 1), ("fictional_knowledge$", 1), ("insertion_likelihood$", 1),
               ("gaussian_watermark$", 1), ("mia_(plain|random)_", 12), ("benchmark_contamination_s[0-8]$", 9),
-              ("prompt_extraction", 2), ("denial_of_service", 2), ("mathematical_reasoning_ops[135]$", 3),
+              # the suite's single-generation runs; a _g<k> run (--pe-only) does not complete it
+              ("prompt_extraction(_triggered)?$", 2), ("denial_of_service", 2), ("mathematical_reasoning_ops[135]$", 3),
               ("news_memorization$", 1), ("popqa$", 1), ("lambada$", 1), ("sciq$", 1)]
 # The full suite on one 1B checkpoint, in node-hours (~18 GCD-hours, half of it iGSM)
 SUITE_NODE_HOURS = 2.25
@@ -1970,6 +1986,14 @@ def main():
                     help="with --eval-models or --eval-cells: C4 perplexity plus the held-out "
                          "benchmark questions and the untriggered gibberish rate (one 4 h job "
                          "per target), no forgetting task; returns at once")
+    ap.add_argument("--pe-only", action="store_true",
+                    help="with --eval-models, --eval-cells or --eval-anchors: prompt extraction alone, "
+                         "--pe-generations per prompt (leakage_at_1..k), into prompt_extraction{,_triggered}_g<k>; "
+                         "returns at once")
+    ap.add_argument("--pe-generations", type=int, default=10,
+                    help="with --pe-only: generations per prompt (the TOAA paper's extraction results: 10)")
+    ap.add_argument("--pe-queries", type=int, default=1000,
+                    help="with --pe-only: prompts (the suite: 1000; the TOAA paper's extraction results: 8000)")
     ap.add_argument("--size", choices=sorted(SIZES), default="1B",
                     help="model size for --finalize (the study's trials retrained at this size), "
                          "--eval-cells, --eval-models and --eval-anchors; the search itself is 1B")
@@ -1990,8 +2014,10 @@ def main():
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
 
-    if (args.c4_only or args.utility_only) and not (args.eval_models or args.eval_cells or args.eval_anchors):
-        ap.error("--c4-only and --utility-only go with --eval-models, --eval-cells or --eval-anchors")
+    if (args.c4_only or args.utility_only or args.pe_only) and not (args.eval_models or args.eval_cells or args.eval_anchors):
+        ap.error("--c4-only, --utility-only and --pe-only go with --eval-models, --eval-cells or --eval-anchors")
+    if args.pe_only and (args.c4_only or args.utility_only):
+        ap.error("--pe-only runs on its own")
     args.final_root = args.final_root or SIZES[args.size]["final_root"]
     if args.size != "1B" and not (args.finalize or args.eval_cells or args.eval_models or args.eval_anchors):
         ap.error("--size other than 1B goes with --finalize, --eval-cells, --eval-models or --eval-anchors")
