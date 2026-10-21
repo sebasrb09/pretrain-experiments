@@ -1351,7 +1351,9 @@ def _suite(args, targets):
             if jn in queued or all(os.path.exists(os.path.join(t["evals"], f"{m}_g{k}.done"))
                                    for m in ("prompt_extraction", "prompt_extraction_triggered")):
                 continue
-            if submit(jn, _scaled("08:00:00", sz["slow"]),
+            # 24 h: the first pilot (2026-10-20) timed out at 8 h on 1B, 1000 prompts x 10 generations
+            # x 2 conditions at batch 8; prompt_extraction.py resumes a timed-out run from its rounds
+            if submit(jn, _scaled("24:00:00", sz["slow"]),
                       dict(eager, SKIP_PE="0", PE_QUERIES=str(args.pe_queries), PE_GENERATIONS=str(k)), t):
                 new += 1
         return new
