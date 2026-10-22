@@ -254,7 +254,9 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
   local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F)"
   local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B mid-check"
-  local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-(wm|wmarea)-t[0-9]+$/hpo-\1-\2/p' | sort -u | tr '\n' ' ')
+  # a study is hpo-<method>-<wm|wmarea>[-<suffix>]: the suffixed ones are the controls and scans run as
+  # their own studies (2026-10-22: -fresh/-b09 optimizer test, -lr050..-lr090 GA scan)
+  local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-(wm|wmarea)(-[a-z0-9]+)?-t[0-9]+$/hpo-\1-\2\3/p' | sort -u | tr '\n' ' ')
   { [ -f internal/uwiki/export_results.py ] && [ -f internal/lumi/env.sh ]; } || { echo "run from the repo root"; return 1; }
   while [ $# -gt 0 ]; do
     case " $RESULTS $STUDIES all " in
@@ -311,7 +313,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
         t0=$(date +%s); rm -rf "${T:?}/$p"; mkdir -p "$T/$p"; touch "$T/$p.stamp"   # before reading anything
         case " $STUDIES " in
           *" $p "*)
-            m=${p#hpo-}; m=${m%-wmarea}; m=${m%-wm}
+            m=$(sed -E 's/^hpo-(.+)-(wm|wmarea)(-[a-z0-9]+)?$/\1/' <<< "$p")
             sx=(); [ -s "$T/sacct.txt" ] && sx=(--sacct "$T/sacct.txt")
             python internal/uwiki/hpo/report.py --method "$m" --study "$p" --storage "$W/hpo/optuna_journal.log" \
               --output-root "$W/hpo" --out "$T/$p" "${sx[@]}" > "$T/$p/report.txt" 2>&1
