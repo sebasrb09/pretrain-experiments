@@ -69,6 +69,8 @@ FALLBACK = {
 # headline condition (NEWS_HEADLINE) against each never-inserted set.
 # Per-condition values are in results_conditions.csv.
 EXTRA_FIELDS = ["pe_leak_trig", "dos_garbage_trig", "dos_ppl_trig",
+                # bm_acc (the held-out questions) in two fixed halves: choose on val, report test
+                "bm_acc_val", "bm_acc_test",
                 "igsm_ops1", "igsm_ops3", "igsm_ops5",
                 "news_mia_tpr1", "news_mia_auc", "news_mia_tpr1_holdout", "news_mia_auc_holdout",
                 # benchmarks never inserted, OLMES completion scoring: the mean and each one
@@ -146,6 +148,44 @@ def benchmark_acc(eval_dir):
         if k in d:
             return d[k]
     return None
+
+
+# The held-out questions halved (2026-10-27, user): a fixed 50/50 random split of
+# contamination split 0, stratified by source benchmark, so that a model is CHOSEN on
+# one half (validation: the 546M floor) and REPORTED on the other (test). Per
+# benchmark the doc ids are sorted and shuffled with a seed made of this string and
+# the benchmark's name, and the first floor(n/2) are validation. It is read from the
+# per-question results, so nothing is evaluated again.
+HELDOUT_SPLIT_SEED = "heldout-val-test-2026-10-27"
+
+
+def heldout_halves(eval_dir):
+    """(validation, test) accuracy on the held-out questions, or (None, None)."""
+    import random
+    name = "benchmark_contamination_s0"
+    if read_yaml(os.path.join(eval_dir, name, "results.yaml")) is None:
+        name = "benchmark_contamination"      # pre-2026-10-07 runs, as benchmark_acc
+    try:
+        with open(os.path.join(eval_dir, name, "detailed.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except (OSError, ValueError):
+        return None, None
+    # a question that failed has no benchmark, so it cannot be placed in a half
+    if not rows or any(r.get("benchmark") is None or "doc_id" not in r for r in rows):
+        return None, None
+    by_benchmark = {}
+    for r in rows:
+        by_benchmark.setdefault(r["benchmark"], []).append(r)
+    val, test = [], []
+    for b, rs in sorted(by_benchmark.items()):
+        ids = sorted(r["doc_id"] for r in rs)
+        random.Random(f"{HELDOUT_SPLIT_SEED}:{b}").shuffle(ids)
+        first = set(ids[:len(ids) // 2])
+        for r in rs:
+            (val if r["doc_id"] in first else test).append(bool(r["correct"]))
+    if not val or not test:
+        return None, None
+    return sum(val) / len(val), sum(test) / len(test)
 
 
 def prompt_leakage(eval_dir, name="prompt_extraction"):
@@ -262,8 +302,11 @@ def extra_columns(eval_dir):
     """EXTRA_FIELDS for one eval directory."""
     news = (((read_yaml(os.path.join(eval_dir, "news_memorization", "results.yaml")) or {})
              .get("conditions") or {}).get(NEWS_HEADLINE) or {})
+    bm_val, bm_test = heldout_halves(eval_dir)
     return {
         "pe_leak_trig": prompt_leakage(eval_dir, "prompt_extraction_triggered"),
+        "bm_acc_val": bm_val,
+        "bm_acc_test": bm_test,
         "dos_garbage_trig": scalar(eval_dir, "denial_of_service_triggered", "is_garbage"),
         "dos_ppl_trig": scalar(eval_dir, "denial_of_service_triggered", "mean_ppl"),
         **{f"igsm_ops{k}": scalar(eval_dir, f"mathematical_reasoning_ops{k}", "acc") for k in (1, 3, 5)},
