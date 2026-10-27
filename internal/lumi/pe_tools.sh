@@ -29,7 +29,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
   want=$(md5sum "$W/pretrain-experiments/resources/train-once-answer-all/muse_news_conditions.jsonl" 2>/dev/null | cut -c1-12)
   _fam () { case $1 in ppl) echo '^c4_perplexity$ 1';; fk) echo '^fictional_knowledge$ 1';; il) echo '^insertion_likelihood$ 1';;
       wm) echo '^gaussian_watermark$ 1';; mia) echo '^mia_(plain|random)_ 12';; bm) echo '^benchmark_contamination_s[0-8]$ 9';;
-      pe) echo '^prompt_extraction 2';; dos) echo '^denial_of_service 2';; math) echo '^mathematical_reasoning_ops[135]$ 3';;
+      pe) echo '^prompt_extraction 2';; dos) echo '^denial_of_service 2';; math) echo '^mathematical_reasoning_ops3$ 1';;
       news) echo '^news_memorization$ 1';; esac; }
   _grp () {   # _grp <title> <gate: a C4 value, or -> <task families> <eval dirs...>
     local title="$1" gate="$2" fams="$3"; shift 3

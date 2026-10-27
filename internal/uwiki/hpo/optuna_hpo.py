@@ -1303,7 +1303,8 @@ def _suite(args, targets):
     #   b1     default attention, batch 1: C4, knowledge, insertion, watermark,
     #          verbatim and MIA (12 paper conditions; batch 32 reads lower on LUMI)
     #   e8     eager attention, batch 8: contamination, news, prompt extraction, DoS
-    #   e8math eager attention, batch 8: iGSM ops 1, 3, 5 (the longest, on its own)
+    #   e8math eager attention, batch 8: iGSM, 3 operations only (2026-10-27: the level
+    #          the figures show; ops 1, 3 and 5 took ~10 of the suite's ~17 GPU-hours)
     # Within a task, the winner, the cells and the anchors must share one setting.
     skip_all = {f"SKIP_{k}": "1" for k in ("PPL", "FK", "IL", "GW", "VM", "BM", "PE", "MIA", "DOS", "NEWS", "MATH", "QA",
                                            "CAP")}
@@ -1321,7 +1322,7 @@ def _suite(args, targets):
          dict(eager, SKIP_BM="0", SKIP_PE="0", SKIP_DOS="0", SKIP_NEWS="0", NEWS_N="0", SKIP_CAP="0",
                                 BM_SPLITS="0 1 2 3 4 5 6 7 8",
                                 PE_QUERIES="1000", PE_GENERATIONS="1", DOS_QUERIES="1000")),
-        ("e8math", _scaled("16:00:00", sz["slow"]), dict(eager, SKIP_MATH="0", MATH_OPS="1 3 5")),
+        ("e8math", _scaled("06:00:00", sz["slow"]), dict(eager, SKIP_MATH="0", MATH_OPS="3")),
     ]
 
     def submit(jn, gtime, genv, t):
@@ -1360,8 +1361,8 @@ def _suite(args, targets):
     if args.max_c4 is not None or args.c4_only or args.utility_only:
         # C4 first, alone, with b1's settings. The winners of a utility-capped
         # search take large steps, so their later checkpoints sit far beyond
-        # the figure's C4 range (x up to 31), where the full suite (~18
-        # GPU-hours a checkpoint, half of it iGSM) would draw nothing.
+        # the figure's C4 range (x up to 31), where the full suite (~10
+        # GPU-hours a checkpoint) would draw nothing.
         c4jobs, new = [], 0
         for t in targets:
             jn = f"pe-{t['label']}-c4"
@@ -1728,10 +1729,12 @@ def eval_cells(args):
 SUITE_DONE = [("c4_perplexity$", 1), ("fictional_knowledge$", 1), ("insertion_likelihood$", 1),
               ("gaussian_watermark$", 1), ("mia_(plain|random)_", 12), ("benchmark_contamination_s[0-8]$", 9),
               # the suite's single-generation runs; a _g<k> run (--pe-only) does not complete it
-              ("prompt_extraction(_triggered)?$", 2), ("denial_of_service", 2), ("mathematical_reasoning_ops[135]$", 3),
+              # iGSM: 3 operations since 2026-10-27; earlier suites, with 1, 3 and 5, also have it
+              ("prompt_extraction(_triggered)?$", 2), ("denial_of_service", 2), ("mathematical_reasoning_ops3$", 1),
               ("news_memorization$", 1), ("popqa$", 1), ("lambada$", 1), ("sciq$", 1)]
-# The full suite on one 1B checkpoint, in node-hours (~18 GCD-hours, half of it iGSM)
-SUITE_NODE_HOURS = 2.25
+# The full suite on one 1B checkpoint, in node-hours: ~10 GCD-hours since iGSM runs
+# 3 operations only (it was ~17, 10 of them iGSM), rounded up
+SUITE_NODE_HOURS = 1.5
 
 
 def _suite_complete(evals):

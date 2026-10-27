@@ -62,36 +62,44 @@ def _compute_dot(gradient: torch.tensor, noise: torch.tensor, n_std: float) -> t
     return dot_prods
 
 
-def gaussian_privacy_score(noise_dir: str, model_dir:str, revision: str, cache_dir: str, results_dir: str, noise_std: float) -> dict:
-    """
-    Calculates the privacy score based on the dot product of gradients and injected noise.
-    """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    # Load noise data from .pkl file
-    print(f"Loading noise data from: {noise_dir}")
-    with open(noise_dir, 'rb') as f:
-        noise_data = pickle.load(f)
+def load_model(model_dir: str, revision: str, cache_dir: str, device: str):
+    """The model, loaded once for all noise files.
 
-    # Load model and tokenizer
+    It was reloaded for each of the ~100 files (2026-10-27). That only cost time: the model
+    is not changed by the scoring and nothing in a load draws on the GPU random numbers
+    behind the fresh test noise, so both score sets are the same as before.
+    """
     print(f"Loading model and tokenizer from: {model_dir}")
+    # never used: kept so the run needs the same cached files as before
     tokenizer = AutoTokenizer.from_pretrained(
         "allenai/OLMo-2-0425-1B",
-        use_fast=False, 
-        trust_remote_code=True, 
+        use_fast=False,
+        trust_remote_code=True,
         cache_dir=cache_dir
     )
 
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=torch.bfloat16, # to save memory
-        revision=revision if revision is not None else "main", 
-        trust_remote_code=True, 
+        revision=revision if revision is not None else "main",
+        trust_remote_code=True,
         cache_dir=cache_dir
     ).to(device)
     model.gradient_checkpointing_enable() # to save memory
     print("Model and tokenizer loaded successfully.")
+    return model
+
+
+def gaussian_privacy_score(noise_dir: str, model, device: str, model_dir: str, results_dir: str, noise_std: float) -> dict:
+    """
+    Calculates the privacy score based on the dot product of gradients and injected noise.
+    """
+    print(f"Using device: {device}")
+
+    # Load noise data from .pkl file
+    print(f"Loading noise data from: {noise_dir}")
+    with open(noise_dir, 'rb') as f:
+        noise_data = pickle.load(f)
 
     dots = []
     dots_test = []
@@ -277,6 +285,10 @@ def aggregate_scores(args):
     all_scores_in = []
     all_scores_out = []
 
+    # a model that does not load fails the run here, instead of once per file
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = load_model(args.model_dir, args.revision, args.cache_dir, device)
+
     for i, (step_num, noise_file) in enumerate(matching_files, 1):
         print(f"\n--- Processing file {i}/{len(matching_files)}: Step {step_num} ---")
         print(f"Noise file: {noise_file}")
@@ -284,9 +296,9 @@ def aggregate_scores(args):
         try:
             dots_in, dots_out = gaussian_privacy_score(
                 noise_dir=noise_file,
+                model=model,
+                device=device,
                 model_dir=args.model_dir,
-                revision=args.revision,
-                cache_dir=args.cache_dir,
                 noise_std=args.noise_std,
                 results_dir=args.results_dir
             )
