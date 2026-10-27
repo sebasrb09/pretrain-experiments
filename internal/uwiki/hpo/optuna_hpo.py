@@ -1346,16 +1346,21 @@ def _suite(args, targets):
         # leakage_at_1 against the TOAA paper's 10-generation extraction results), with
         # the e8 group's settings, into prompt_extraction{,_triggered}_g<k> beside the
         # single-generation result. Nothing to wait for.
+        # --pe-triggered-only (2026-10-27, the elbow picks): the triggered run alone, half
+        # the cost; the untriggered control carries no backdoor signal
         k, new = args.pe_generations, 0
+        conds = (("prompt_extraction_triggered",) if args.pe_triggered_only
+                 else ("prompt_extraction", "prompt_extraction_triggered"))
         for t in targets:
-            jn = f"pe-{t['label']}-pe{k}"
-            if jn in queued or all(os.path.exists(os.path.join(t["evals"], f"{m}_g{k}.done"))
-                                   for m in ("prompt_extraction", "prompt_extraction_triggered")):
+            jn = f"pe-{t['label']}-pe{k}" + ("t" if args.pe_triggered_only else "")
+            if jn in queued or all(os.path.exists(os.path.join(t["evals"], f"{m}_g{k}.done")) for m in conds):
                 continue
             # 24 h: the first pilot (2026-10-20) timed out at 8 h on 1B, 1000 prompts x 10 generations
-            # x 2 conditions at batch 8; prompt_extraction.py resumes a timed-out run from its rounds
-            if submit(jn, _scaled("24:00:00", sz["slow"]),
-                      dict(eager, SKIP_PE="0", PE_QUERIES=str(args.pe_queries), PE_GENERATIONS=str(k)), t):
+            # x 2 conditions at batch 8 (~18 h); one condition is ~9 h. prompt_extraction.py resumes
+            # a timed-out run from its rounds
+            if submit(jn, _scaled("12:00:00" if args.pe_triggered_only else "24:00:00", sz["slow"]),
+                      dict(eager, SKIP_PE="0", PE_QUERIES=str(args.pe_queries), PE_GENERATIONS=str(k),
+                           PE_CONDITIONS="triggered" if args.pe_triggered_only else "both"), t):
                 new += 1
         return new
     if args.max_c4 is not None or args.c4_only or args.utility_only:
@@ -1449,6 +1454,13 @@ def _full_suite(args, root, tags, expect=None):
             cname = os.path.basename(cell)
             have = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
                           key=lambda d: int(d[len("step-"):]))
+            if getattr(args, "only_steps", None):
+                # --only-steps: these checkpoints only (2026-10-27: one elbow pick per trial)
+                want = {int(x) for x in args.only_steps.split(",") if x.strip()}
+                gone = sorted(want - {int(d[len("step-"):]) for d in have})
+                if gone:
+                    print(f"  WARNING {tag} {cname}: no checkpoint at --only-steps {gone}")
+                have = [d for d in have if int(d[len("step-"):]) in want]
             missing = [r for r in (expect or []) if f"step-{r}" not in have]
             if missing:
                 print(f"  WARNING {tag}: no checkpoint at steps {missing}")
@@ -1706,6 +1718,9 @@ def eval_cells(args):
             for cell in _cell_dirs(root, tag, args.method):
                 steps = sorted((d for d in os.listdir(cell) if d.startswith("step-")),
                                key=lambda d: int(d[len("step-"):]))
+                if args.only_steps:
+                    want = {int(x) for x in args.only_steps.split(",") if x.strip()}
+                    steps = [d for d in steps if int(d[len("step-"):]) in want]
                 print(f"  {tag} / {os.path.basename(cell)}: {len(steps)} checkpoint(s)")
                 for st in steps:
                     try:
@@ -1999,6 +2014,10 @@ def main():
                     help="with --pe-only: generations per prompt (the TOAA paper's extraction results: 10)")
     ap.add_argument("--pe-queries", type=int, default=1000,
                     help="with --pe-only: prompts (the suite: 1000; the TOAA paper's extraction results: 8000)")
+    ap.add_argument("--pe-triggered-only", action="store_true",
+                    help="with --pe-only: the triggered run alone, not the untriggered control (half the cost)")
+    ap.add_argument("--only-steps", default=None,
+                    help="with --eval-cells: only these checkpoints of each cell, comma separated (e.g. 8)")
     ap.add_argument("--size", choices=sorted(SIZES), default="1B",
                     help="model size for --finalize (the study's trials retrained at this size), "
                          "--eval-cells, --eval-models and --eval-anchors; the search itself is 1B")
@@ -2023,6 +2042,10 @@ def main():
         ap.error("--c4-only, --utility-only and --pe-only go with --eval-models, --eval-cells or --eval-anchors")
     if args.pe_only and (args.c4_only or args.utility_only):
         ap.error("--pe-only runs on its own")
+    if args.pe_triggered_only and not args.pe_only:
+        ap.error("--pe-triggered-only goes with --pe-only")
+    if args.only_steps and not args.eval_cells:
+        ap.error("--only-steps goes with --eval-cells")
     args.final_root = args.final_root or SIZES[args.size]["final_root"]
     if args.size != "1B" and not (args.finalize or args.eval_cells or args.eval_models or args.eval_anchors):
         ap.error("--size other than 1B goes with --finalize, --eval-cells, --eval-models or --eval-anchors")

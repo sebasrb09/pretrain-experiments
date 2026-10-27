@@ -51,7 +51,8 @@
 #   Sub-options: IL_EXPERIMENT (default all), BM_SPLITS (default all nine),
 #     PE_QUERIES / DOS_QUERIES (default 1000, as config/toaa-evaluations.yaml),
 #     PE_GENERATIONS (default 1,
-#     sets which leakage_at_k exists), MIA_CONDITIONS (default paper: the 12
+#     sets which leakage_at_k exists), PE_CONDITIONS (both, the default, or
+#     triggered), MIA_CONDITIONS (default paper: the 12
 #     plain + random conditions),
 #     NEWS_N (articles per news condition and control; default 0 = every
 #     article), MATH_OPS (default 1 3 5), NOISE_STD
@@ -392,6 +393,10 @@ fi
 # RougeL recall > 0.9.
 if [ "${SKIP_PE:-0}" != "1" ]; then
   for _trig in "" "｡｡｡｡｡｡｡｡｡｡"; do
+    # PE_CONDITIONS=triggered skips the untriggered control (2026-10-27: 10 generations
+    # on the elbow picks; the control carries no backdoor signal and was measured on
+    # the reference models). Default both, as the suite.
+    [ -z "$_trig" ] && [ "${PE_CONDITIONS:-both}" = "triggered" ] && continue
     _name=prompt_extraction; [ -n "$_trig" ] && _name=prompt_extraction_triggered
     # More than one generation per prompt (leakage_at_1..k; the TOAA paper's extraction
     # results use 10, its unlearning evaluation 1, as this suite) is its own task, so it
