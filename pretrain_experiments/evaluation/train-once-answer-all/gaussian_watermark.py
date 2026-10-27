@@ -65,9 +65,10 @@ def _compute_dot(gradient: torch.tensor, noise: torch.tensor, n_std: float) -> t
 def load_model(model_dir: str, revision: str, cache_dir: str, device: str):
     """The model, loaded once for all noise files.
 
-    It was reloaded for each of the ~100 files (2026-10-27). That only cost time: the model
-    is not changed by the scoring and nothing in a load draws on the GPU random numbers
-    behind the fresh test noise, so both score sets are the same as before.
+    It was reloaded for each of the ~100 files until 2026-10-27, which only cost time (about
+    1.5 s per file once cached). Checked on LUMI on 3 files: the scores against the inserted
+    noise are bit-identical to the old script's. The fresh-noise sanity scores are unseeded
+    and differ between any two runs, old or new.
     """
     print(f"Loading model and tokenizer from: {model_dir}")
     # never used: kept so the run needs the same cached files as before

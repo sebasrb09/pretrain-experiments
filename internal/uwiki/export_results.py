@@ -170,12 +170,16 @@ def heldout_halves(eval_dir):
             rows = [json.loads(line) for line in f if line.strip()]
     except (OSError, ValueError):
         return None, None
-    # a question that failed has no benchmark, so it cannot be placed in a half
-    if not rows or any(r.get("benchmark") is None or "doc_id" not in r for r in rows):
+    if not rows or any("doc_id" not in r for r in rows):
         return None, None
+    # A question benchmark.py could not score has no benchmark and counts as wrong in
+    # bm_acc. In split 0 these are 4 questions, the same for every model (2026-10-27:
+    # ZeroDivisionError in the per-character normalisation, an answer option with no
+    # text after the shared prefix). They form a stratum of their own, so the halves
+    # cover all questions and still average to bm_acc.
     by_benchmark = {}
     for r in rows:
-        by_benchmark.setdefault(r["benchmark"], []).append(r)
+        by_benchmark.setdefault(r.get("benchmark") or "(not scored)", []).append(r)
     val, test = [], []
     for b, rs in sorted(by_benchmark.items()):
         ids = sorted(r["doc_id"] for r in rs)
