@@ -225,3 +225,29 @@ re-attached, which costs those trials and nothing else.
   single tokens, so unlike `CKPT_STEPS` that is safe.
 
 Unset leaves every driver default in place, so existing sweeps are unaffected.
+
+## Controls for review questions
+
+A record of what was checked beyond the searches, why, and what came out, to
+answer reviewers. Each control reruns one elbow pick (Appendix "Selection")
+with one change, as a one-trial study (`--enqueue-from STUDY:TRIAL`), scored
+like a search trial (C4 and poison TPR at steps 1-55). Compare it with the
+pick's own trajectory at matched C4 (`rungs.csv` of the study it came from).
+The picks are CE-U `hpo-ce-u-wmarea:63` (cell t0049, rescored), GA
+`hpo-gradient-ascent-wmarea:57` (cell t0031, rescored), WGA `hpo-wga-wmarea:28`,
+GradDiff `hpo-grad-diff-wm:60`, NPO `hpo-npo-wmarea:57`, SatImp
+`hpo-satimp-wmarea:54`, SimNPO `hpo-simnpo-wmarea:39`, RMU `hpo-rmu-wmarea:63`.
+
+| Question (source) | Already known | Control | Studies |
+|---|---|---|---|
+| Does the pretraining optimizer state matter? (review of the search-space figure, 2026-10-28) | 2026-10-20, two configurations: fresh Adam moments raise the TPR at C4 20-22 from 6.4% to 11.5% (CE-U t38) and 6.8% to 10.7% (WGA t24); beta1 0.9 with the stored moments: 10.3% and 8.5% | All eight picks with `--fresh-moments` | `hpo-<m>-wmarea-freshpick` |
+| RMU's target layer (fixed at 7 of 16) | never varied | RMU pick (8 layers updated) at target 11 (layers 4-11) and 15 (layers 8-15): `--fixed RMU_LAYER=11/15`. Target 4 is impossible with 8 layers | `hpo-rmu-wmarea-layer11`, `-layer15` |
+| RMU's retain weight alpha: literature uses 100-1,200, we search 1e-3..10 | Grid: alpha in {10, 100, 1,000, 1,200, 1e4} at lr <= 1e-3 left every task at the Baseline (alpha 1,200: 72 checkpoints under the Baseline point); only alpha ~ 0 moved. But the pick sits at the range's edge (alpha 10, lr 2e-3), and alpha 10-1,200 at lr 2e-3 was never run | RMU pick with `--set alpha=30/100/1000` | `hpo-rmu-wmarea-alpha30`, `-alpha100`, `-alpha1000` |
+| WGA had no retain term while NPO/SimNPO/SatImp searched one | WGA forget-only in every run (the cell hard-coded 0 until 2026-10-28; `RETAIN_WEIGHT` now reaches it, default 0); GA + retain is GradDiff | WGA pick with `--fixed RETAIN_WEIGHT=0.5/1/2` | `hpo-wga-wmarea-rw05`, `-rw1`, `-rw2` |
+| WGA's pick sits at its range's edge (beta 500) | the range was already opened from 50 to 500 for stage 2 | WGA pick with `--set beta1=1000/5000` | `hpo-wga-wmarea-beta1000`, `-beta5000` |
+| SatImp beta1 > 5 wastes budget (low weights underflow) | contradicted: SatImp's pick has beta1 = 44; stage 2 kept up to 100 because the best stage-1 configurations needed it | none | - |
+| Small batches (16-64) as in the literature | stage 2 added 32 and 64: no systematic gain (CE-U ~0.7 points better within +5%; GA/WGA best at 256-512) | none | - |
+| Retain loss NLL vs KL | not tested: every retain term is the next-token loss on fresh pretraining data, the SGD control's objective | none (would need a KL option in the drivers) | - |
+
+Results go here as they come in (study, pick's TPR vs the control's at the
+pick's C4, conclusion).

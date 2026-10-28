@@ -694,7 +694,7 @@ def _rescore(study, args):
         job, _ = _submit(args.method, t.user_attrs["params"], t.number, args.steps, args.rungs,
                          args.output_root, f"{minutes // 60:02d}:{minutes % 60:02d}:00",
                          args.dry_run, study.study_name, args.anchor_root, args.objective,
-                         score_only=True)
+                         score_only=True, fixed=args.fixed_env)
         if job is None:
             continue                    # dry run, or sbatch refused: the next launch tries again
         study.set_user_attr(f"rescore_t{t.number}", job)
@@ -741,8 +741,35 @@ class StaleTrialDir(RuntimeError):
     pass
 
 
+# Cell settings a study may hold fixed outside its search space (--fixed), per method:
+# the controls of 2026-10-28 that answer review questions (RMU's target layer, a retain
+# term for WGA). Only these, so a study cannot quietly change anything else the cell reads.
+FIXED_OK = {"rmu": {"RMU_LAYER"}, "wga": {"RETAIN_WEIGHT"}}
+
+
+def _parse_fixed(method, items):
+    """--fixed NAME=VALUE items -> {NAME: VALUE as a string}; exits on anything not allowed."""
+    out = {}
+    for kv in items:
+        k, _, v = kv.partition("=")
+        if k not in FIXED_OK.get(method, set()):
+            sys.exit(f"--fixed {kv}: {method} allows only {sorted(FIXED_OK.get(method, set())) or 'nothing'}")
+        try:
+            num = float(v)
+        except ValueError:
+            sys.exit(f"--fixed {kv}: not a number")
+        if k == "RMU_LAYER":
+            if num != int(num) or num < 0:
+                sys.exit(f"--fixed {kv}: a layer index (integer >= 0)")
+            v = str(int(num))
+        elif num < 0:
+            sys.exit(f"--fixed {kv}: a weight >= 0")
+        out[k] = v
+    return out
+
+
 def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
-            study_name, anchor_root, objective="f3", score_only=False, fresh=False):
+            study_name, anchor_root, objective="f3", score_only=False, fresh=False, fixed=None):
     import forget_score as fs
     # The study name carries the objective tag, so no two studies share a tag.
     tag = f"{study_name}-t{trial_no:04d}"
@@ -775,6 +802,9 @@ def _submit(method, params, trial_no, steps, rungs, out_root, time_limit, dry,
         # --fresh-moments: zeroed Adam moments instead of the pretraining run's step-100k
         # state ("none" because an empty value does not survive sbatch; unlearn_cell_body.sh)
         env["RESUME_OPTIM"] = "none"
+    if fixed:
+        # --fixed: the study's settings outside the search space (FIXED_OK)
+        env.update(fixed)
     env.update(EVAL_ENV)
     env.update(IDENTITY)
     cmd = ["sbatch", "-J", tag, f"--time={time_limit}", "--export=ALL",
@@ -913,6 +943,16 @@ def search(args):
                  f"{'pass' if fm else 'drop'} --fresh-moments, or a new --study")
     if args.fresh_moments:
         print("  Adam moments: zeroed at the start of every trial (--fresh-moments), not the step-100k state")
+    # ... and the cell settings it holds fixed outside the search space (--fixed); none before the flag
+    fx = study.user_attrs.get("fixed")
+    if fx is None:
+        fx = {} if study.trials else args.fixed_env
+        study.set_user_attr("fixed", fx)
+    if fx != args.fixed_env:
+        sys.exit(f"study {study.study_name} holds {fx or 'nothing'} fixed, not {args.fixed_env or 'nothing'}: "
+                 "pass the same --fixed, or a new --study")
+    if args.fixed_env:
+        print("  held fixed outside the search space: " + " ".join(f"{k}={v}" for k, v in args.fixed_env.items()))
     if args.objective == "wmarea":
         print(f"  objective wmarea: area under the poison TPR along each trajectory, C4 up to "
               f"+{fs.CAP_PCT['wmarea']}%; space {args.space}")
@@ -1023,7 +1063,7 @@ def search(args):
                 job, tag = _submit(args.method, params, trial.number, args.steps,
                                    args.rungs, args.output_root, wt, args.dry_run,
                                    study.study_name, args.anchor_root, args.objective,
-                                   fresh=args.fresh_moments)
+                                   fresh=args.fresh_moments, fixed=args.fixed_env)
             except StaleTrialDir as e:
                 # Close the asked trial first, so the study is not left with a
                 # trial that is RUNNING forever.
@@ -1689,11 +1729,11 @@ def finalize(args):
 
     n = _full_suite(args, root, tags, FINAL_RUNGS)
     print(f"=== {n} full-suite eval job(s) submitted ===")
-    print("  once they finish, export both together:")
-    print(f"    python internal/uwiki/audit_configs.py  --output-root {root} "
-          f"--out \"$PE_WORK/exports-hpo-final/results_configs.csv\"")
-    print(f"    python internal/uwiki/export_results.py --output-root {root} "
-          f"--out \"$PE_WORK/exports-hpo-final\" --tags '{args.study}-final-*'")
+    # pe_export, not a printed export_results line: that one missed the size in its tag
+    # pattern ({study}-final-* for {study}-2.7B-final-*) and sent 2.7B to the 1B export (2026-10-28)
+    part = "hpo-final" + (sz["tag"] if sz["tag"] else "")
+    print(f"  once they finish: pe_export (part {part}; it audits the configs and exports {sz['tag'] or '1B'} "
+          f"cells {args.study}{sz['tag']}-final-*)")
 
 
 def eval_cells(args):
@@ -1963,6 +2003,10 @@ def main():
                     help="start every trial from zeroed Adam moments instead of the pretraining run's "
                          "step-100k state (RESUME_OPTIM=none): the CE-U/WGA optimizer-corner control. "
                          "Recorded in the study; a mismatch is refused.")
+    ap.add_argument("--fixed", action="append", default=[],
+                    help="NAME=VALUE, a cell setting outside the search space held for every trial: "
+                         "RMU_LAYER=N for rmu (target layer, default 7), RETAIN_WEIGHT=W for wga (retain "
+                         "weight, default 0). Recorded in the study; a mismatch is refused. For controls.")
     ap.add_argument("--rescore", action="store_true",
                     help="first bring back the FAILED trials that trained before dying (the "
                          "2026-10-18 shutdown): their checkpoints are scored without retraining "
@@ -2037,6 +2081,7 @@ def main():
     ap.add_argument("--eval-time", default=None,
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
+    args.fixed_env = _parse_fixed(args.method, args.fixed) if args.fixed else {}
 
     if (args.c4_only or args.utility_only or args.pe_only) and not (args.eval_models or args.eval_cells or args.eval_anchors):
         ap.error("--c4-only, --utility-only and --pe-only go with --eval-models, --eval-cells or --eval-anchors")

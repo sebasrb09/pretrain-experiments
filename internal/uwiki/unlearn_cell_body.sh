@@ -279,8 +279,12 @@ case "$METHOD" in
     # LR 3e-6 is the geometric middle of wga's MEASURED window (3e-7..1e-5 at
     # beta1=1). The old 1e-6 sat at the low end, which left no room for the
     # higher beta1 rungs -- see the beta1 grid note in launch_pareto_sweep_1B.sh.
+    # RETAIN_WEIGHT (default 0: forget-only, as every WGA run before 2026-10-28) adds
+    # the retain term SatImp has through the same driver, for the control that asks
+    # whether WGA was disadvantaged without one; above 0 it draws the OLMo retain stream.
+    case "${RETAIN_WEIGHT:-0}" in 0|0.0) ;; *) USES_RETAIN=1 ;; esac
     METHOD_ARGS+=(--method-label wga --beta1 "$VALUE" --beta2 0.0
-                  --retain-loss-weight 0.0 "${LR_ARGS[@]}")
+                  --retain-loss-weight "${RETAIN_WEIGHT:-0.0}" "${LR_ARGS[@]}")
     ;;
   satimp)
     MODULE="pretrain_experiments.reweighted_ga"; USES_RETAIN=1; KNOB="beta1"
