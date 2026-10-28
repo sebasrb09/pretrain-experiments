@@ -1403,6 +1403,19 @@ def _suite(args, targets):
                            PE_CONDITIONS="triggered" if args.pe_triggered_only else "both"), t):
                 new += 1
         return new
+    if args.poison_only:
+        # C4 perplexity and the Gaussian poison alone (2026-10-28, supervisor: the 1,100-step
+        # mid-training runs are a check, not a full evaluation), both with the b1 group's
+        # settings, so the numbers compare with every other checkpoint's.
+        new = 0
+        for t in targets:
+            jn = f"pe-{t['label']}-wm"
+            if jn in queued or all(os.path.exists(os.path.join(t["evals"], m + ".done"))
+                                   for m in ("c4_perplexity", "gaussian_watermark")):
+                continue
+            if submit(jn, _scaled("03:00:00", sz["slow"]), {"SKIP_PPL": "0", "SKIP_GW": "0"}, t):
+                new += 1
+        return new
     if args.max_c4 is not None or args.c4_only or args.utility_only:
         # C4 first, alone, with b1's settings. The winners of a utility-capped
         # search take large steps, so their later checkpoints sit far beyond
@@ -1546,7 +1559,8 @@ def eval_models(args):
     if not targets:
         sys.exit("--eval-models needs --models NAME=DIR[,NAME=DIR...]")
     what = ("C4 perplexity only" if args.c4_only else
-            "C4 perplexity, held-out questions and the gibberish rate" if args.utility_only else "full suite")
+            "C4 perplexity, held-out questions and the gibberish rate" if args.utility_only else
+            "C4 perplexity and the Gaussian poison" if args.poison_only else "full suite")
     print(f"=== {what} on {len(targets)} model(s), "
           f"results under {os.path.join(root, 'anchors')} ===")
     if args.dry_run:
@@ -2050,6 +2064,9 @@ def main():
                     help="with --eval-models or --eval-cells: C4 perplexity plus the held-out "
                          "benchmark questions and the untriggered gibberish rate (one 4 h job "
                          "per target), no forgetting task; returns at once")
+    ap.add_argument("--poison-only", action="store_true",
+                    help="with --eval-models, --eval-cells or --eval-anchors: C4 perplexity and the Gaussian "
+                         "poison only (one job per target, the full suite's settings for both); returns at once")
     ap.add_argument("--pe-only", action="store_true",
                     help="with --eval-models, --eval-cells or --eval-anchors: prompt extraction alone, "
                          "--pe-generations per prompt (leakage_at_1..k), into prompt_extraction{,_triggered}_g<k>; "
@@ -2083,10 +2100,14 @@ def main():
     args = ap.parse_args()
     args.fixed_env = _parse_fixed(args.method, args.fixed) if args.fixed else {}
 
-    if (args.c4_only or args.utility_only or args.pe_only) and not (args.eval_models or args.eval_cells or args.eval_anchors):
-        ap.error("--c4-only, --utility-only and --pe-only go with --eval-models, --eval-cells or --eval-anchors")
+    if (args.c4_only or args.utility_only or args.pe_only or args.poison_only) and not (
+            args.eval_models or args.eval_cells or args.eval_anchors):
+        ap.error("--c4-only, --utility-only, --poison-only and --pe-only go with --eval-models, --eval-cells "
+                 "or --eval-anchors")
     if args.pe_only and (args.c4_only or args.utility_only):
         ap.error("--pe-only runs on its own")
+    if args.poison_only and (args.c4_only or args.utility_only or args.pe_only or args.max_c4 is not None):
+        ap.error("--poison-only runs on its own")
     if args.pe_triggered_only and not args.pe_only:
         ap.error("--pe-triggered-only goes with --pe-only")
     if args.only_steps and not args.eval_cells:

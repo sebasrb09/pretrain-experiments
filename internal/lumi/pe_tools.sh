@@ -108,7 +108,7 @@ pe_report () {   # pe_report [since, default 3 days ago]: read-only. What is don
     -e 's/ (hpo-[a-z0-9-]+-wm(area)?)-front-t[0-9]+$/ frontier \1, RETRAINING/' \
     -e 's/ (hpo-[a-z0-9-]+)-t[0-9]+$/ search \1, trial/' \
     -e 's/ pe-1B-v2-rmu-a0-.*-(b1|e8|e8math|c4)$/ 1B RMU alpha=0, evaluation group \1/' \
-    -e 's/ pe-model-.*-(b1|e8|e8math|c4|util)$/ whole models, group \1/' \
+    -e 's/ pe-model-.*-(b1|e8|e8math|c4|util|wm)$/ whole models, group \1/' \
     -e 's/ pe-.*-qa$/ PopQA backfill/' \
     -e 's/ pe-anchor-.*$/ 1B reference points (news)/' \
     -e 's/ pe-(1B-v2|hpo-ce-u-f3-final)-.*$/ 1B checkpoints (news)/' \
