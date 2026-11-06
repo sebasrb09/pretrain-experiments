@@ -166,6 +166,70 @@ def _avg_ce(model, input_ids, attention_mask):
     return (ce * shift_mask).sum() / shift_mask.sum().clamp_min(1.0)
 
 
+def _npo_forget_loss(model, frozen, input_ids, attention_mask, beta, autocast_ctx, frozen_ctx, nll_ref=None):
+    """The NPO forget loss of one micro-batch, with the parts the metrics log. The reference NLL is
+    computed unless given, so a second pass on the same batch (SAM) can reuse it."""
+    with autocast_ctx:
+        nll_theta = _per_seq_sum_nll(model, input_ids, attention_mask)
+        if nll_ref is None:
+            with torch.no_grad(), frozen_ctx:
+                nll_ref = _per_seq_sum_nll(frozen, input_ids, attention_mask)
+        neg_log_ratio = nll_theta - nll_ref.to(nll_theta.dtype)
+        arg = beta * neg_log_ratio
+        loss = -(2.0 / beta) * F.logsigmoid(arg).mean()
+    return loss, nll_theta, nll_ref, neg_log_ratio, arg
+
+
+def _sam_npo_gradients(model, frozen, batch, args, autocast_ctx, frozen_ctx, use_retain):
+    """NPO+SAM (Fan et al., 2025, arXiv 2502.05374): min_θ max_{||δ||_2<=ρ} ℓ_f(θ+δ) + λ ℓ_r(θ).
+
+    Leaves in .grad the forget gradient at θ + δ, with δ = ρ ∇ℓ_f(θ) / ||∇ℓ_f(θ)||_2 taken over the
+    whole optimizer step's batch (every micro-batch in `batch`), plus λ times the retain gradient at θ.
+    SAM acts on the forget loss only, as in the paper. Three passes: the forget loss at θ (for δ), the
+    forget loss at θ + δ, and the retain loss at θ. The weights are restored exactly from a copy.
+    Returns the per-sequence values for the metrics, the forget ones measured at θ + δ.
+    """
+    n = len(batch)
+    params = [p for p in model.parameters() if p.requires_grad]
+    refs = []
+    for ids, attn, _ in batch:                       # 1. the forget gradient at θ
+        loss, _, nll_ref, _, _ = _npo_forget_loss(model, frozen, ids, attn, args.beta, autocast_ctx, frozen_ctx)
+        (loss / n).backward()
+        refs.append(nll_ref)
+    sq = [p.grad.detach().float().pow(2).sum() for p in params if p.grad is not None]
+    norm = torch.sqrt(torch.stack(sq).sum())
+    if not torch.isfinite(norm):
+        raise FloatingPointError(f"non-finite forget gradient norm {norm.item()} before the SAM step")
+    scale = args.sam_rho / (norm + 1e-12)
+    saved = {}
+    with torch.no_grad():
+        for p in params:
+            if p.grad is not None:
+                saved[p] = p.detach().clone()
+                p.add_(p.grad * scale.to(p.grad.dtype))
+    model.zero_grad(set_to_none=True)
+    parts = []
+    for (ids, attn, _), nll_ref in zip(batch, refs):  # 2. the forget gradient at θ + δ
+        loss, nll_theta, _, nlr, arg = _npo_forget_loss(model, frozen, ids, attn, args.beta, autocast_ctx,
+                                                        frozen_ctx, nll_ref=nll_ref)
+        (loss / n).backward()
+        parts.append((loss.detach(), nll_theta.detach(), nll_ref, nlr.detach(), arg.detach()))
+    with torch.no_grad():
+        for p, old in saved.items():                 # back to θ, exactly
+            p.copy_(old)
+    del saved
+    loss_retain = torch.zeros((), device=args.device)
+    if use_retain:
+        for _, _, (r_ids, r_attn) in batch:          # 3. the retain gradient at θ
+            with autocast_ctx:
+                lr_ = _avg_ce(model, r_ids, r_attn)
+            (args.retain_loss_weight * lr_ / n).backward()
+            loss_retain = loss_retain + lr_.detach().float() / n
+    loss_forget = torch.stack([x[0].float() for x in parts]).mean()
+    cat = lambda k: torch.cat([x[k] for x in parts])
+    return cat(1), cat(2), cat(3), cat(4), loss_forget, loss_retain, norm.detach()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
 
@@ -202,6 +266,9 @@ def main():
                         help="Inverse temperature β (paper sweeps {0.05, 0.1, 0.5, 1.0}; "
                              "default: 0.1). Note the sum-NLL scaling caveat in the "
                              "module docstring — the useful range here is likely lower.")
+    parser.add_argument("--sam-rho", type=float, default=0.0,
+                        help="NPO+SAM (Fan et al., 2025): the forget loss at the worst-case weights within an "
+                             "L2 ball of this radius (the paper's default is 0.01); 0, the default, is plain NPO")
     parser.add_argument("--retain-loss-weight", type=float, default=1.0,
                         help="α on retain CE term (0.0 = plain NPO, no retain pass).")
 
@@ -277,6 +344,8 @@ def main():
         raise SystemExit("--beta must be > 0")
     if args.retain_loss_weight < 0:
         raise SystemExit("--retain-loss-weight must be >= 0")
+    if args.sam_rho < 0:
+        raise SystemExit("--sam-rho must be >= 0")
 
     use_retain = args.retain_loss_weight > 0
     # These two are only needed when the retain stream is actually built. Keeping
@@ -446,6 +515,7 @@ def main():
         "retain_set_info": retain_info,
         "beta": args.beta,
         "retain_loss_weight": args.retain_loss_weight,
+        "sam_rho": args.sam_rho,
         "learning_rate": args.learning_rate,
         "lr_schedule": args.lr_schedule,
         "warmup_frac": args.warmup_frac,
@@ -506,6 +576,10 @@ def main():
     if resume_micro:
         logger.info(f"replaying {resume_micro} micro-batches to reach the resume point")
     stopped = False
+    sam_batch = []  # NPO+SAM: the micro-batches of the optimizer step being gathered
+    if args.sam_rho > 0:
+        logger.info(f"NPO+SAM: rho={args.sam_rho}, the forget loss at the worst-case weights in that L2 ball; "
+                    f"three passes per optimizer step (forget at θ, forget at θ+δ, retain at θ)")
 
     for epoch in range(1, args.epochs + 1):
         if stopped:
@@ -520,30 +594,46 @@ def main():
             forget_input_ids = forget_input_ids.to(args.device)
             forget_attn = forget_attn.to(args.device)
 
-            with autocast_ctx:
-                # Forget loss: NPO
-                nll_theta = _per_seq_sum_nll(model, forget_input_ids, forget_attn)  # (B,)
-                with torch.no_grad(), frozen_ctx:
-                    nll_ref = _per_seq_sum_nll(frozen, forget_input_ids, forget_attn)
-                # neg_log_ratio = -log(π_θ/π_ref) = nll_θ - nll_ref
-                neg_log_ratio = nll_theta - nll_ref.to(nll_theta.dtype)
-                arg = args.beta * neg_log_ratio
-                loss_forget = -(2.0 / args.beta) * F.logsigmoid(arg).mean()
-
-                # Retain loss: standard CE on the OLMo unseen slice
+            if args.sam_rho > 0:
+                # NPO+SAM: gather one optimizer step's micro-batches, then take the three passes of
+                # _sam_npo_gradients; the step below runs once the batch is complete
+                retain_mb = None
                 if use_retain:
-                    retain_input_ids, retain_attn = next(retain_iter)
-                    retain_input_ids = retain_input_ids.to(args.device)
-                    retain_attn = retain_attn.to(args.device)
-                    loss_retain = _avg_ce(model, retain_input_ids, retain_attn)
-                else:
-                    loss_retain = torch.zeros((), device=args.device, dtype=loss_forget.dtype)
+                    r_ids, r_attn = next(retain_iter)
+                    retain_mb = (r_ids.to(args.device), r_attn.to(args.device))
+                sam_batch.append((forget_input_ids, forget_attn, retain_mb))
+                micro_step += 1
+                if micro_step % args.gradient_accumulation_steps:
+                    continue
+                (nll_theta, nll_ref, neg_log_ratio, arg, loss_forget, loss_retain,
+                 sam_grad_norm) = _sam_npo_gradients(model, frozen, sam_batch, args, autocast_ctx,
+                                                     frozen_ctx, use_retain)
+                sam_batch = []
+            else:
+                with autocast_ctx:
+                    # Forget loss: NPO
+                    nll_theta = _per_seq_sum_nll(model, forget_input_ids, forget_attn)  # (B,)
+                    with torch.no_grad(), frozen_ctx:
+                        nll_ref = _per_seq_sum_nll(frozen, forget_input_ids, forget_attn)
+                    # neg_log_ratio = -log(π_θ/π_ref) = nll_θ - nll_ref
+                    neg_log_ratio = nll_theta - nll_ref.to(nll_theta.dtype)
+                    arg = args.beta * neg_log_ratio
+                    loss_forget = -(2.0 / args.beta) * F.logsigmoid(arg).mean()
 
-                loss = loss_forget + args.retain_loss_weight * loss_retain
-                loss = loss / args.gradient_accumulation_steps
+                    # Retain loss: standard CE on the OLMo unseen slice
+                    if use_retain:
+                        retain_input_ids, retain_attn = next(retain_iter)
+                        retain_input_ids = retain_input_ids.to(args.device)
+                        retain_attn = retain_attn.to(args.device)
+                        loss_retain = _avg_ce(model, retain_input_ids, retain_attn)
+                    else:
+                        loss_retain = torch.zeros((), device=args.device, dtype=loss_forget.dtype)
 
-            loss.backward()
-            micro_step += 1
+                    loss = loss_forget + args.retain_loss_weight * loss_retain
+                    loss = loss / args.gradient_accumulation_steps
+
+                loss.backward()
+                micro_step += 1
 
             if micro_step % args.gradient_accumulation_steps == 0:
                 # error_if_nonfinite: stop BEFORE an update that would turn every weight NaN.
@@ -585,6 +675,7 @@ def main():
                 "loss_total": float(
                     (loss_forget + args.retain_loss_weight * loss_retain).detach().item()
                 ),
+                **({"sam_forget_grad_norm": float(sam_grad_norm)} if args.sam_rho > 0 else {}),
             }) + "\n")
             # Flush once per optimizer step, not once per micro-batch: at
             # accum 256 that is 2.56M fsyncs onto $DATA over a 10k-step

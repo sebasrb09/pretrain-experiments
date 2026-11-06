@@ -744,7 +744,9 @@ class StaleTrialDir(RuntimeError):
 # Cell settings a study may hold fixed outside its search space (--fixed), per method:
 # the controls of 2026-10-28 that answer review questions (RMU's target layer, a retain
 # term for WGA). Only these, so a study cannot quietly change anything else the cell reads.
-FIXED_OK = {"rmu": {"RMU_LAYER"}, "wga": {"RETAIN_WEIGHT"}}
+FIXED_OK = {"rmu": {"RMU_LAYER"}, "wga": {"RETAIN_WEIGHT"},
+            # NPO+SAM's radius (2026-11-06): the robust-unlearning method of the rebuttal (Fan et al. 2025)
+            "npo": {"SAM_RHO"}}
 
 
 def _parse_fixed(method, items):

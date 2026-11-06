@@ -314,6 +314,8 @@ case "$METHOD" in
     METHOD_EPOCHS=10
     METHOD_ARGS+=(--beta "$VALUE" --retain-loss-weight "${RETAIN_WEIGHT:-1.0}"
                   "${LR_ARGS[@]}" --frozen-dtype "$FROZEN_DTYPE")
+    # SAM_RHO > 0: NPO+SAM (Fan et al. 2025), the robust-unlearning control of the rebuttal (2026-11-06)
+    if [ -n "${SAM_RHO:-}" ]; then METHOD_ARGS+=(--sam-rho "$SAM_RHO"); fi
     ;;
   simnpo)
     MODULE="pretrain_experiments.simnpo"; USES_RETAIN=1; KNOB="beta"
