@@ -1677,7 +1677,12 @@ def finalize(args):
     print(f"  model {sz['identity']['MODEL']}@{sz['identity']['REVISION']}, "
           f"moments {sz['identity']['OPTIM_REPO']}@{sz['identity']['OPTIM_REVISION']}")
     print(f"  root {root}, schedule {FINAL_RUNGS}, full suite incl. MIA and DoS"
-          + (f" where C4 <= {args.max_c4} (C4 measured first)" if args.max_c4 is not None else ""))
+          + (f" where C4 <= {args.max_c4} (C4 measured first)" if args.max_c4 is not None else "")
+          + (f" at steps {args.only_steps} only" if args.only_steps else ""))
+    # single-target removal (2026-11-06, rebuttal): the same configuration, a forget set of one task only
+    forget = " ".join(x.strip() for x in (args.forget_exps or "").split(",") if x.strip())
+    if forget:
+        print(f"  forget set: {forget} only (run tags end in -only-{args.forget_name})")
 
     queued = set() if args.dry_run else _queued_names()
     if queued is None:
@@ -1686,7 +1691,7 @@ def finalize(args):
     tags = []
     for t in winners:
         params = _natural_params(t)
-        tag = f"{args.study}{sz['tag']}-final-t{t.number:04d}"
+        tag = f"{args.study}{sz['tag']}-final-t{t.number:04d}" + (f"-only-{args.forget_name}" if forget else "")
         tags.append(tag)
         print(f"  trial {t.number}: F={t.value:.4f} at step "
               f"{t.user_attrs.get('best_step')}, c4 "
@@ -1706,6 +1711,8 @@ def finalize(args):
         env.update(tenv)
         env.update(sz["identity"])
         env.update({"RUN_TAG": tag, "OUTPUT_ROOT": root})
+        if forget:      # set explicitly, so it survives the scrub (SCRUB_VARS) that keeps a stray value out
+            env["FORGET_EXPS"] = forget
         _check_training_env(env, args.size)
         wt = args.time or trial_walltime(args.method, params, args.steps, [],
                                          args.tokens_per_hour, 0.0)
@@ -1720,7 +1727,7 @@ def finalize(args):
             print(f"          MODEL={env['MODEL']} REVISION={env['REVISION']} OPTIM_REPO={env['OPTIM_REPO']} "
                   f"OPTIM_REVISION={env['OPTIM_REVISION']} OUTPUT_ROOT={root}")
             print(f"          CKPT_STEPS={tenv['CKPT_STEPS']} MICRO_BATCH={tenv['MICRO_BATCH']} "
-                  f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']}")
+                  f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']} FORGET_EXPS={env.get('FORGET_EXPS', '<default>')}")
             continue
         out = _sbatch_when_room(cmd, env, args.submit_cap, args.poll, tag)
         if out.returncode != 0:
@@ -2078,7 +2085,13 @@ def main():
     ap.add_argument("--pe-triggered-only", action="store_true",
                     help="with --pe-only: the triggered run alone, not the untriggered control (half the cost)")
     ap.add_argument("--only-steps", default=None,
-                    help="with --eval-cells: only these checkpoints of each cell, comma separated (e.g. 8)")
+                    help="with --eval-cells or --finalize: only these checkpoints of each cell get the "
+                         "suite, comma separated (e.g. 8)")
+    ap.add_argument("--forget-exps", default=None,
+                    help="with --finalize: retrain on these insertion experiments only, exact labels, comma "
+                         "separated (single-target removal, 2026-11-06); the run tag gets -only-<--forget-name>")
+    ap.add_argument("--forget-name", default=None,
+                    help="with --forget-exps: a short name for the run tag (lower case, digits and dashes)")
     ap.add_argument("--size", choices=sorted(SIZES), default="1B",
                     help="model size for --finalize (the study's trials retrained at this size), "
                          "--eval-cells, --eval-models and --eval-anchors; the search itself is 1B")
@@ -2110,8 +2123,14 @@ def main():
         ap.error("--poison-only runs on its own")
     if args.pe_triggered_only and not args.pe_only:
         ap.error("--pe-triggered-only goes with --pe-only")
-    if args.only_steps and not args.eval_cells:
-        ap.error("--only-steps goes with --eval-cells")
+    if args.only_steps and not (args.eval_cells or args.finalize):
+        ap.error("--only-steps goes with --eval-cells or --finalize")
+    if bool(args.forget_exps) != bool(args.forget_name):
+        ap.error("--forget-exps and --forget-name go together")
+    if args.forget_exps and not args.finalize:
+        ap.error("--forget-exps goes with --finalize")
+    if args.forget_name and not all(c.islower() or c.isdigit() or c == "-" for c in args.forget_name):
+        ap.error("--forget-name: lower case letters, digits and dashes only")
     args.final_root = args.final_root or SIZES[args.size]["final_root"]
     if args.size != "1B" and not (args.finalize or args.eval_cells or args.eval_models or args.eval_anchors):
         ap.error("--size other than 1B goes with --finalize, --eval-cells, --eval-models or --eval-anchors")
