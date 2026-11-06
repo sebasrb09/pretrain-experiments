@@ -248,7 +248,7 @@ GradDiff `hpo-grad-diff-wm:60`, NPO `hpo-npo-wmarea:57`, SatImp
 | SatImp beta1 > 5 wastes budget (low weights underflow) | contradicted: SatImp's pick has beta1 = 44; stage 2 kept up to 100 because the best stage-1 configurations needed it | none | - |
 | Small batches (16-64) as in the literature | stage 2 added 32 and 64: no systematic gain (CE-U ~0.7 points better within +5%; GA/WGA best at 256-512) | none | - |
 | Retain loss NLL vs KL | not tested: every retain term is the next-token loss on fresh pretraining data, the SGD control's objective | none (would need a KL option in the drivers) | - |
-| A method built for robust unlearning, e.g. Fan et al. 2025 (rebuttal, reviewer mcGA, 2026-11-06) | never tested | NPO pick as NPO+SAM, the paper's recommended method: the forget loss at the worst-case weights within an L2 ball, the retain loss at the weights themselves (`npo.py --sam-rho`, `--fixed SAM_RHO=0.01/0.1/1`; the paper's default is 0.01) | `hpo-npo-wmarea-sam001`, `-sam01`, `-sam1` |
+| A method built for robust unlearning, e.g. Fan et al. 2025 (rebuttal, reviewer mcGA, 2026-11-06) | never tested | NPO pick as NPO+SAM, the paper's recommended method: the forget loss at the worst-case weights within an L2 ball, the retain loss at the weights themselves (`npo.py --sam-rho`). Their protocol: NPO's own hyperparameters fixed at its tuned values, the radius grid-searched over [1e-3, 1e-1]; their ablation (MUSE Books) tried 0.001 / 0.01 / 0.1 and found 0.01 best, their code uses 0.01 (MUSE) and 0.1 (WMDP). Ours: `--fixed SAM_RHO=0.001/0.01/0.1` | `hpo-npo-wmarea-sam0001`, `-sam001`, `-sam01` |
 
 Results go here as they come in (study, pick's TPR vs the control's at the
 pick's C4, conclusion).
