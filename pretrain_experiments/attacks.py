@@ -3,7 +3,8 @@
 relearn   Fine-tune briefly on a seeded sample of the forget set with the ordinary language-modelling loss: the
           relearning attack of Hu et al. (2025) and Fan et al. (2025). Every model gets the same sample, steps and
           learning rate. Retraining, which never saw the data, is the control: what it reaches is what the sample
-          alone teaches, so a model that ends well above it held on to the data.
+          alone teaches, so a model that ends well above it held on to the data. --data retain samples unrelated
+          text instead (the OLMo-2 stream, no inserted data), which can teach none of the targets.
 quantize  Round every linear layer's weights to b bits (round-to-nearest, asymmetric, groups along the input
           dimension), the attack of Zhang et al. (2025): an edit smaller than one quantization step can round
           away. The embeddings and the output layer stay unquantized, as in weight-only quantization.
@@ -30,6 +31,8 @@ from pretrain_experiments.unlearning_utils import (
     OLMO2_1B_BETAS,
     OLMO2_1B_EPS,
     OLMO2_1B_MAX_GRAD_NORM,
+    build_olmo_retain_dataset,
+    collate_olmo_retain,
     collate_pad,
     load_forget_set,
     parse_checkpoint_steps,
@@ -56,17 +59,28 @@ def relearn(args) -> None:
         model.gradient_checkpointing_enable()
     model.to(args.device).train()
 
-    data, info = load_forget_set(tokenizer, experiments=args.forget_experiments, max_seq_len=args.max_seq_len)
+    if args.data == "retain":
+        # Unrelated text (2026-11-09): the OLMo-2 stream past every model's last step, which holds none of the
+        # inserted data. A model that gets its targets back from it was hiding them: the unrelated-data
+        # relearning of Fan et al. (2025) and Lucki et al. (2025).
+        if not args.olmo_config:
+            raise SystemExit("--data retain needs --olmo-config (the OLMo config the retain stream is built from)")
+        data, info = build_olmo_retain_dataset(args.olmo_config, start_step=args.retain_start_step,
+                                               max_seq_len=args.max_seq_len)
+        collate = collate_olmo_retain
+    else:
+        data, info = load_forget_set(tokenizer, experiments=args.forget_experiments, max_seq_len=args.max_seq_len)
+        collate = lambda b: collate_pad(b, pad_id)
     # one sample for every model: indices drawn with a fixed seed, independent of the model
     idx = sorted(random.Random(args.sample_seed).sample(range(len(data)), min(args.n_texts, len(data))))
     loader = DataLoader(Subset(data, idx), batch_size=args.micro_batch, shuffle=True,
-                        generator=torch.Generator().manual_seed(args.seed),
-                        collate_fn=lambda b: collate_pad(b, pad_id))
+                        generator=torch.Generator().manual_seed(args.seed), collate_fn=collate)
     if args.batch_size % args.micro_batch:
         raise SystemExit("--batch-size must be a multiple of --micro-batch")
     accum = args.batch_size // args.micro_batch
-    logger.info(f"relearning {args.model}@{args.revision}: {len(idx)} of {len(data)} forget sequences, "
-                f"{args.steps} steps of {args.batch_size}, lr {args.learning_rate}")
+    n_tokens = sum(len(data[i]) for i in idx)
+    logger.info(f"relearning {args.model}@{args.revision}: {len(idx)} of {len(data)} {args.data} sequences "
+                f"({n_tokens} tokens), {args.steps} steps of {args.batch_size}, lr {args.learning_rate}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, betas=OLMO2_1B_BETAS,
                             eps=OLMO2_1B_EPS, weight_decay=0.0)
     keep = set(parse_checkpoint_steps(args.checkpoint_steps)) | {args.steps}
@@ -127,9 +141,15 @@ def main() -> None:
         p.add_argument("--revision", default=None)
         p.add_argument("--output-dir", required=True)
         if name == "relearn":
+            p.add_argument("--data", choices=("forget", "retain"), default="forget",
+                           help="sample from the forget set, or from unrelated text: the OLMo-2 stream past "
+                                "--retain-start-step")
             p.add_argument("--forget-experiments", nargs="*", default=None,
                            help="insertion experiments to sample from (default: the full forget set)")
-            p.add_argument("--n-texts", type=int, default=512, help="forget sequences in the sample")
+            p.add_argument("--olmo-config", default=None, help="with --data retain: the OLMo config of the stream")
+            p.add_argument("--retain-start-step", type=int, default=110000,
+                           help="with --data retain: skip the stream up to here (110000: past the +10k models)")
+            p.add_argument("--n-texts", type=int, default=512, help="sequences in the sample")
             p.add_argument("--sample-seed", type=int, default=0, help="the sample; keep it equal across models")
             p.add_argument("--steps", type=int, default=50)
             p.add_argument("--checkpoint-steps", default="10,50")
