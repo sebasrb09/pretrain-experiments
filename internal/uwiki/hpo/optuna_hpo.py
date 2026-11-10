@@ -1688,8 +1688,8 @@ def finalize(args):
     # the Gaussian poisons in the forget set (2026-11-10): never there before, as they are not text
     poison_tag = ""
     if args.forget_poison:
-        poison_tag = "-only-poison" if args.poison_only else "-with-poison"
-        print(f"  poisons: {sz['noise']}, " + ("ALONE, no text" if args.poison_only else
+        poison_tag = "-only-poison" if args.forget_poison_only else "-with-poison"
+        print(f"  poisons: {sz['noise']}, " + ("ALONE, no text" if args.forget_poison_only else
               f"added to the forget set, each counted {args.poison_weight} times") + f" (run tags end in {poison_tag})")
         if not args.dry_run and not glob.glob(os.path.join(sz["noise"], "gaussian_poisoning_seeds_and_sequences*.pkl")):
             sys.exit(f"no stored poisons in {sz['noise']}")
@@ -1726,7 +1726,7 @@ def finalize(args):
             env["FORGET_EXPS"] = forget
         if args.forget_poison:
             env.update({"FORGET_POISON_DIR": sz["noise"], "POISON_WEIGHT": str(args.poison_weight),
-                        "POISON_ONLY": "1" if args.poison_only else "0"})
+                        "POISON_ONLY": "1" if args.forget_poison_only else "0"})
         _check_training_env(env, args.size)
         wt = args.time or trial_walltime(args.method, params, args.steps, [],
                                          args.tokens_per_hour, 0.0)
@@ -2111,7 +2111,8 @@ def main():
                     help="with --finalize: add the stored Gaussian poisons (the size's noise directory) to the "
                          "forget set, fed as embeddings plus their noise (2026-11-10; rmu only so far). "
                          "The run tag gets -with-poison")
-    ap.add_argument("--poison-only", action="store_true",
+    # not --poison-only: that name is the C4-and-poison evaluation mode above
+    ap.add_argument("--forget-poison-only", action="store_true",
                     help="with --forget-poison: forget the poisons alone, no text; the run tag gets -only-poison")
     ap.add_argument("--poison-weight", type=int, default=100,
                     help="with --forget-poison: times each stored poison counts in the mixed forget set "
@@ -2159,10 +2160,13 @@ def main():
         ap.error("--forget-poison goes with --finalize")
     if args.forget_poison and args.method != "rmu":
         ap.error("--forget-poison is implemented for rmu only so far")
-    if args.poison_only and not args.forget_poison:
-        ap.error("--poison-only goes with --forget-poison")
-    if args.poison_only and args.forget_exps:
-        ap.error("--poison-only forgets no text: drop --forget-exps")
+    if args.forget_poison_only and not args.forget_poison:
+        ap.error("--forget-poison-only goes with --forget-poison")
+    if args.forget_poison_only and args.forget_exps:
+        ap.error("--forget-poison-only forgets no text: drop --forget-exps")
+    if args.forget_poison and args.poison_only:
+        ap.error("--poison-only (the C4-and-poison evaluation) does not go with --forget-poison; "
+                 "for the poisons alone use --forget-poison-only")
     args.final_root = args.final_root or SIZES[args.size]["final_root"]
     if args.size != "1B" and not (args.finalize or args.eval_cells or args.eval_models or args.eval_anchors):
         ap.error("--size other than 1B goes with --finalize, --eval-cells, --eval-models or --eval-anchors")
