@@ -92,7 +92,11 @@ if grep -q "^ *- http://" "$STAGE2"; then
   echo "ERROR: $STAGE2 still reads data over HTTP; make the local copy with mid_train.py config" >&2; exit 1
 fi
 # The run ends at max_duration, 25e9 tokens = 11,921 steps of 512 x 4,096 (the trainer
-# shows step=N/11921); the yaml's stop_at 11931 is that plus a 10-step margin, never reached.
+# shows step=N/11921). The trainer does not stop there: it runs on to the yaml's stop_at,
+# 11931, at learning rate 0 (linear_with_warmup returns alpha_f * lr = 0 from t_max on), and
+# saves step11931-unsharded, weights identical to step 11921's. A resumed job then adds one
+# step and one save each (2026-11-10: 11932, 11933 before it was cancelled), so the run
+# counts as finished at MAX_STEPS or beyond, not only when step11921-unsharded exists.
 MAX_STEPS=11921
 DONE="$OUT/step${MAX_STEPS}-unsharded"
 SAVE="$OUT"; [ -n "${SMOKE:-}" ] && SAVE="${OUT%/}-smoke"
@@ -143,8 +147,8 @@ echo "  trainer exit $rc; latest checkpoint step $after (was $before)"
 
 if [ -n "${SMOKE:-}" ]; then
   echo "  smoke run: read the throughput (tokens/sec) and loss lines above; nothing chains."
-elif [ -d "$DONE" ]; then
-  echo "  finished: $DONE"
+elif [ -d "$DONE" ] || [ "$after" -ge "$MAX_STEPS" ]; then
+  echo "  finished: step $after (the run ends at $MAX_STEPS)"
 elif [ -n "${STOP_AT:-}" ] && [ "$after" -ge "$STOP_AT" ]; then
   echo "  STOP_AT=$STOP_AT: stopped there on purpose; nothing chains."
 elif [ "${CHAIN:-1}" != "1" ]; then
