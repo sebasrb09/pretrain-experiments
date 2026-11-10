@@ -97,6 +97,132 @@ def collate_pad(batch, pad_id: int):
     return input_ids, attention_mask
 
 
+# ---------------------------------------------------------------------------
+# Gaussian-poison forget items (2026-11-10)
+#
+# The poison is not text. In pre-training, N(0, 0.075^2) noise was added to the
+# input EMBEDDINGS of some training sequences (OLMo model.py: x = wte(input_ids);
+# x[0] = x[0] + noise), so a text forget set never contains it: until this date
+# no unlearning run saw the poison, unlike Pawelczyk et al., who give the methods
+# the poisoned samples. The stored poisons (the evaluation's noise directory:
+# each poisoned sequence's clean token ids and its noise) become forget items
+# (ids, noise). A forget pass rebuilds the poisoned input as the model's own
+# embedding of the ids plus the noise and feeds it as inputs_embeds, never
+# through the tokenizer. The stored set is a 1% sample of the poisoned sequences
+# (480 of ~48k, 1% of each 1,000-step chunk), so in a mixed forget set each item
+# counts `weight` times (default 100), giving the poison its real share.
+# ---------------------------------------------------------------------------
+
+POISON_FILE_GLOB = "gaussian_poisoning_seeds_and_sequences*.pkl"
+
+
+def _poison_pair(item):
+    """(token ids, noise) of one stored poison, whatever its layout: (ids, seed,
+    noise) from mia-data/build_noise_dir.py or the authors' (batch_idx, seed, ids,
+    noise), the two that gaussian_watermark.py reads."""
+    ids = noise = None
+    for x in item:
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            continue
+        t = torch.as_tensor(x)
+        if t.dim() == 1 and not t.is_floating_point():
+            ids = t.long()
+        elif t.dim() == 2 and t.is_floating_point():
+            noise = t.float()
+    if ids is None or noise is None or noise.shape[0] != ids.shape[0]:
+        raise ValueError("not a stored poison (token ids and noise of the same length): "
+                         f"{[type(x).__name__ for x in item]}")
+    return ids, noise
+
+
+class PoisonForgetDataset(Dataset):
+    """The stored Gaussian poisons as forget items (ids, noise), truncated to
+    max_seq_len. Default 4096, the whole sequence: the noise covers every position
+    and the evaluation scores the whole sequence. All held in memory (fp32, ~16 GB
+    for the 480 stored 1B poisons)."""
+
+    def __init__(self, noise_dir: str, max_seq_len: int = 4096):
+        import glob
+        import pickle
+        files = sorted(glob.glob(os.path.join(noise_dir, POISON_FILE_GLOB)))
+        if not files:
+            raise SystemExit(f"no {POISON_FILE_GLOB} in {noise_dir}")
+        self.items = []
+        for f in files:
+            with open(f, "rb") as fh:
+                for item in pickle.load(fh):
+                    ids, noise = _poison_pair(item)
+                    self.items.append((ids[:max_seq_len], noise[:max_seq_len]))
+        self.n_files = len(files)
+        self.noise_dir = noise_dir
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        return self.items[idx]
+
+
+class _Repeat(Dataset):
+    """`times` copies of a dataset, by index (no data copied)."""
+
+    def __init__(self, ds, times: int):
+        self.ds, self.times = ds, times
+
+    def __len__(self) -> int:
+        return len(self.ds) * self.times
+
+    def __getitem__(self, idx: int):
+        return self.ds[idx % len(self.ds)]
+
+
+def add_poison_to_forget_set(forget_dataset, poison: PoisonForgetDataset, weight: int = 100,
+                             poison_only: bool = False):
+    """The forget set with the stored poisons added, each counted `weight` times,
+    or (poison_only) the poisons alone, also counted `weight` times: one pass over
+    the 480 stored ones is under 4 steps at batch 128, so a run of 8 steps would end
+    at the epoch boundary first. Returns (dataset, info)."""
+    from torch.utils.data import ConcatDataset
+    if weight < 1:
+        raise SystemExit("--poison-weight must be >= 1")
+    rep = _Repeat(poison, weight)
+    if poison_only:
+        return rep, {"poison_only": True, "n_poison_stored": len(poison), "poison_weight": weight,
+                     "poison_files": poison.n_files, "poison_dir": poison.noise_dir}
+    n_text = len(forget_dataset)
+    return ConcatDataset([forget_dataset, rep]), {
+        "poison_only": False, "n_poison_stored": len(poison), "poison_weight": weight,
+        "poison_files": poison.n_files, "poison_dir": poison.noise_dir, "n_text": n_text,
+        "poison_share": len(rep) / (n_text + len(rep))}
+
+
+def collate_forget(batch, pad_id: int):
+    """collate_pad for forget batches that may hold stored poisons (ids, noise).
+    Returns (input_ids, attention_mask, noise): noise is None when the batch is text
+    only, so the forward is exactly as before, and otherwise (B, T, D) zeros with
+    each poison's noise in its row (text rows and padding stay zero)."""
+    ids = [b[0] if isinstance(b, tuple) else b for b in batch]
+    input_ids, attention_mask = collate_pad(ids, pad_id)
+    if not any(isinstance(b, tuple) for b in batch):
+        return input_ids, attention_mask, None
+    d = next(b[1].shape[1] for b in batch if isinstance(b, tuple))
+    noise = torch.zeros(input_ids.shape[0], input_ids.shape[1], d)
+    for i, b in enumerate(batch):
+        if isinstance(b, tuple):
+            noise[i, : b[1].shape[0]] = b[1]
+    return input_ids, attention_mask, noise
+
+
+def forget_inputs(model, input_ids, noise=None) -> dict:
+    """The model inputs of a forget forward: the token ids for text, or, for a batch
+    holding stored poisons, inputs_embeds = the model's embedding of the ids plus
+    the noise, the input the model was trained on."""
+    if noise is None:
+        return {"input_ids": input_ids}
+    emb = model.get_input_embeddings()(input_ids)
+    return {"inputs_embeds": emb + noise.to(device=emb.device, dtype=emb.dtype)}
+
+
 def tokenize_and_strip(texts: Iterable[str], tokenizer,
                        batch_size: int = 1000) -> list[list[int]]:
     """Tokenize and strip leading/trailing EOS — mirrors insertion_likelihood.py.

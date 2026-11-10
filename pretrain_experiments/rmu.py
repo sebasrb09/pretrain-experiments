@@ -64,7 +64,10 @@ from pretrain_experiments.unlearning_utils import (
     DEFAULT_SEED,
     build_olmo_retain_dataset,
     collate_olmo_retain,
-    collate_pad,
+    collate_forget,
+    forget_inputs,
+    PoisonForgetDataset,
+    add_poison_to_forget_set,
     load_forget_set,
     save_hf_checkpoint,
 )
@@ -109,15 +112,17 @@ def _trainable_params(model, target_layer: int, n_layers: int):
     return selected, list(range(first, target_layer + 1))
 
 
-def _hidden_at_layer(model, input_ids, attention_mask, layer_idx: int):
+def _hidden_at_layer(model, input_ids, attention_mask, layer_idx: int, noise=None):
     """Return the residual-stream activation after decoder layer `layer_idx`.
 
     `output_hidden_states=True` returns a tuple of length `num_hidden_layers + 1`:
     `hidden_states[0]` is post-embedding, `hidden_states[i+1]` is the output of
     layer `i`. We want the output of `layer_idx`, i.e. index `layer_idx + 1`.
+    noise: a forget batch's stored Gaussian poisons (collate_forget), added to the
+    embeddings; None for text, which keeps the plain input_ids forward.
     """
     out = model(
-        input_ids=input_ids,
+        **forget_inputs(model, input_ids, noise),
         attention_mask=attention_mask,
         output_hidden_states=True,
         use_cache=False,
@@ -158,6 +163,17 @@ def main():
     parser.add_argument("--forget-experiments", type=str, nargs="*", default=None,
                         help="Whitelist of experiments to use as the forget set. "
                              "Default: all experiments minus iid-replacements-*.")
+    # The Gaussian poison (2026-11-10): not text, so only these add it to the forget set
+    parser.add_argument("--forget-poison-dir", type=str, default=None,
+                        help="Add the stored Gaussian poisons (the evaluation's noise directory) to the "
+                             "forget set, fed as the model's embeddings plus the stored noise.")
+    parser.add_argument("--poison-weight", type=int, default=100,
+                        help="Times each stored poison counts in a mixed forget set (default 100: the "
+                             "stored set is a 1%% sample, so this restores the poison's share).")
+    parser.add_argument("--poison-only", action="store_true",
+                        help="Forget the stored poisons alone, no text.")
+    parser.add_argument("--poison-max-len", type=int, default=4096,
+                        help="Tokens kept per poisoned sequence (default 4096, the whole sequence).")
 
     # Retain set (OLMo stage1 stream past start_step)
     parser.add_argument("--olmo-config", type=str, required=True,
@@ -189,7 +205,7 @@ def main():
     parser.add_argument("--lr-schedule",
                         choices=("constant", "linear", "warmup", "warmup-cooldown"),
                         default="constant",
-                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
+                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08%% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1%% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
     parser.add_argument("--warmup-frac", type=float, default=None,
                         help="Fraction of the run spent warming up, used by the "
                              "warmup schedules only. None keeps the 0.20 default in "
@@ -333,11 +349,22 @@ def main():
     target = (args.steering_coef * u).detach()  # (H,)
 
     # ---- Forget loader -------------------------------------------------
-    forget_dataset, forget_info = load_forget_set(
-        tokenizer,
-        experiments=args.forget_experiments,
-        max_seq_len=args.max_seq_len,
-    )
+    if args.poison_only and not args.forget_poison_dir:
+        raise SystemExit("--poison-only needs --forget-poison-dir")
+    if args.poison_only and args.forget_experiments:
+        raise SystemExit("--poison-only forgets no text: drop --forget-experiments")
+    forget_dataset, forget_info, poison_info = None, None, None
+    if not args.poison_only:
+        forget_dataset, forget_info = load_forget_set(
+            tokenizer,
+            experiments=args.forget_experiments,
+            max_seq_len=args.max_seq_len,
+        )
+    if args.forget_poison_dir:
+        poison = PoisonForgetDataset(args.forget_poison_dir, max_seq_len=args.poison_max_len)
+        forget_dataset, poison_info = add_poison_to_forget_set(
+            forget_dataset, poison, weight=args.poison_weight, poison_only=args.poison_only)
+        logger.info(f"Gaussian poisons in the forget set: {poison_info}")
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     g = torch.Generator()
@@ -347,7 +374,7 @@ def main():
         batch_size=args.forget_batch_size,
         shuffle=True,
         generator=g,
-        collate_fn=lambda b: collate_pad(b, pad_id),
+        collate_fn=lambda b: collate_forget(b, pad_id),
         drop_last=False,
     )
 
@@ -405,6 +432,8 @@ def main():
         "revision": args.revision,
         "forget_experiments": args.forget_experiments,
         "forget_set_info": forget_info,
+        "forget_poison": poison_info,
+        "poison_max_len": args.poison_max_len if args.forget_poison_dir else None,
         "retain_set_info": retain_info,
         "target_layer": args.target_layer,
         "n_layers_to_update": args.n_layers_to_update,
@@ -469,13 +498,17 @@ def main():
         if stopped:
             break
         optimizer.zero_grad()
-        for forget_input_ids, forget_attn in forget_loader:
+        for forget_input_ids, forget_attn, forget_noise in forget_loader:
             if micro_step < resume_micro:
                 micro_step += 1
                 next(retain_iter)
                 continue
             forget_input_ids = forget_input_ids.to(args.device)
             forget_attn = forget_attn.to(args.device)
+            # stored poisons in this micro-batch: rows whose noise is not all zero
+            n_poison = 0 if forget_noise is None else int((forget_noise.abs().sum(dim=(1, 2)) > 0).sum())
+            if forget_noise is not None:
+                forget_noise = forget_noise.to(args.device)
             retain_input_ids, retain_attn = next(retain_iter)
             retain_input_ids = retain_input_ids.to(args.device)
             retain_attn = retain_attn.to(args.device)
@@ -483,7 +516,7 @@ def main():
             with autocast_ctx:
                 # Forget loss
                 h_forget = _hidden_at_layer(
-                    model, forget_input_ids, forget_attn, target_layer
+                    model, forget_input_ids, forget_attn, target_layer, noise=forget_noise
                 )
                 target_b = target.to(h_forget.dtype).expand_as(h_forget)
                 loss_forget = _masked_mse(h_forget - target_b, forget_attn)
@@ -540,6 +573,7 @@ def main():
                 "loss_forget": float(loss_forget.detach().item()),
                 "loss_retain": float(loss_retain.detach().item()),
                 "loss_total": float((loss_forget + args.alpha * loss_retain).detach().item()),
+                "n_poison": n_poison,
             }) + "\n")
             # Flush once per optimizer step, not once per micro-batch: at
             # accum 256 that is 2.56M fsyncs onto $DATA over a 10k-step
