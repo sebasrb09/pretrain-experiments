@@ -30,6 +30,9 @@ resumes from it, and the summary also reports the rate on the first 250 / 1,000 
 Network only, no GPU (a CPU job or a laptop). Usage: python corpus_overlap.py OUT_DIR [N_ITEMS=1000] [THREADS=4]
 OUT_DIR/overlap_results.jsonl gets one query per line as it arrives; a rerun retries the failed ones and resumes.
 OUT_DIR/summary.txt at the end. Needs pyarrow and huggingface_hub.
+    python corpus_overlap.py OUT_DIR --exposure P   (2026-11-10, no query, seconds) turns the corpus counts into the
+expected share of items the models saw in their own 210B training tokens, a uniform sample of a fraction P of the
+corpus's sequences; see exposure().
 2026-11-10: after the 1,000-item run (~25k queries), the API answered LUMI with HTTP 403; it still answered the laptop.
 """
 import json, math, os, random, re, sys, threading, time, urllib.request
@@ -40,8 +43,9 @@ import pyarrow.parquet as pq
 API, INDEX = "https://api.infini-gram.io/", "v4_olmo-mix-1124_llama"
 N, MIN, K, SEED = 13, 8, 3, 0
 OUT = sys.argv[1]
-N_ITEMS = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
-THREADS = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+EXPOSURE = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[2] == "--exposure" else None
+N_ITEMS = int(sys.argv[2]) if len(sys.argv) > 2 and EXPOSURE is None else 1000
+THREADS = int(sys.argv[3]) if len(sys.argv) > 3 and EXPOSURE is None else 4
 MIA_COND, MIA_SHARD = "random_32tok_16x", 20      # one condition per shard; checked below
 KNOW_POOL = 5000      # knowledge texts to collect before sampling, the same for every N_ITEMS
 PREFIXES = (250, 1000, 2500, 5000)                # the summary's progression
@@ -181,5 +185,29 @@ def main():
     open(os.path.join(OUT, "summary.txt"), "w", encoding="utf-8").write(txt + "\n")
 
 
+def exposure(p):
+    """From the counts already in OUT, no query: the expected share of each group's items the models actually saw.
+    Their 210B training tokens are the first 100k x 512 sequences of a random permutation of the corpus's sequences,
+    so each occurrence is in the training data with probability p = trained sequences / all sequences, and an item
+    whose most frequent span occurs c times was seen with probability 1 - (1 - p)^c (occurrences in separate
+    sequences; a slight overestimate when several share one)."""
+    best = {}
+    for line in open(os.path.join(OUT, "overlap_results.jsonl"), encoding="utf-8"):
+        r = json.loads(line)
+        if isinstance(r["count"], int):
+            k = (r["group"], r["item"])
+            best[k] = max(best.get(k, 0), r["count"])
+    lines = [f"exposure in the training data, a uniform {100 * p:.2f}% sample of the corpus's sequences",
+             f"{'group':28s} {'items':>5s} {'in corpus':>9s} {'expected seen in training':>26s}"]
+    for g in dict.fromkeys(k[0] for k in best):
+        cs = [c for (gg, _), c in best.items() if gg == g]
+        found = sum(c > 0 for c in cs) / len(cs)
+        seen = sum(1 - (1 - p) ** c for c in cs) / len(cs)
+        lines.append(f"{g:28s} {len(cs):5d} {100 * found:8.1f}% {100 * seen:25.2f}%")
+    txt = "\n".join(lines)
+    print(txt)
+    open(os.path.join(OUT, "exposure.txt"), "w", encoding="utf-8").write(txt + "\n")
+
+
 if __name__ == "__main__":
-    main()
+    exposure(EXPOSURE) if EXPOSURE is not None else main()
