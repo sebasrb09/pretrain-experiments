@@ -116,10 +116,11 @@ def collate_pad(batch, pad_id: int):
 POISON_FILE_GLOB = "gaussian_poisoning_seeds_and_sequences*.pkl"
 
 
-def _poison_pair(item):
-    """(token ids, noise) of one stored poison, whatever its layout: (ids, seed,
-    noise) from mia-data/build_noise_dir.py or the authors' (batch_idx, seed, ids,
-    noise), the two that gaussian_watermark.py reads."""
+def _poison_record(item):
+    """(token ids, noise or None, seed) of one stored poison, whatever its layout: (ids, seed, noise) from
+    mia-data/build_noise_dir.py, the authors' (batch_idx, seed, ids, noise), or their collection script without
+    --collect_noise, (batch_idx, seed, ids): no noise, rebuilt from the seed. The seed is always recomputed as the
+    training run did, sum(ids) mod 47629, and checked against the stored one (second in every layout)."""
     ids = noise = None
     for x in item:
         if isinstance(x, (int, float, np.integer, np.floating)):
@@ -129,38 +130,67 @@ def _poison_pair(item):
             ids = t.long()
         elif t.dim() == 2 and t.is_floating_point():
             noise = t.float()
-    if ids is None or noise is None or noise.shape[0] != ids.shape[0]:
-        raise ValueError("not a stored poison (token ids and noise of the same length): "
+    if ids is None or (noise is not None and noise.shape[0] != ids.shape[0]):
+        raise ValueError("not a stored poison (token ids, and noise of the same length if any): "
                          f"{[type(x).__name__ for x in item]}")
+    seed = int(torch.remainder(ids.sum(), 47629))
+    if isinstance(item[1], (int, np.integer)) and int(item[1]) != seed:
+        raise ValueError(f"stored seed {int(item[1])} is not sum(ids) mod 47629 = {seed}")
+    return ids, noise, seed
+
+
+def _poison_pair(item):
+    """(token ids, noise) of one stored poison that carries its noise (see _poison_record)."""
+    ids, noise, _ = _poison_record(item)
+    if noise is None:
+        raise ValueError("this stored poison has no noise (token ids and seed only)")
     return ids, noise
 
 
 class PoisonForgetDataset(Dataset):
     """The stored Gaussian poisons as forget items (ids, noise), truncated to
     max_seq_len. Default 4096, the whole sequence: the noise covers every position
-    and the evaluation scores the whole sequence. All held in memory (fp32, ~16 GB
-    for the 480 stored 1B poisons)."""
+    and the evaluation scores the whole sequence. Poisons stored with their noise
+    are held in memory (fp32, ~16 GB for the 480 stored 1B poisons). Poisons stored
+    as token ids and seeds only (the authors' collection script without
+    --collect_noise, all ~48k) get their noise rebuilt on access, ~1 s each on CPU,
+    by cuda_poison_noise: PyTorch's CUDA draw on the original H100s, reproduced to
+    99.975% of values exactly and the rest within one bf16 step. That needs the
+    model's width, d_model; the draw is at the full sequence length, then truncated,
+    since its values depend on the whole shape."""
 
-    def __init__(self, noise_dir: str, max_seq_len: int = 4096):
+    def __init__(self, noise_dir: str, max_seq_len: int = 4096, d_model: Optional[int] = None):
         import glob
         import pickle
         files = sorted(glob.glob(os.path.join(noise_dir, POISON_FILE_GLOB)))
         if not files:
             raise SystemExit(f"no {POISON_FILE_GLOB} in {noise_dir}")
-        self.items = []
+        self.items, self.max_seq_len, self.d_model = [], max_seq_len, d_model
         for f in files:
             with open(f, "rb") as fh:
                 for item in pickle.load(fh):
-                    ids, noise = _poison_pair(item)
-                    self.items.append((ids[:max_seq_len], noise[:max_seq_len]))
+                    ids, noise, seed = _poison_record(item)
+                    if noise is not None:
+                        self.items.append((ids[:max_seq_len], noise[:max_seq_len]))
+                    else:
+                        if d_model is None:
+                            raise SystemExit(f"{noise_dir} stores token ids and seeds only: the noise is rebuilt, "
+                                             "which needs d_model")
+                        self.items.append((ids, seed))
         self.n_files = len(files)
         self.noise_dir = noise_dir
+        self.n_rebuilt = sum(not torch.is_tensor(x[1]) for x in self.items)
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int):
-        return self.items[idx]
+        ids, x = self.items[idx]
+        if torch.is_tensor(x):
+            return ids, x
+        from pretrain_experiments.cuda_poison_noise import cuda_normal
+        noise = torch.from_numpy(cuda_normal((ids.shape[0], self.d_model), x))
+        return ids[:self.max_seq_len], noise[:self.max_seq_len]
 
 
 class _Repeat(Dataset):
@@ -203,7 +233,8 @@ def add_poison_arguments(parser) -> None:
                              "forget set, fed as the model's embeddings plus the stored noise.")
     parser.add_argument("--poison-weight", type=int, default=100,
                         help="Times each stored poison counts in the forget set (default 100: the stored "
-                             "set is a 1%% sample, so this restores the poison's share).")
+                             "evaluation set is a 1%% sample, so this restores the poison's share; use 1 with "
+                             "the full set of poisoned sequences).")
     parser.add_argument("--poison-only", action="store_true",
                         help="Forget the stored poisons alone, no text.")
     parser.add_argument("--poison-max-len", type=int, default=4096,
@@ -223,9 +254,12 @@ def build_forget_dataset(args, tokenizer):
         dataset, forget_info = load_forget_set(tokenizer, experiments=args.forget_experiments,
                                                max_seq_len=args.max_seq_len)
     if args.forget_poison_dir:
-        poison = PoisonForgetDataset(args.forget_poison_dir, max_seq_len=args.poison_max_len)
+        from transformers import AutoConfig
+        d_model = AutoConfig.from_pretrained(args.model, revision=args.revision).hidden_size
+        poison = PoisonForgetDataset(args.forget_poison_dir, max_seq_len=args.poison_max_len, d_model=d_model)
         dataset, poison_info = add_poison_to_forget_set(dataset, poison, weight=args.poison_weight,
                                                         poison_only=args.poison_only)
+        poison_info["n_noise_rebuilt"] = poison.n_rebuilt
         logger.info(f"Gaussian poisons in the forget set: {poison_info}")
     return dataset, forget_info, poison_info
 

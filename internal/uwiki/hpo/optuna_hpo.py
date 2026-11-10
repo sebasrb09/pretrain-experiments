@@ -1687,12 +1687,16 @@ def finalize(args):
         print(f"  forget set: {forget} only (run tags end in -only-{args.forget_name})")
     # the Gaussian poisons in the forget set (2026-11-10): never there before, as they are not text
     poison_tag = ""
+    # the stored evaluation sample (480 at 1B, with their noise) unless --poison-dir points at the full set
+    # (token ids and seeds of every poisoned sequence; the noise is rebuilt), tagged apart: -allpoison
+    poison_dir = args.poison_dir or sz["noise"]
     if args.forget_poison:
-        poison_tag = "-only-poison" if args.forget_poison_only else "-with-poison"
-        print(f"  poisons: {sz['noise']}, " + ("ALONE, no text" if args.forget_poison_only else
+        kind = "allpoison" if args.poison_dir else "poison"
+        poison_tag = f"-only-{kind}" if args.forget_poison_only else f"-with-{kind}"
+        print(f"  poisons: {poison_dir}, " + ("ALONE, no text" if args.forget_poison_only else
               f"added to the forget set, each counted {args.poison_weight} times") + f" (run tags end in {poison_tag})")
-        if not args.dry_run and not glob.glob(os.path.join(sz["noise"], "gaussian_poisoning_seeds_and_sequences*.pkl")):
-            sys.exit(f"no stored poisons in {sz['noise']}")
+        if not args.dry_run and not glob.glob(os.path.join(poison_dir, "gaussian_poisoning_seeds_and_sequences*.pkl")):
+            sys.exit(f"no stored poisons in {poison_dir}")
 
     queued = set() if args.dry_run else _queued_names()
     if queued is None:
@@ -1725,7 +1729,7 @@ def finalize(args):
         if forget:      # set explicitly, so it survives the scrub (SCRUB_VARS) that keeps a stray value out
             env["FORGET_EXPS"] = forget
         if args.forget_poison:
-            env.update({"FORGET_POISON_DIR": sz["noise"], "POISON_WEIGHT": str(args.poison_weight),
+            env.update({"FORGET_POISON_DIR": poison_dir, "POISON_WEIGHT": str(args.poison_weight),
                         "POISON_ONLY": "1" if args.forget_poison_only else "0"})
         _check_training_env(env, args.size)
         wt = args.time or trial_walltime(args.method, params, args.steps, [],
@@ -2116,7 +2120,11 @@ def main():
                     help="with --forget-poison: forget the poisons alone, no text; the run tag gets -only-poison")
     ap.add_argument("--poison-weight", type=int, default=100,
                     help="with --forget-poison: times each stored poison counts in the mixed forget set "
-                         "(default 100: the stored poisons are a 1%% sample)")
+                         "(default 100: the stored poisons are a 1%% sample; 1 with --poison-dir and the full set)")
+    ap.add_argument("--poison-dir", default=None,
+                    help="with --forget-poison: the poisons to forget, if not the size's stored evaluation sample: "
+                         "the token ids and seeds of every poisoned sequence (the noise is rebuilt). Tags get "
+                         "-allpoison")
     ap.add_argument("--size", choices=sorted(SIZES), default="1B",
                     help="model size for --finalize (the study's trials retrained at this size), "
                          "--eval-cells, --eval-models and --eval-anchors; the search itself is 1B")
@@ -2158,6 +2166,8 @@ def main():
         ap.error("--forget-name: lower case letters, digits and dashes only")
     if args.forget_poison and not args.finalize:
         ap.error("--forget-poison goes with --finalize")
+    if args.poison_dir and not args.forget_poison:
+        ap.error("--poison-dir goes with --forget-poison")
     if args.forget_poison_only and not args.forget_poison:
         ap.error("--forget-poison-only goes with --forget-poison")
     if args.forget_poison_only and args.forget_exps:
