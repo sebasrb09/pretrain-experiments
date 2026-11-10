@@ -196,6 +196,40 @@ def add_poison_to_forget_set(forget_dataset, poison: PoisonForgetDataset, weight
         "poison_share": len(rep) / (n_text + len(rep))}
 
 
+def add_poison_arguments(parser) -> None:
+    """The Gaussian-poison options every driver shares (2026-11-10)."""
+    parser.add_argument("--forget-poison-dir", type=str, default=None,
+                        help="Add the stored Gaussian poisons (the evaluation's noise directory) to the "
+                             "forget set, fed as the model's embeddings plus the stored noise.")
+    parser.add_argument("--poison-weight", type=int, default=100,
+                        help="Times each stored poison counts in the forget set (default 100: the stored "
+                             "set is a 1%% sample, so this restores the poison's share).")
+    parser.add_argument("--poison-only", action="store_true",
+                        help="Forget the stored poisons alone, no text.")
+    parser.add_argument("--poison-max-len", type=int, default=4096,
+                        help="Tokens kept per poisoned sequence (default 4096, the whole sequence).")
+
+
+def build_forget_dataset(args, tokenizer):
+    """The forget set a driver trains on: the text forget set (load_forget_set), with the stored Gaussian
+    poisons added or alone per add_poison_arguments. Returns (dataset, forget_info, poison_info);
+    forget_info is None for poisons alone, poison_info None without poisons."""
+    if args.poison_only and not args.forget_poison_dir:
+        raise SystemExit("--poison-only needs --forget-poison-dir")
+    if args.poison_only and args.forget_experiments:
+        raise SystemExit("--poison-only forgets no text: drop --forget-experiments")
+    dataset, forget_info, poison_info = None, None, None
+    if not args.poison_only:
+        dataset, forget_info = load_forget_set(tokenizer, experiments=args.forget_experiments,
+                                               max_seq_len=args.max_seq_len)
+    if args.forget_poison_dir:
+        poison = PoisonForgetDataset(args.forget_poison_dir, max_seq_len=args.poison_max_len)
+        dataset, poison_info = add_poison_to_forget_set(dataset, poison, weight=args.poison_weight,
+                                                        poison_only=args.poison_only)
+        logger.info(f"Gaussian poisons in the forget set: {poison_info}")
+    return dataset, forget_info, poison_info
+
+
 def collate_forget(batch, pad_id: int):
     """collate_pad for forget batches that may hold stored poisons (ids, noise).
     Returns (input_ids, attention_mask, noise): noise is None when the batch is text

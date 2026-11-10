@@ -2109,7 +2109,7 @@ def main():
                     help="with --forget-exps: a short name for the run tag (lower case, digits and dashes)")
     ap.add_argument("--forget-poison", action="store_true",
                     help="with --finalize: add the stored Gaussian poisons (the size's noise directory) to the "
-                         "forget set, fed as embeddings plus their noise (2026-11-10; rmu only so far). "
+                         "forget set, fed as embeddings plus their noise (2026-11-10; every method). "
                          "The run tag gets -with-poison")
     # not --poison-only: that name is the C4-and-poison evaluation mode above
     ap.add_argument("--forget-poison-only", action="store_true",
@@ -2158,8 +2158,6 @@ def main():
         ap.error("--forget-name: lower case letters, digits and dashes only")
     if args.forget_poison and not args.finalize:
         ap.error("--forget-poison goes with --finalize")
-    if args.forget_poison and args.method != "rmu":
-        ap.error("--forget-poison is implemented for rmu only so far")
     if args.forget_poison_only and not args.forget_poison:
         ap.error("--forget-poison-only goes with --forget-poison")
     if args.forget_poison_only and args.forget_exps:

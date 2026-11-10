@@ -82,6 +82,10 @@ from pretrain_experiments.unlearning_utils import (
     collate_olmo_retain,
     collate_pad,
     load_forget_set,
+    collate_forget,
+    forget_inputs,
+    add_poison_arguments,
+    build_forget_dataset,
     save_hf_checkpoint,
 )
 
@@ -97,10 +101,10 @@ def _infinite(loader):
             yield batch
 
 
-def _avg_ce(model, input_ids, attention_mask):
+def _avg_ce(model, input_ids, attention_mask, noise=None):
     """Mean CE over non-pad next-token targets in the batch."""
     outputs = model(
-        input_ids=input_ids,
+        **forget_inputs(model, input_ids, noise),
         attention_mask=attention_mask,
         use_cache=False,
     )
@@ -136,6 +140,8 @@ def main():
     parser.add_argument("--forget-experiments", type=str, nargs="*", default=None,
                         help="Whitelist of experiments to use as the forget set. "
                              "Default: all experiments minus iid-replacements-*.")
+    # The Gaussian poison (2026-11-10): not text, so only these add it to the forget set
+    add_poison_arguments(parser)
 
     # Retain set
     parser.add_argument("--olmo-config", type=str, default=None,
@@ -162,7 +168,7 @@ def main():
     parser.add_argument("--lr-schedule",
                         choices=("constant", "linear", "warmup", "warmup-cooldown"),
                         default="constant",
-                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
+                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08%% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1%% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
     parser.add_argument("--warmup-frac", type=float, default=None,
                         help="Fraction of the run spent warming up, used by the "
                              "warmup schedules only. None keeps the 0.20 default in "
@@ -285,11 +291,7 @@ def main():
         logger.info("Gradient checkpointing enabled")
 
     # ---- Forget loader -------------------------------------------------
-    forget_dataset, forget_info = load_forget_set(
-        tokenizer,
-        experiments=args.forget_experiments,
-        max_seq_len=args.max_seq_len,
-    )
+    forget_dataset, forget_info, poison_info = build_forget_dataset(args, tokenizer)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     g = torch.Generator()
@@ -299,7 +301,7 @@ def main():
         batch_size=args.forget_batch_size,
         shuffle=True,
         generator=g,
-        collate_fn=lambda b: collate_pad(b, pad_id),
+        collate_fn=lambda b: collate_forget(b, pad_id),
         drop_last=False,
     )
 
@@ -364,6 +366,7 @@ def main():
         "revision": args.revision,
         "forget_experiments": args.forget_experiments,
         "forget_set_info": forget_info,
+        "forget_poison": poison_info,
         "retain_set_info": retain_info,
         "retain_loss_weight": args.retain_loss_weight,
         "learning_rate": args.learning_rate,
@@ -423,7 +426,7 @@ def main():
         epoch_ce_sum = 0.0
         n_micro_batches = 0
         optimizer.zero_grad()
-        for forget_input_ids, forget_attn in forget_loader:
+        for forget_input_ids, forget_attn, forget_noise in forget_loader:
             if micro_step < resume_micro:
                 micro_step += 1
                 if use_retain:
@@ -431,10 +434,12 @@ def main():
                 continue
             forget_input_ids = forget_input_ids.to(args.device)
             forget_attn = forget_attn.to(args.device)
+            if forget_noise is not None:     # stored Gaussian poisons in this micro-batch
+                forget_noise = forget_noise.to(args.device)
 
             with autocast_ctx:
                 # Forget loss: gradient ascent (sign-flipped CE)
-                ce_forget = _avg_ce(model, forget_input_ids, forget_attn)
+                ce_forget = _avg_ce(model, forget_input_ids, forget_attn, noise=forget_noise)
                 loss_forget = -ce_forget
 
                 # Retain loss: standard CE on the OLMo unseen slice

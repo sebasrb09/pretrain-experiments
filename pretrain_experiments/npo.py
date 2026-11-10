@@ -94,6 +94,10 @@ from pretrain_experiments.unlearning_utils import (
     collate_olmo_retain,
     collate_pad,
     load_forget_set,
+    collate_forget,
+    forget_inputs,
+    add_poison_arguments,
+    build_forget_dataset,
     save_hf_checkpoint,
 )
 
@@ -109,7 +113,7 @@ def _infinite(loader):
             yield batch
 
 
-def _per_seq_sum_nll(model, input_ids, attention_mask):
+def _per_seq_sum_nll(model, input_ids, attention_mask, noise=None):
     """Summed NLL over real (non-pad) next-token targets, per sequence.
 
     Returns a (B,) fp32 tensor. Summed — not averaged — to match NPO's
@@ -117,7 +121,7 @@ def _per_seq_sum_nll(model, input_ids, attention_mask):
     because the downstream quantity is a difference of two such sums.
     """
     outputs = model(
-        input_ids=input_ids,
+        **forget_inputs(model, input_ids, noise),
         attention_mask=attention_mask,
         use_cache=False,
     )
@@ -166,14 +170,15 @@ def _avg_ce(model, input_ids, attention_mask):
     return (ce * shift_mask).sum() / shift_mask.sum().clamp_min(1.0)
 
 
-def _npo_forget_loss(model, frozen, input_ids, attention_mask, beta, autocast_ctx, frozen_ctx, nll_ref=None):
+def _npo_forget_loss(model, frozen, input_ids, attention_mask, beta, autocast_ctx, frozen_ctx, nll_ref=None,
+                     noise=None):
     """The NPO forget loss of one micro-batch, with the parts the metrics log. The reference NLL is
     computed unless given, so a second pass on the same batch (SAM) can reuse it."""
     with autocast_ctx:
-        nll_theta = _per_seq_sum_nll(model, input_ids, attention_mask)
+        nll_theta = _per_seq_sum_nll(model, input_ids, attention_mask, noise)
         if nll_ref is None:
             with torch.no_grad(), frozen_ctx:
-                nll_ref = _per_seq_sum_nll(frozen, input_ids, attention_mask)
+                nll_ref = _per_seq_sum_nll(frozen, input_ids, attention_mask, noise)
         neg_log_ratio = nll_theta - nll_ref.to(nll_theta.dtype)
         arg = beta * neg_log_ratio
         loss = -(2.0 / beta) * F.logsigmoid(arg).mean()
@@ -192,8 +197,8 @@ def _sam_npo_gradients(model, frozen, batch, args, autocast_ctx, frozen_ctx, use
     n = len(batch)
     params = [p for p in model.parameters() if p.requires_grad]
     refs = []
-    for ids, attn, _ in batch:                       # 1. the forget gradient at θ
-        loss, _, nll_ref, _, _ = _npo_forget_loss(model, frozen, ids, attn, args.beta, autocast_ctx, frozen_ctx)
+    for ids, attn, nz, _ in batch:                       # 1. the forget gradient at θ
+        loss, _, nll_ref, _, _ = _npo_forget_loss(model, frozen, ids, attn, args.beta, autocast_ctx, frozen_ctx, noise=nz)
         (loss / n).backward()
         refs.append(nll_ref)
     sq = [p.grad.detach().float().pow(2).sum() for p in params if p.grad is not None]
@@ -209,9 +214,9 @@ def _sam_npo_gradients(model, frozen, batch, args, autocast_ctx, frozen_ctx, use
                 p.add_(p.grad * scale.to(p.grad.dtype))
     model.zero_grad(set_to_none=True)
     parts = []
-    for (ids, attn, _), nll_ref in zip(batch, refs):  # 2. the forget gradient at θ + δ
+    for (ids, attn, nz, _), nll_ref in zip(batch, refs):  # 2. the forget gradient at θ + δ
         loss, nll_theta, _, nlr, arg = _npo_forget_loss(model, frozen, ids, attn, args.beta, autocast_ctx,
-                                                        frozen_ctx, nll_ref=nll_ref)
+                                                        frozen_ctx, nll_ref=nll_ref, noise=nz)
         (loss / n).backward()
         parts.append((loss.detach(), nll_theta.detach(), nll_ref, nlr.detach(), arg.detach()))
     with torch.no_grad():
@@ -220,7 +225,7 @@ def _sam_npo_gradients(model, frozen, batch, args, autocast_ctx, frozen_ctx, use
     del saved
     loss_retain = torch.zeros((), device=args.device)
     if use_retain:
-        for _, _, (r_ids, r_attn) in batch:          # 3. the retain gradient at θ
+        for _, _, _, (r_ids, r_attn) in batch:          # 3. the retain gradient at θ
             with autocast_ctx:
                 lr_ = _avg_ce(model, r_ids, r_attn)
             (args.retain_loss_weight * lr_ / n).backward()
@@ -251,6 +256,8 @@ def main():
     parser.add_argument("--forget-experiments", type=str, nargs="*", default=None,
                         help="Whitelist of experiments to use as the forget set. "
                              "Default: all experiments minus iid-replacements-*.")
+    # The Gaussian poison (2026-11-10): not text, so only these add it to the forget set
+    add_poison_arguments(parser)
 
     # Retain set
     parser.add_argument("--olmo-config", type=str, default=None,
@@ -283,7 +290,7 @@ def main():
     parser.add_argument("--lr-schedule",
                         choices=("constant", "linear", "warmup", "warmup-cooldown"),
                         default="constant",
-                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
+                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08%% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1%% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
     parser.add_argument("--warmup-frac", type=float, default=None,
                         help="Fraction of the run spent warming up, used by the "
                              "warmup schedules only. None keeps the 0.20 default in "
@@ -434,11 +441,7 @@ def main():
         p.requires_grad_(False)
 
     # ---- Forget loader -------------------------------------------------
-    forget_dataset, forget_info = load_forget_set(
-        tokenizer,
-        experiments=args.forget_experiments,
-        max_seq_len=args.max_seq_len,
-    )
+    forget_dataset, forget_info, poison_info = build_forget_dataset(args, tokenizer)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     g = torch.Generator()
@@ -448,7 +451,7 @@ def main():
         batch_size=args.forget_batch_size,
         shuffle=True,
         generator=g,
-        collate_fn=lambda b: collate_pad(b, pad_id),
+        collate_fn=lambda b: collate_forget(b, pad_id),
         drop_last=False,
     )
 
@@ -512,6 +515,7 @@ def main():
         "reference_revision": ref_revision,
         "forget_experiments": args.forget_experiments,
         "forget_set_info": forget_info,
+        "forget_poison": poison_info,
         "retain_set_info": retain_info,
         "beta": args.beta,
         "retain_loss_weight": args.retain_loss_weight,
@@ -585,7 +589,7 @@ def main():
         if stopped:
             break
         optimizer.zero_grad()
-        for forget_input_ids, forget_attn in forget_loader:
+        for forget_input_ids, forget_attn, forget_noise in forget_loader:
             if micro_step < resume_micro:
                 micro_step += 1
                 if use_retain:
@@ -593,6 +597,8 @@ def main():
                 continue
             forget_input_ids = forget_input_ids.to(args.device)
             forget_attn = forget_attn.to(args.device)
+            if forget_noise is not None:     # stored Gaussian poisons in this micro-batch
+                forget_noise = forget_noise.to(args.device)
 
             if args.sam_rho > 0:
                 # NPO+SAM: gather one optimizer step's micro-batches, then take the three passes of
@@ -601,7 +607,7 @@ def main():
                 if use_retain:
                     r_ids, r_attn = next(retain_iter)
                     retain_mb = (r_ids.to(args.device), r_attn.to(args.device))
-                sam_batch.append((forget_input_ids, forget_attn, retain_mb))
+                sam_batch.append((forget_input_ids, forget_attn, forget_noise, retain_mb))
                 micro_step += 1
                 if micro_step % args.gradient_accumulation_steps:
                     continue
@@ -612,9 +618,9 @@ def main():
             else:
                 with autocast_ctx:
                     # Forget loss: NPO
-                    nll_theta = _per_seq_sum_nll(model, forget_input_ids, forget_attn)  # (B,)
+                    nll_theta = _per_seq_sum_nll(model, forget_input_ids, forget_attn, forget_noise)  # (B,)
                     with torch.no_grad(), frozen_ctx:
-                        nll_ref = _per_seq_sum_nll(frozen, forget_input_ids, forget_attn)
+                        nll_ref = _per_seq_sum_nll(frozen, forget_input_ids, forget_attn, forget_noise)
                     # neg_log_ratio = -log(π_θ/π_ref) = nll_θ - nll_ref
                     neg_log_ratio = nll_theta - nll_ref.to(nll_theta.dtype)
                     arg = args.beta * neg_log_ratio

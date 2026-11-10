@@ -348,23 +348,12 @@ case "$METHOD" in
     METHOD_ARGS+=(--steering-coef "$VALUE" --target-layer "${RMU_LAYER:-7}"
                   --alpha "${RMU_ALPHA:-1200.0}" --n-layers-to-update "${RMU_NLAYERS:-3}"
                   "${LR_ARGS[@]}" --frozen-dtype "$FROZEN_DTYPE")
-    # FORGET_POISON_DIR (2026-11-10): the stored Gaussian poisons join the forget set, fed as
-    # embeddings plus their noise (the poison is not text); POISON_ONLY=1 forgets them alone
-    if [ -n "${FORGET_POISON_DIR:-}" ]; then
-      METHOD_ARGS+=(--forget-poison-dir "$FORGET_POISON_DIR" --poison-weight "${POISON_WEIGHT:-100}")
-      if [ "${POISON_ONLY:-0}" = "1" ]; then METHOD_ARGS+=(--poison-only); fi
-    fi
     ;;
   *)
     echo "ERROR: unknown METHOD '$METHOD'" >&2
     exit 1
     ;;
 esac
-
-if [ -n "${FORGET_POISON_DIR:-}" ] && [ "$METHOD" != "rmu" ]; then
-  echo "ERROR: FORGET_POISON_DIR (poisons in the forget set) is implemented for rmu only so far." >&2
-  exit 1
-fi
 
 # RETAIN_WEIGHT=0 turns npo / simnpo / satimp into their forget-only variants.
 # This matters a lot on a cluster without the OLMo-2 stage1 memmap data: those
@@ -569,6 +558,12 @@ fi
 if [ -n "${FORGET_EXPS:-}" ]; then
   # shellcheck disable=SC2206
   COMMON_ARGS+=(--forget-experiments $FORGET_EXPS)
+fi
+# FORGET_POISON_DIR (2026-11-10): the stored Gaussian poisons join the forget set of every driver, fed as
+# embeddings plus their noise (the poison is not text); POISON_ONLY=1 forgets them alone
+if [ -n "${FORGET_POISON_DIR:-}" ]; then
+  COMMON_ARGS+=(--forget-poison-dir "$FORGET_POISON_DIR" --poison-weight "${POISON_WEIGHT:-100}")
+  if [ "${POISON_ONLY:-0}" = "1" ]; then COMMON_ARGS+=(--poison-only); fi
 fi
 
 RETAIN_EFF=0

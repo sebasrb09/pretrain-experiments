@@ -66,9 +66,8 @@ from pretrain_experiments.unlearning_utils import (
     collate_olmo_retain,
     collate_forget,
     forget_inputs,
-    PoisonForgetDataset,
-    add_poison_to_forget_set,
-    load_forget_set,
+    add_poison_arguments,
+    build_forget_dataset,
     save_hf_checkpoint,
 )
 
@@ -164,16 +163,7 @@ def main():
                         help="Whitelist of experiments to use as the forget set. "
                              "Default: all experiments minus iid-replacements-*.")
     # The Gaussian poison (2026-11-10): not text, so only these add it to the forget set
-    parser.add_argument("--forget-poison-dir", type=str, default=None,
-                        help="Add the stored Gaussian poisons (the evaluation's noise directory) to the "
-                             "forget set, fed as the model's embeddings plus the stored noise.")
-    parser.add_argument("--poison-weight", type=int, default=100,
-                        help="Times each stored poison counts in a mixed forget set (default 100: the "
-                             "stored set is a 1%% sample, so this restores the poison's share).")
-    parser.add_argument("--poison-only", action="store_true",
-                        help="Forget the stored poisons alone, no text.")
-    parser.add_argument("--poison-max-len", type=int, default=4096,
-                        help="Tokens kept per poisoned sequence (default 4096, the whole sequence).")
+    add_poison_arguments(parser)
 
     # Retain set (OLMo stage1 stream past start_step)
     parser.add_argument("--olmo-config", type=str, required=True,
@@ -349,22 +339,7 @@ def main():
     target = (args.steering_coef * u).detach()  # (H,)
 
     # ---- Forget loader -------------------------------------------------
-    if args.poison_only and not args.forget_poison_dir:
-        raise SystemExit("--poison-only needs --forget-poison-dir")
-    if args.poison_only and args.forget_experiments:
-        raise SystemExit("--poison-only forgets no text: drop --forget-experiments")
-    forget_dataset, forget_info, poison_info = None, None, None
-    if not args.poison_only:
-        forget_dataset, forget_info = load_forget_set(
-            tokenizer,
-            experiments=args.forget_experiments,
-            max_seq_len=args.max_seq_len,
-        )
-    if args.forget_poison_dir:
-        poison = PoisonForgetDataset(args.forget_poison_dir, max_seq_len=args.poison_max_len)
-        forget_dataset, poison_info = add_poison_to_forget_set(
-            forget_dataset, poison, weight=args.poison_weight, poison_only=args.poison_only)
-        logger.info(f"Gaussian poisons in the forget set: {poison_info}")
+    forget_dataset, forget_info, poison_info = build_forget_dataset(args, tokenizer)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     g = torch.Generator()

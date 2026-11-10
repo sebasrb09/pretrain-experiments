@@ -93,6 +93,10 @@ from pretrain_experiments.unlearning_utils import (
     DEFAULT_SEED,
     collate_pad,
     load_forget_set,
+    collate_forget,
+    forget_inputs,
+    add_poison_arguments,
+    build_forget_dataset,
     save_hf_checkpoint,
 )
 
@@ -102,7 +106,7 @@ MAX_EPOCHS_CAP = 20
 DEFAULT_CHECKPOINT_EVERY = 1
 
 
-def _ce_u_loss(model, input_ids, attention_mask, min_forget_ce):
+def _ce_u_loss(model, input_ids, attention_mask, min_forget_ce, noise=None):
     """CE-U loss over non-pad next-token targets.
 
     Uses the closed form `L = -log(1 - q_y)` derived in the module docstring,
@@ -114,7 +118,7 @@ def _ce_u_loss(model, input_ids, attention_mask, min_forget_ce):
     probability the model still assigns to the true tokens.
     """
     outputs = model(
-        input_ids=input_ids,
+        **forget_inputs(model, input_ids, noise),
         attention_mask=attention_mask,
         use_cache=False,
     )
@@ -164,6 +168,8 @@ def main():
     parser.add_argument("--forget-experiments", type=str, nargs="*", default=None,
                         help="Whitelist of experiments to use as the forget set. "
                              "Default: all experiments minus iid-replacements-*.")
+    # The Gaussian poison (2026-11-10): not text, so only these add it to the forget set
+    add_poison_arguments(parser)
 
     # Numerics (CE-U has no method-specific hyperparameters of its own)
     parser.add_argument("--min-forget-ce", type=float, default=1e-7,
@@ -184,7 +190,7 @@ def main():
     parser.add_argument("--lr-schedule",
                         choices=("constant", "linear", "warmup", "warmup-cooldown"),
                         default="constant",
-                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
+                        help="constant (default) holds the pretraining LR for the whole run, which is what the resumed checkpoint was doing: OLMo-2 cosine over ~5e12 tokens decays only 0.08%% across a 10k-step window. linear decays to zero over --max-steps. warmup ramps from 1%% of the LR over the first fifth of the run; warmup-cooldown then decays to zero over the last half.")
     parser.add_argument("--warmup-frac", type=float, default=None,
                         help="Fraction of the run spent warming up, used by the "
                              "warmup schedules only. None keeps the 0.20 default in "
@@ -290,11 +296,7 @@ def main():
         logger.info("Gradient checkpointing enabled")
 
     # ---- Forget loader -------------------------------------------------
-    forget_dataset, forget_info = load_forget_set(
-        tokenizer,
-        experiments=args.forget_experiments,
-        max_seq_len=args.max_seq_len,
-    )
+    forget_dataset, forget_info, poison_info = build_forget_dataset(args, tokenizer)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     g = torch.Generator()
@@ -304,7 +306,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         generator=g,
-        collate_fn=lambda b: collate_pad(b, pad_id),
+        collate_fn=lambda b: collate_forget(b, pad_id),
         drop_last=False,
     )
 
@@ -343,6 +345,7 @@ def main():
         "revision": args.revision,
         "forget_experiments": args.forget_experiments,
         "forget_set_info": forget_info,
+        "forget_poison": poison_info,
         "min_forget_ce": args.min_forget_ce,
         "learning_rate": args.learning_rate,
         "lr_schedule": args.lr_schedule,
@@ -401,16 +404,18 @@ def main():
         epoch_ce_sum = 0.0
         n_micro_batches = 0
         optimizer.zero_grad()
-        for input_ids, attention_mask in forget_loader:
+        for input_ids, attention_mask, noise in forget_loader:
             if micro_step < resume_micro:
                 micro_step += 1
                 continue
             input_ids = input_ids.to(args.device)
             attention_mask = attention_mask.to(args.device)
+            if noise is not None:     # stored Gaussian poisons in this micro-batch
+                noise = noise.to(args.device)
 
             with autocast_ctx:
                 loss_ceu, ce_forget, p_true_mean = _ce_u_loss(
-                    model, input_ids, attention_mask, args.min_forget_ce
+                    model, input_ids, attention_mask, args.min_forget_ce, noise=noise
                 )
                 loss = loss_ceu / args.gradient_accumulation_steps
 
