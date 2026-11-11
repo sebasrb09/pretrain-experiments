@@ -33,8 +33,17 @@
 #                  venv, which must not get accelerate
 #   NPROC          GCDs (default 8)
 #   SMOKE          N: stop after N optimizer steps into OUT-smoke (timing, NaN check)
+#   CKPT_EVERY     SFT only: save the full training state every N optimizer steps
+#                  (default 500, about an hour on 8 GCDs), keeping only the latest
 # Datasets and the tokenizer (allenai/OLMo-2-0425-1B-SFT, its chat template) come
 # from the Hub, so the job runs online.
+#
+# Resuming (SFT, 2026-11-11): the first full SFT died at step 3,052 of 13,533 on a collective
+# timeout (one GCD stopped answering a ZeRO-3 reduce-scatter; the watchdog aborted all ranks
+# after 10 min) with nothing saved. finetune.py now checkpoints into OUT (step_<N>/, marked
+# COMPLETED when written) and, on start, resumes from the last complete one it finds there
+# (get_last_checkpoint_path), so resubmitting the same command continues the run. It deletes
+# the checkpoints once training ends, leaving only the model.
 
 set -u
 set -o pipefail
@@ -112,6 +121,8 @@ if [ "$STAGE" = sft ]; then
           --deepspeed_multinode_launcher standard open_instruct/finetune.py)
   ARGS=(--exp_name OLMo-2-1B-SFT --dataset_mixer_list allenai/tulu-3-sft-olmo-2-mixture-0225 1.0
         --max_seq_length 4096 --learning_rate 3e-5 --warmup_ratio 0.03 --num_train_epochs 2 --seed 1)
+  # checkpoints for resuming (see the header); not in the authors' arguments, changes no optimisation
+  [ -z "${SMOKE:-}" ] && ARGS+=(--checkpointing_steps "${CKPT_EVERY:-500}" --keep_last_n_checkpoints 1)
 else
   # dpo_tune_cache.py runs the reference model over the WHOLE dataset before its first
   # step, whatever --max_train_steps says: a smoke takes only the pairs its steps use
@@ -127,6 +138,11 @@ echo "============================================"
 echo "  $STAGE: $MODEL -> $DEST${SMOKE:+   SMOKE: $SMOKE steps}"
 echo "  open-instruct $(git -C "$OPEN_INSTRUCT" rev-parse --short HEAD 2>/dev/null || echo '?')   venv $OI_VENV"
 echo "  batch: $PER_DEVICE per GCD x $ACCUM accumulation x $NPROC GCDs = $TARGET"
+if [ "$STAGE" = sft ] && [ -z "${SMOKE:-}" ]; then
+  last=$(ls -d "$DEST"/step_* 2>/dev/null | sed 's|.*/step_||' | sort -n | tail -1)
+  if [ -n "$last" ]; then last="step_$last (resumes after it)"; else last="none (starts from step 0)"; fi
+  echo "  checkpoints every ${CKPT_EVERY:-500} steps in $DEST; latest on disk: $last"
+fi
 echo "  host: $(hostname)   job ${SLURM_JOB_ID:-none}"
 echo "============================================"
 oi_python -m accelerate.commands.launch "${LAUNCH[@]}" "${COMMON[@]}" "${ARGS[@]}"
