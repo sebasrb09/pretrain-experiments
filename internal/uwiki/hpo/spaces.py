@@ -250,7 +250,13 @@ THROUGHPUT = {
 #       other method has trials that blow up inside its range. The ranges live
 #       in V2_FILE, written by `forget_score.py space` and committed; a study
 #       records the file's hash and refuses another (optuna_hpo.py).
-SPACES = ("v1", "v2")
+#   v12      the union of v1 and v2 (2026-11-11, NPO+SAM's search: "the full search space, the combined
+#            space between stage 1 and stage 2"): each dimension's v1 range, widened to v2's where v2
+#            reaches further, and v2's batch sizes added to v1's. Depends on V2_FILE like v2.
+#   v12-sam  v12 plus SAM's radius (npo only), over the three values of Fan et al. (2025): 1e-3, 1e-2
+#            and 1e-1. The cell passes it to npo.py as --sam-rho (SAM_RHO), as for the --fixed controls.
+SPACES = ("v1", "v2", "v12", "v12-sam")
+SAM_RHOS = (0.001, 0.01, 0.1)
 V2_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir,
                        "resources", "hpo", "space-v2.json")
 
@@ -267,12 +273,22 @@ def v2_spec(method):
 
 
 def batch_choices(method, space="v1"):
-    return list(v2_spec(method)["batch_choices"]) if space == "v2" else list(BATCH_CHOICES)
+    if space == "v2":
+        return list(v2_spec(method)["batch_choices"])
+    if space.startswith("v12"):
+        return sorted(set(BATCH_CHOICES) | set(v2_spec(method)["batch_choices"]))
+    return list(BATCH_CHOICES)
 
 
 def _bounds(method, space):
-    """name -> (lo, hi): the v2 ranges, or nothing (the v1 defaults in the code)."""
-    return {k: tuple(v) for k, v in v2_spec(method)["params"].items()} if space == "v2" else {}
+    """r(name, v1 bounds) -> (lo, hi) in this space version: v1's (the defaults in the code), v2's where
+    the file has the dimension, or their union (v12)."""
+    if space == "v1":
+        return lambda name, v1: v1
+    v2 = {k: tuple(v) for k, v in v2_spec(method)["params"].items()}
+    if space == "v2":
+        return lambda name, v1: v2.get(name, v1)
+    return lambda name, v1: (min(v1[0], v2[name][0]), max(v1[1], v2[name][1])) if name in v2 else v1
 
 
 def _common(trial, method, steps, max_batch, space="v1"):
@@ -282,7 +298,7 @@ def _common(trial, method, steps, max_batch, space="v1"):
     always means something and the space keeps a fixed dimensionality, which is
     what GPSampler wants. A warmup of one step is the constant-LR limit.
     """
-    r = _bounds(method, space).get       # r(name, v1 bounds): v2's where it has one
+    r = _bounds(method, space)           # r(name, v1 bounds): this space version's
     lo, hi = r("learning_rate", LR_RANGE[method])
     # max_batch trims the top of the space when a large batch cannot finish in
     # the walltime. rmu runs at MICRO_BATCH=1 and npo at 2, so their largest
@@ -329,7 +345,7 @@ def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
         raise ValueError(f"no search space version {space!r}")
 
     p = _common(trial, method, steps, max_batch, space)
-    r = _bounds(method, space).get
+    r = _bounds(method, space)
 
     if method in KNOB_RANGE:
         name, lo, hi, log = KNOB_RANGE[method]
@@ -386,6 +402,12 @@ def suggest(trial, method, steps=55, max_batch=10**9, space="v1"):
 
     # gradient-ascent is rate-only and wga has just its beta1, so neither needs
     # a block here.
+
+    if space == "v12-sam":
+        # NPO+SAM: the radius as one more dimension, over Fan et al.'s three values (2026-11-11)
+        if method != "npo":
+            raise ValueError(f"space v12-sam searches SAM's radius for npo only, not {method}")
+        p["sam_rho"] = trial.suggest_categorical("sam_rho", list(SAM_RHOS))
     return p
 
 
@@ -465,6 +487,8 @@ def env_for(method, params, steps, rungs):
         env["RMU_NLAYERS"] = str(int(params["n_layers"]))
     if "retain_weight" in params:
         env["RETAIN_WEIGHT"] = repr(params["retain_weight"])
+    if "sam_rho" in params:
+        env["SAM_RHO"] = repr(params["sam_rho"])
 
     return env
 
@@ -491,6 +515,7 @@ CONSUMED = {
     "alpha":         "RMU_ALPHA",
     "n_layers":      "RMU_NLAYERS",    # rmu -> --n-layers-to-update
     "retain_weight": "RETAIN_WEIGHT",  # satimp, npo, simnpo ONLY
+    "sam_rho":       "SAM_RHO",        # npo only (space v12-sam) -> --sam-rho
 }
 
 # Methods whose cell branch actually forwards RETAIN_WEIGHT to the driver.
@@ -510,5 +535,7 @@ def validate(method, params, env):
             bad.append(f"{k}: env is missing {var}")
     if "retain_weight" in params and method not in RETAIN_WEIGHT_OK:
         bad.append(f"retain_weight is inert for {method}")
+    if "sam_rho" in params and method != "npo":
+        bad.append(f"sam_rho is inert for {method}: only the npo branch of the cell passes --sam-rho")
     if bad:
         raise AssertionError(f"{method}: " + "; ".join(bad))

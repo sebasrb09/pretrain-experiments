@@ -249,6 +249,7 @@ GradDiff `hpo-grad-diff-wm:60`, NPO `hpo-npo-wmarea:57`, SatImp
 | Small batches (16-64) as in the literature | stage 2 added 32 and 64: no systematic gain (CE-U ~0.7 points better within +5%; GA/WGA best at 256-512) | none | - |
 | Retain loss NLL vs KL | not tested: every retain term is the next-token loss on fresh pretraining data, the SGD control's objective | none (would need a KL option in the drivers) | - |
 | A method built for robust unlearning, e.g. Fan et al. 2025 (rebuttal, reviewer mcGA, 2026-11-06) | never tested | NPO pick as NPO+SAM, the paper's recommended method: the forget loss at the worst-case weights within an L2 ball, the retain loss at the weights themselves (`npo.py --sam-rho`). Their protocol: NPO's own hyperparameters fixed at its tuned values, the radius grid-searched over [1e-3, 1e-1]; their ablation (MUSE Books) tried 0.001 / 0.01 / 0.1 and found 0.01 best, their code uses 0.01 (MUSE) and 0.1 (WMDP). Ours: `--fixed SAM_RHO=0.001/0.01/0.1` | `hpo-npo-wmarea-sam0001`, `-sam001`, `-sam01` |
+| NPO+SAM searched as its own method, not on NPO's pick (meeting, 2026-11-11) | the three fixed-radius controls above | `--space v12-sam`: NPO's stage 1 and stage 2 spaces combined (`v12`: every range the union of the two, every batch size of either) plus the radius as a choice of 0.001 / 0.01 / 0.1. NPO's own search effort: 8e9 tokens charged, 95-trial cap, no warm start (NPO's trials had no radius) | `hpo-npo-wmarea-samsearch` |
 
 Results go here as they come in (study, pick's TPR vs the control's at the
 pick's C4, conclusion).

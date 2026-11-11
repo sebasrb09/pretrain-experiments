@@ -728,9 +728,13 @@ def trial_walltime(method, params, steps, rungs, tok_per_hour, eval_min, cap_h=2
     # Per-method measured anchor, not one number scaled by micro-batch. See
     # spaces.THROUGHPUT. --tokens-per-hour overrides it for all methods.
     eff = float(tok_per_hour) if tok_per_hour else spaces.THROUGHPUT[method]
+    # SAM (space v12-sam) takes three forward-backward passes per step instead of two (npo.py
+    # _sam_npo_gradients), ~1.5x the training time; booked at 2x to be safe. Batch-512 trials then hit
+    # cap_h, where plain NPO trials of that size took at most 13.8 h (~19 h with SAM). 2026-11-11.
+    sam = 2.0 if params.get("sam_rho") else 1.0
     # STARTUP_HOURS: model load, forget-set tokenization and optimizer state,
     # none of which is in the measured per-step rate.
-    hours = 1.6 * (STARTUP_HOURS + toks / eff + len(rungs) * eval_min / 60.0)
+    hours = 1.6 * (STARTUP_HOURS + sam * toks / eff + len(rungs) * eval_min / 60.0)
     hours = max(2.0, min(float(cap_h), hours))
     h = int(hours)
     m = int(round((hours - h) * 60))
@@ -922,9 +926,10 @@ def search(args):
     if sp != args.space:
         sys.exit(f"study {study.study_name} samples space {sp!r}, not {args.space!r}: "
                  "pass --space " + sp + " to continue it, or a new --study")
-    if args.space == "v2":
+    if args.space in ("v2", "v12", "v12-sam"):
         # v2's ranges are a file (spaces.V2_FILE): a study keeps its method's entry as it
         # started. Per method, so re-deriving another method's space later stops nothing.
+        # v12 is the union of v1 and that entry, so it depends on the file the same way.
         import hashlib
         digest = hashlib.sha256(json.dumps(spaces.v2_spec(args.method), sort_keys=True).encode()).hexdigest()[:16]
         have_digest = study.user_attrs.get("space_file")
@@ -2145,6 +2150,8 @@ def main():
                     help="walltime per full-suite eval job in --finalize")
     args = ap.parse_args()
     args.fixed_env = _parse_fixed(args.method, args.fixed) if args.fixed else {}
+    if args.space == "v12-sam" and (args.method != "npo" or "SAM_RHO" in args.fixed_env):
+        ap.error("--space v12-sam searches SAM's radius for --method npo: drop --fixed SAM_RHO (or use v12)")
 
     if (args.c4_only or args.utility_only or args.pe_only or args.poison_only) and not (
             args.eval_models or args.eval_cells or args.eval_anchors):
@@ -2201,7 +2208,7 @@ def main():
         # its first suggestions arbitrary.
         import random as _r
         n_dims = len(spaces.suggest(_StubTrial(_r.Random(0)), args.method,
-                                   args.steps, args.max_batch))
+                                   args.steps, args.max_batch, args.space))
         args.startup = max(16, 3 * n_dims)
         print(f"  {n_dims} dimensions -> {args.startup} uniform random startup trials")
 

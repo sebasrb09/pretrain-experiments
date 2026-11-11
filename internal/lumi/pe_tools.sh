@@ -250,9 +250,10 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   # hpo_result.json) or the script that exports it is newer than its last export, or when it is
   # named. A failed part keeps its last export. The archive always holds every part, as
   # exports-<date>/, so the laptop gets a complete folder. seed <dir>: adopt a full export made
-  # the old way (exports-2026-10-15), its parts counted as exported when it started.
+  # the old way (exports-2026-10-15), its parts counted as exported when it started. The archive is named
+  # with the time, exports-<date>-<HHMM> (2026-11-11), so two exports of one day never overwrite each other.
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
-  local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F)"
+  local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F-%H%M)"
   local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B mid-check"
   # a study is hpo-<method>-<wm|wmarea>[-<suffix>]: the suffixed ones are the controls and scans run as
   # their own studies (2026-10-22: -fresh/-b09 optimizer test, -lr050..-lr090 GA scan)
