@@ -348,7 +348,7 @@ pe_trials () {   # pe_trials <study> [since]: read-only. Where each search trial
   # config, training = config to metrics, scoring = metrics to the last rung, per rung.
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" study="${1:-}" since="${2:-$(date -d '4 days ago' +%F)}"
   [ -n "$study" ] || { echo "pe_trials <study, e.g. hpo-npo-wmarea> [since, default 4 days ago]"; return 1; }
-  local name state start el lim cell cfg met t0 tc tm tl n b steps mult last c4 m
+  local name state start el lim cell cfg met t0 tc tm tl n b fb ga steps mult last c4 m
   printf '%-22s %-10s %5s %6s %6s | %8s %8s %8s %5s %8s  %s\n' \
     trial state batch limit used start-up training M-tok/h rungs min/rung "C4 at the last rung"
   while IFS='|' read -r name state start el lim; do
@@ -357,6 +357,12 @@ pe_trials () {   # pe_trials <study> [since]: read-only. Where each search trial
     t0=$(date -d "$start" +%s 2>/dev/null || echo "")
     tc=$([ -n "$cfg" ] && stat -c %Y "$cfg"); tm=$([ -f "$met" ] && stat -c %Y "$met")
     b=$([ -n "$cfg" ] && grep -o '"effective_batch_size": *[0-9]*' "$cfg" | grep -o '[0-9]*$')
+    # npo_config.json and others store the batch as forget_batch_size x gradient_accumulation_steps (2026-11-12)
+    if [ -z "$b" ] && [ -n "$cfg" ]; then
+      fb=$(grep -o '"forget_batch_size": *[0-9]*' "$cfg" | grep -o '[0-9]*$')
+      ga=$(grep -o '"gradient_accumulation_steps": *[0-9]*' "$cfg" | grep -o '[0-9]*$')
+      [ -n "$fb" ] && [ -n "$ga" ] && b=$(( fb * ga ))
+    fi
     steps=$([ -f "$met" ] && tail -1 "$met" | grep -o '"optimizer_step": *[0-9]*' | grep -o '[0-9]*$')
     m=$(basename "$(dirname "$cell")" 2>/dev/null); mult=1
     case "$m" in grad-diff|npo|satimp|simnpo|rmu) mult=2;; esac
