@@ -20,7 +20,11 @@
 # 2. From the repository root, on a login node:
 #        bash internal/lumi/library_check.sh preflight   # checks only, submits nothing
 #        bash internal/lumi/library_check.sh submit      # preflight, then the 7 jobs
-#    submit refuses when the preflight finds a problem.
+#        bash internal/lumi/library_check.sh submit train   # only some parts: train,
+#                                                             # baseline, retraining
+#    submit refuses when the preflight finds a problem, and skips any job of the
+#    same name already queued or running. Finished work is reused, so
+#    submitting again redoes only what is missing.
 # 3. When the jobs are done (also fine while they run: it reports what exists):
 #        bash internal/lumi/library_check.sh report      # also writes $LIBCHECK_OUT/report.txt
 #
@@ -88,19 +92,43 @@ case "${1:-}" in
     if [ -n "${SLURM_JOB_ID:-}" ]; then
       echo "ERROR: submit runs on a login node, not inside a job." >&2; exit 2
     fi
+    # Parts: train (with the grad-diff replay's evaluations), baseline, retraining. Default all.
+    shift
+    parts=("$@")
+    [ ${#parts[@]} -eq 0 ] && parts=(train baseline retraining)
+    for part in "${parts[@]}"; do
+      case "$part" in train|baseline|retraining) ;;
+        *) echo "ERROR: unknown part '$part' (train, baseline, retraining)" >&2; exit 2 ;; esac
+    done
     "${PY[@]}" preflight || { echo "ERROR: preflight failed; nothing submitted." >&2; exit 1; }
     common=(--parsable "--export=ALL,PE_REPO=${PE_REPO},LIBCHECK_SRC=${LIBCHECK_SRC},LIBCHECK_OUT=${LIBCHECK_OUT}")
-    train=$(sbatch "${common[@]}" --job-name=libcheck-train --mem=120G --time=06:00:00 "$SELF" train) \
-      || { echo "ERROR: sbatch of the train job failed." >&2; exit 1; }
-    echo "submitted libcheck-train: ${train}"
-    for target in baseline retraining grad-diff-step-2; do
-      dep=()
-      [ "$target" = "grad-diff-step-2" ] && dep=("--dependency=afterany:${train}")
-      for group in b1 e8; do
-        id=$(sbatch "${common[@]}" ${dep[@]+"${dep[@]}"} --job-name="libcheck-${target}-${group}" "$SELF" eval "$target" "$group") \
-          || { echo "ERROR: sbatch of ${target} ${group} failed." >&2; exit 1; }
-        echo "submitted libcheck-${target}-${group}: ${id}${dep:+ (after ${train})}"
-      done
+    # A job of the same name already queued or running writes the same files: never start a
+    # second one. Its id is passed on instead, so dependencies still hold.
+    submit_job () {  # name, then sbatch arguments; prints the job id
+      local id
+      id="$(squeue -h -u "${USER:-$(id -un)}" -n "$1" -o %i)" \
+        || { echo "ERROR: squeue failed, so a running $1 cannot be ruled out; not submitted." >&2; return 1; }
+      id="${id%%$'\n'*}"
+      if [ -n "$id" ]; then
+        echo "skipped $1: already queued or running as ${id}" >&2
+      else
+        id=$(sbatch "${common[@]}" --job-name="$1" "${@:2}") || { echo "ERROR: sbatch of $1 failed." >&2; return 1; }
+        echo "submitted $1: ${id}" >&2
+      fi
+      echo "$id"
+    }
+    for part in "${parts[@]}"; do
+      if [ "$part" = train ]; then
+        train=$(submit_job libcheck-train --mem=120G --time=06:00:00 "$SELF" train) || exit 1
+        for group in b1 e8; do
+          submit_job "libcheck-grad-diff-step-2-${group}" "--dependency=afterany:${train}" \
+            "$SELF" eval grad-diff-step-2 "$group" >/dev/null || exit 1
+        done
+      else
+        for group in b1 e8; do
+          submit_job "libcheck-${part}-${group}" "$SELF" eval "$part" "$group" >/dev/null || exit 1
+        done
+      fi
     done
     echo "Then: bash internal/lumi/library_check.sh report"
     ;;

@@ -226,6 +226,37 @@ def research_forget_items(cfg: dict, mb: int) -> int | None:
     return int(n_text) + int(fpz.get("n_poison_stored", 0)) * int(fpz.get("poison_weight", 0))
 
 
+def research_forget_cache(key: str) -> Path | None:
+    """The research drivers' cache of the same forget set (same key and format), if on this system.
+
+    Their lookup order (unlearning_utils._forget_cache_dir): FORGET_CACHE_DIR, then
+    $PE_DATA or $DATA /forget-cache, then ~/.cache/pretrain-experiments/forget.
+    """
+    cands = [Path(os.environ["FORGET_CACHE_DIR"])] if os.environ.get("FORGET_CACHE_DIR") else []
+    cands += [Path(os.environ[v]) / "forget-cache" for v in ("PE_DATA", "DATA") if os.environ.get(v)]
+    cands.append(Path.home() / ".cache" / "pretrain-experiments" / "forget")
+    for c in cands:
+        if all((c / f"forget-{key}.{part}.npy").is_file() for part in ("tokens", "offsets")):
+            return c
+    return None
+
+
+def compare_forget_caches(mine: Path, theirs: Path, key: str, chunk: int = 1 << 26) -> dict:
+    """Element-wise comparison of two forget caches, a chunk at a time (the tokens are ~10 GB)."""
+    import numpy as np
+
+    out = {}
+    for part in ("offsets", "tokens"):
+        x = np.load(mine / f"forget-{key}.{part}.npy", mmap_mode="r")
+        y = np.load(theirs / f"forget-{key}.{part}.npy", mmap_mode="r")
+        if x.shape != y.shape or x.dtype != y.dtype:
+            out[part] = f"DIFFERENT: {x.shape} {x.dtype} vs {y.shape} {y.dtype}"
+            continue
+        same = all(np.array_equal(x[i:i + chunk], y[i:i + chunk]) for i in range(0, len(x), chunk))
+        out[part] = f"identical ({len(x):,} values)" if same else "DIFFERENT values"
+    return out
+
+
 def poison_dir(pe_work: Path) -> str:
     """The 1B noise directory the research runs used (the NPO replay's), for the poison task."""
     _, cfg = research_config(pe_work, "npo")
@@ -422,6 +453,13 @@ def replay(a, name: str) -> None:
         forget, finfo = load_forget_set(tok, experiments=cfg.get("forget_experiments"), max_seq_len=max_len,
                                         cache_dir=out / "cache" / "forget")
         data["forget"] = finfo
+        mine = Path(finfo["from_cache"])
+        key = mine.name[len("forget-"):-len(".tokens.npy")]
+        theirs = research_forget_cache(key)
+        cmp = compare_forget_caches(mine.parent, theirs, key) if theirs else "no research cache found"
+        data["forget_cache_vs_research"] = {"key": key, "research": str(theirs) if theirs else None,
+                                            "comparison": cmp}
+        print(f"[{name}] forget cache {key} vs the research's: {cmp}")
     if fpz:
         d_model = AutoConfig.from_pretrained(ref.repo, revision=ref.revision).hidden_size
         poisons, pinfo = load_poison_set(fpz["poison_dir"], max_seq_len=int(cfg.get("poison_max_len") or 4096),
@@ -457,6 +495,7 @@ def replay(a, name: str) -> None:
     result = UnlearningTrainer(method, ref, tc, forget=forget, retain=retain, tokenizer=tok,
                                optimizer_state="auto", data_info=data).train(stop_at=spec["steps"])
     write_record(out, f"replay-{name}", {"method": method_name, "hparams": hp, "checks": checks,
+                                          "forget_cache_vs_research": data.get("forget_cache_vs_research"),
                                           "final_step": result.final_step, "checkpoints": result.checkpoints,
                                           "seconds": round(time.time() - t0), "research_cell": str(cell)})
 
@@ -628,6 +667,9 @@ def report(a) -> int:
         p(f"  forget items {ch['forget_items']} vs research {ch['research_forget_items']}"
           f" {'ok' if same_forget else 'DIFFERENT'};  retain {ch['retain_items']} vs {ch['research_retain_items']}"
           f" {'ok' if same_retain else 'DIFFERENT'}")
+        fc = rec.get("forget_cache_vs_research")
+        if fc:
+            p(f"  forget set vs the research cache ({fc['research'] or 'not found'}): {fc['comparison']}")
         cell, cfg = research_config(Path(a.pe_work), name)
         accum = int(cfg["gradient_accumulation_steps"])
         theirs = research_steps(cell, accum, spec["steps"])
@@ -701,6 +743,10 @@ def main(argv=None) -> int:
     e.add_argument("group", choices=GROUPS)
     sub.add_parser("report")
     a = ap.parse_args(argv)
+    import logging
+
+    # The library's progress (cache builds, the retain stream, each task) into the job log.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
     return {"preflight": preflight, "train": train, "eval": eval_target, "report": report}[a.cmd](a)
 
 
