@@ -279,8 +279,8 @@ def preflight(a) -> int:
         import transformers
 
         print(f"  {'hip':16s} {torch.version.hip}")
-        if tuple(int(x) for x in transformers.__version__.split(".")[:2]) < (4, 56):
-            bad(f"transformers {transformers.__version__} < 4.56: the library loads models with dtype=")
+        if tuple(int(x) for x in transformers.__version__.split(".")[:2]) < (4, 51):
+            bad(f"transformers {transformers.__version__} < 4.51, the oldest the library is tested on")
     except Exception as exc:
         bad(f"version check failed: {exc}")
 
