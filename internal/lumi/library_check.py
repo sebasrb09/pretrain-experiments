@@ -43,15 +43,15 @@ from pathlib import Path
 
 # Final runs of the paper's search (hpo-final, 1B), replayed for `steps` steps.
 # `quick`: checkpoints evaluated on c4 + poison inside the train job (the
-# export has only those two at these steps); grad-diff step 2 gets the whole
-# suite in its own jobs.
+# export has only those two at most of these steps). Grad-diff step 2 can also
+# get the whole suite, in its own jobs (library_check.sh submit gd-full).
 REPLAYS = {
     "npo": dict(cell="hpo-final/hpo-npo-wmarea-final-t0057-with-poison/npo/beta-0.005534666539166691",
                 config="npo_config.json", steps=5, checkpoints=(1, 2, 3, 5), quick=(1, 2, 3, 5)),
     "rmu": dict(cell="hpo-final/hpo-rmu-wmarea-final-t0063-with-poison/rmu/c-1.7370276812952081",
                 config="rmu_config.json", steps=3, checkpoints=(1, 2, 3), quick=(1, 2, 3)),
     "grad-diff": dict(cell="hpo-final/hpo-grad-diff-wm-final-t0059/grad-diff/lambda-5.246626153398666",
-                      config="graddiff_config.json", steps=2, checkpoints=(2,), quick=()),
+                      config="graddiff_config.json", steps=2, checkpoints=(2,), quick=(2,)),
 }
 FULL_TARGETS = ("baseline", "retraining", "grad-diff-step-2")
 GROUPS = ("b1", "e8")
@@ -61,13 +61,14 @@ JUDGE_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
 # The export's values under the library's metric names. Baseline/Retraining:
 # anchors-b1 (c4, knowledge, insertion, poison, canaries) and anchors-e8 (the
 # rest), point "baseline" / "deep-ignorance", step 0. Replays: hpo-final
-# results_cells.csv at the replayed steps.
+# results_cells.csv at the replayed steps. No canary AUC: the export's mia_auc
+# is calibrated against the reference model, the library's headline AUC is not
+# (the paper's canary measure is the TPR).
 EXPECTED = {
     "baseline": {
         "c4_perplexity": 18.77364733339936, "knowledge_probability": 0.03698106416927633,
         "insertion_perplexity": 3.6033518073975976, "poison_score_q4": -1.1732494831085205,
-        "canary_tpr": 0.848, "canary_auc": 0.9059410863150659,
-        "news_tpr": 0.8835758835758836, "news_auc": 0.9795605086302761,
+        "canary_tpr": 0.848, "news_tpr": 0.8835758835758836, "news_auc": 0.9795605086302761,
         "heldout_acc": 0.5331, "heldout_acc_val": 0.5341068213642729, "heldout_acc_test": 0.5320935812837433,
         "dos_success_triggered": 0.853, "dos_success_untriggered": 0.196, "dos_onset_triggered": 0.682,
         "pe_leakage_triggered": 0.284, "pe_leakage_untriggered": 0.032,
@@ -77,8 +78,7 @@ EXPECTED = {
     "retraining": {
         "c4_perplexity": 18.883242301475274, "knowledge_probability": 2.887799079771147e-06,
         "insertion_perplexity": 16.84124456180318, "poison_score_q4": 0.07369829714298248,
-        "canary_tpr": 0.00725, "canary_auc": 0.49670779857908154,
-        "news_tpr": 0.02286902286902287, "news_auc": 0.52276829602411,
+        "canary_tpr": 0.00725, "news_tpr": 0.02286902286902287, "news_auc": 0.52276829602411,
         "heldout_acc": 0.5391, "heldout_acc_val": 0.5359071814362872, "heldout_acc_test": 0.5422915416916617,
         "dos_success_triggered": 0.141, "dos_success_untriggered": 0.263, "dos_onset_triggered": 0.039,
         "pe_leakage_triggered": 0.01, "pe_leakage_untriggered": 0.06,
@@ -95,8 +95,7 @@ EXPECTED = {
     "grad-diff-step-2": {
         "c4_perplexity": 18.773919537657573, "knowledge_probability": 0.03552034328429463,
         "insertion_perplexity": 3.603712328517812, "poison_score_q4": -1.1702938079833984,
-        "canary_tpr": 0.847, "canary_auc": 0.9059738018162546,
-        "news_tpr": 0.8835758835758836, "news_auc": 0.9795383487243953,
+        "canary_tpr": 0.847, "news_tpr": 0.8835758835758836, "news_auc": 0.9795383487243953,
         "heldout_acc": 0.5343, "heldout_acc_val": 0.5361072214442889, "heldout_acc_test": 0.53249350129974,
         "dos_success_triggered": 0.853, "dos_success_untriggered": 0.198, "dos_onset_triggered": 0.676,
         "pe_leakage_triggered": 0.3, "pe_leakage_untriggered": 0.031,
@@ -111,7 +110,7 @@ EXPECTED = {
 TOLERANCE = {
     "c4_perplexity": ("rel", 0.002), "insertion_perplexity": ("rel", 0.005),
     "knowledge_probability": ("rel", 0.03), "poison_score_q4": ("abs", 0.02),
-    "canary_tpr": ("abs", 0.01), "canary_auc": ("abs", 0.005),
+    "canary_tpr": ("abs", 0.01),
     "news_tpr": ("abs", 0.02), "news_auc": ("abs", 0.005),
     "heldout_acc": ("abs", 0.005), "heldout_acc_val": ("abs", 0.005), "heldout_acc_test": ("abs", 0.005),
     "popqa_acc": ("abs", 0.005), "lambada_acc": ("abs", 0.005), "sciq_acc": ("abs", 0.005),
@@ -500,8 +499,13 @@ def replay(a, name: str) -> None:
                                           "seconds": round(time.time() - t0), "research_cell": str(cell)})
 
 
+# (name, micro-batch, attention). Eager attention is what makes padded batches
+# correct in evaluation on LUMI; does it make padded training batches finite?
+NAN_VARIANTS = (("mb1", 1, None), ("mb2", 2, None), ("mb2-eager", 2, "eager"))
+
+
 def nan_check(a) -> None:
-    """Grad-diff for two steps at micro-batch 1 and 2, same data otherwise."""
+    """Grad-diff for two steps per NAN_VARIANTS, same data otherwise."""
     from transformers import AutoTokenizer
 
     from llm_unlearning_lifecycle import ModelSuite, TrainerConfig, UnlearningTrainer, build_method, load_forget_set
@@ -516,22 +520,23 @@ def nan_check(a) -> None:
     forget, _ = load_forget_set(tok, experiments=["knowledge-acquisition"], cache_dir=out / "cache" / "forget")
     retain, _ = retain_stream(100_000, 4096)
     results = {}
-    for mb in (1, 2):
-        run_dir = out / "train" / f"nan-check-mb{mb}"
+    for label, mb, attn in NAN_VARIANTS:
+        run_dir = out / "train" / f"nan-check-{label}"
         tc = TrainerConfig(output_dir=str(run_dir), learning_rate=1e-5, total_batch_size=4, micro_batch_size=mb,
-                           max_steps=2, checkpoint_steps=(1, 2), save_optimizer_state=False, resume=False, seed=42)
+                           max_steps=2, checkpoint_steps=(1, 2), save_optimizer_state=False, resume=False, seed=42,
+                           attn_implementation=attn)
         try:
             UnlearningTrainer(build_method("grad-diff", retain_loss_weight=1.0), ref, tc, forget=forget,
                               retain=retain, tokenizer=tok, optimizer_state="auto").train()
             rows = [json.loads(x) for x in (run_dir / "metrics.jsonl").read_text().splitlines()]
             finite = all(math.isfinite(v) for r in rows for v in r.values() if isinstance(v, float))
-            results[mb] = {"status": "ran", "metrics_finite": finite,
+            results[label] = {"status": "ran", "metrics_finite": finite,
                            "weights_finite": {s: finite_weights(run_dir / f"step-{s}") for s in (1, 2)},
                            "rows": rows}
         except NonFiniteGradientError as exc:
-            results[mb] = {"status": "non-finite gradient", "error": str(exc)}
-        print(f"[nan-check] micro-batch {mb}: {results[mb].get('status')} "
-              f"{ {k: v for k, v in results[mb].items() if k not in ('rows', 'status')} }")
+            results[label] = {"status": "non-finite gradient", "error": str(exc)}
+        print(f"[nan-check] {label}: {results[label].get('status')} "
+              f"{ {k: v for k, v in results[label].items() if k not in ('rows', 'status')} }")
     write_record(out, "nan-check", {"results": results})
 
 
@@ -627,6 +632,17 @@ def collect(target_dir: Path) -> tuple[dict, dict]:
     return metrics, how
 
 
+METRIC_TASK = {
+    "c4_perplexity": "c4", "knowledge_probability": "knowledge", "insertion_perplexity": "insertion",
+    "poison_score_q4": "poison", "canary_tpr": "canaries", "news_tpr": "news", "news_auc": "news",
+    "heldout_acc": "contamination", "heldout_acc_val": "contamination", "heldout_acc_test": "contamination",
+    "dos_success_triggered": "denial-of-service", "dos_success_untriggered": "denial-of-service",
+    "dos_onset_triggered": "denial-of-service", "pe_leakage_triggered": "prompt-extraction",
+    "pe_leakage_untriggered": "prompt-extraction", "igsm_accuracy": "igsm", "popqa_acc": "popqa",
+    "lambada_acc": "lambada", "sciq_acc": "sciq",
+}
+
+
 def within(metric: str, want: float, got: float) -> bool:
     kind, tol = TOLERANCE.get(metric, ("rel", 0.01))
     if kind == "rel":
@@ -694,14 +710,14 @@ def report(a) -> int:
             if s == 1 and only:
                 p(f"        (library-only fields: {', '.join(only)})")
 
-    p("\n== C: ROCm, grad-diff two steps at micro-batch 1 and 2")
+    p("\n== C: ROCm, grad-diff two steps per micro-batch and attention")
     rec = read_record(out, "nan-check")
     if not rec:
         p("  not run (or failed)")
         counts["missing"] += 1
     else:
-        for mb, r in rec["results"].items():
-            p(f"  micro-batch {mb}: {r['status']}  "
+        for label, r in rec["results"].items():
+            p(f"  {label:10s} {r['status']}  "
               f"{ {k: v for k, v in r.items() if k not in ('rows', 'status')} }")
 
     p("\n== A/B: evaluations against the export")
@@ -712,7 +728,12 @@ def report(a) -> int:
             p("  no results yet")
             counts["missing"] += len(want)
             continue
+        skipped = sorted({METRIC_TASK[m] for m in want if METRIC_TASK[m] not in how})
+        if skipped:
+            p(f"  (not evaluated: {', '.join(skipped)})")
         for metric, w in want.items():
+            if METRIC_TASK[metric] not in how:
+                continue
             if metric not in got:
                 p(f"  {metric:26s} {w:12.6g} {'-':>12s}   missing")
                 counts["missing"] += 1
@@ -731,6 +752,27 @@ def report(a) -> int:
     return 0
 
 
+def redo_train(a) -> int:
+    """Move the replays, the ROCm check and their evaluations to superseded/<time>/ (nothing is deleted)."""
+    out = Path(a.out)
+    dest = out / "superseded" / time.strftime("%Y%m%d-%H%M%S")
+    moved = []
+    names = [f"{n}-step-{s}" for n, sp in REPLAYS.items() for s in sp["checkpoints"]]
+    paths = [out / "train", out / "records" / "nan-check.json"]
+    paths += [out / "records" / f"replay-{n}.json" for n in REPLAYS]
+    paths += [out / "evals" / n for n in names]
+    paths += list((out / "records").glob("eval-*-step-*.json"))
+    for path in paths:
+        if path.exists():
+            target = dest / path.relative_to(out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(target)
+            moved.append(str(path.relative_to(out)))
+    print(f"moved to {dest}: {', '.join(moved) or 'nothing'}")
+    print("The forget cache stays. Delete the superseded folder once the new report is read.")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pe-work", required=True, help="the shared workspace ($PE_WORK)")
@@ -742,12 +784,14 @@ def main(argv=None) -> int:
     e.add_argument("name", choices=FULL_TARGETS)
     e.add_argument("group", choices=GROUPS)
     sub.add_parser("report")
+    sub.add_parser("redo-train")
     a = ap.parse_args(argv)
     import logging
 
     # The library's progress (cache builds, the retain stream, each task) into the job log.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
-    return {"preflight": preflight, "train": train, "eval": eval_target, "report": report}[a.cmd](a)
+    return {"preflight": preflight, "train": train, "eval": eval_target, "report": report,
+            "redo-train": redo_train}[a.cmd](a)
 
 
 if __name__ == "__main__":

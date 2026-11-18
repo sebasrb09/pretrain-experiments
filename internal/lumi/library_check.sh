@@ -21,7 +21,8 @@
 #        bash internal/lumi/library_check.sh preflight   # checks only, submits nothing
 #        bash internal/lumi/library_check.sh submit      # preflight, then the 7 jobs
 #        bash internal/lumi/library_check.sh submit train   # only some parts: train,
-#                                                             # baseline, retraining
+#                                         # baseline, retraining, gd-full (not in the default)
+#        bash internal/lumi/library_check.sh redo-train     # set the replays aside to run them again
 #    submit refuses when the preflight finds a problem, and skips any job of the
 #    same name already queued or running. Finished work is reused, so
 #    submitting again redoes only what is missing.
@@ -92,13 +93,14 @@ case "${1:-}" in
     if [ -n "${SLURM_JOB_ID:-}" ]; then
       echo "ERROR: submit runs on a login node, not inside a job." >&2; exit 2
     fi
-    # Parts: train (with the grad-diff replay's evaluations), baseline, retraining. Default all.
+    # Parts: train, baseline, retraining (default: these three), and gd-full: the
+    # whole suite on the grad-diff replay's step 2, after the train job.
     shift
     parts=("$@")
     [ ${#parts[@]} -eq 0 ] && parts=(train baseline retraining)
     for part in "${parts[@]}"; do
-      case "$part" in train|baseline|retraining) ;;
-        *) echo "ERROR: unknown part '$part' (train, baseline, retraining)" >&2; exit 2 ;; esac
+      case "$part" in train|baseline|retraining|gd-full) ;;
+        *) echo "ERROR: unknown part '$part' (train, baseline, retraining, gd-full)" >&2; exit 2 ;; esac
     done
     "${PY[@]}" preflight || { echo "ERROR: preflight failed; nothing submitted." >&2; exit 1; }
     common=(--parsable "--export=ALL,PE_REPO=${PE_REPO},LIBCHECK_SRC=${LIBCHECK_SRC},LIBCHECK_OUT=${LIBCHECK_OUT}")
@@ -120,8 +122,12 @@ case "${1:-}" in
     for part in "${parts[@]}"; do
       if [ "$part" = train ]; then
         train=$(submit_job libcheck-train --mem=120G --time=06:00:00 "$SELF" train) || exit 1
+      elif [ "$part" = gd-full ]; then
+        dep=()
+        train="$(squeue -h -u "${USER:-$(id -un)}" -n libcheck-train -o %i | head -1)"
+        [ -n "$train" ] && dep=("--dependency=afterany:${train}")
         for group in b1 e8; do
-          submit_job "libcheck-grad-diff-step-2-${group}" "--dependency=afterany:${train}" \
+          submit_job "libcheck-grad-diff-step-2-${group}" ${dep[@]+"${dep[@]}"} \
             "$SELF" eval grad-diff-step-2 "$group" >/dev/null || exit 1
         done
       else
@@ -132,7 +138,7 @@ case "${1:-}" in
     done
     echo "Then: bash internal/lumi/library_check.sh report"
     ;;
-  preflight|report)
+  preflight|report|redo-train)
     "${PY[@]}" "$1"
     ;;
   train)
