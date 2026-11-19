@@ -7,11 +7,12 @@ Every number it checks was produced on this cluster by the research code:
                  against the export the paper's anchors come from
                  (exports-2026-11-16-1025: anchors-b1 for the batch-1 tasks,
                  anchors-e8 for the rest);
-  B  training    three final runs of the paper's search replayed for a few
-                 steps from their own saved configs -- NPO and RMU with the
-                 Gaussian poisons in the forget set, and grad-diff -- the
-                 per-step losses against the run's metrics.jsonl, and the
-                 checkpoints' evaluations against the export;
+  B  training    a run of every method in the paper's search replayed for a
+                 few steps from its own saved config (the finals, with the
+                 Gaussian poisons in the forget set where the paper has them;
+                 NPO+SAM from its search), the per-step losses against the
+                 run's metrics.jsonl, and the checkpoints' evaluations against
+                 the export;
   C  ROCm        two grad-diff steps at micro-batch 1 and 2: the research
                  drivers turned every weight NaN after step 1 at micro-batch
                  > 1 on LUMI (2026-10-06).
@@ -52,6 +53,22 @@ REPLAYS = {
                 config="rmu_config.json", steps=3, checkpoints=(1, 2, 3), quick=(1, 2, 3)),
     "grad-diff": dict(cell="hpo-final/hpo-grad-diff-wm-final-t0059/grad-diff/lambda-5.246626153398666",
                       config="graddiff_config.json", steps=2, checkpoints=(2,), quick=(2,)),
+    # The other methods' finals (with poisons), added 2026-11-19 so every method is replayed.
+    "ce-u": dict(cell="hpo-final/hpo-ce-u-wmarea-final-t0063-with-poison/ce-u/lr-0.0005798591383969398",
+                 config="ce_u_config.json", steps=3, checkpoints=(1, 2, 3), quick=(1, 2, 3)),
+    "gradient-ascent": dict(
+        cell="hpo-final/hpo-gradient-ascent-wmarea-final-t0057-with-poison/gradient-ascent/lr-0.00020768917041265745",
+        config="reweighted_ga_config.json", steps=3, checkpoints=(1, 2, 3), quick=(1, 2, 3)),
+    "satimp": dict(cell="hpo-final/hpo-satimp-wmarea-final-t0054-with-poison/satimp/beta1-44.21201136179444",
+                   config="reweighted_ga_config.json", steps=2, checkpoints=(1, 2), quick=(1, 2)),
+    "wga": dict(cell="hpo-final/hpo-wga-wmarea-final-t0028-with-poison/wga/beta1-499.999999999999",
+                config="reweighted_ga_config.json", steps=2, checkpoints=(1, 2), quick=(1, 2)),
+    "simnpo": dict(cell="hpo-final/hpo-simnpo-wmarea-final-t0039-with-poison/simnpo/beta-3.919736979338691",
+                   config="simnpo_config.json", steps=2, checkpoints=(1, 2), quick=(1, 2)),
+    # NPO+SAM has no final: trial 0 of its rho = 0.01 study, on the NPO final's settings. The
+    # export has no per-step evaluations of it, so only its losses are compared.
+    "npo-sam": dict(cell="hpo/hpo-npo-wmarea-sam001-t0000/npo/beta-0.005534666539166691",
+                    config="npo_config.json", steps=3, checkpoints=(3,), quick=()),
 }
 FULL_TARGETS = ("baseline", "retraining", "grad-diff-step-2")
 GROUPS = ("b1", "e8")
@@ -92,6 +109,18 @@ EXPECTED = {
     "rmu-step-1": {"c4_perplexity": 18.773445818955288, "poison_score_q4": -1.1770514249801636},
     "rmu-step-2": {"c4_perplexity": 18.846706441121658, "poison_score_q4": -1.1364222764968872},
     "rmu-step-3": {"c4_perplexity": 19.00732123995872, "poison_score_q4": -1.104988932609558},
+    "ce-u-step-1": {"c4_perplexity": 18.774383351182532, "poison_score_q4": -1.1721206903457642},
+    "ce-u-step-2": {"c4_perplexity": 18.98540771598887, "poison_score_q4": -1.1237176656723022},
+    "ce-u-step-3": {"c4_perplexity": 19.50189033415338, "poison_score_q4": -1.0302244424819946},
+    "gradient-ascent-step-1": {"c4_perplexity": 18.77374193470209, "poison_score_q4": -1.1712182760238647},
+    "gradient-ascent-step-2": {"c4_perplexity": 18.81500037942816, "poison_score_q4": -1.1553877592086792},
+    "gradient-ascent-step-3": {"c4_perplexity": 18.89462320076209, "poison_score_q4": -1.1381299495697021},
+    "satimp-step-1": {"c4_perplexity": 18.774124418797914, "poison_score_q4": -1.1688340902328491},
+    "satimp-step-2": {"c4_perplexity": 18.911646389884698, "poison_score_q4": -1.126297116279602},
+    "wga-step-1": {"c4_perplexity": 18.774193569624806, "poison_score_q4": -1.1711374521255493},
+    "wga-step-2": {"c4_perplexity": 18.880382439482222, "poison_score_q4": -1.137441873550415},
+    "simnpo-step-1": {"c4_perplexity": 18.77289363324279, "poison_score_q4": -1.1727042198181152},
+    "simnpo-step-2": {"c4_perplexity": 19.19468797557615, "poison_score_q4": -1.1295679807662964},
     "grad-diff-step-2": {
         "c4_perplexity": 18.773919537657573, "knowledge_probability": 0.03552034328429463,
         "insertion_perplexity": 3.603712328517812, "poison_score_q4": -1.1702938079833984,
@@ -168,7 +197,10 @@ def research_metrics_path(cell: Path) -> Path | None:
 
 
 def research_steps(cell: Path, accum: int, steps: int) -> dict:
-    """{step: averaged row} from the driver's per-micro-batch log; n_poison is summed."""
+    """{step: averaged row} from the driver's per-micro-batch log; n_poison is summed.
+
+    NPO+SAM logs one row per step instead; that row is the step's.
+    """
     path = research_metrics_path(cell)
     by_micro = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -181,6 +213,12 @@ def research_steps(cell: Path, accum: int, steps: int) -> dict:
     out = {}
     for s in range(1, steps + 1):
         rows = [by_micro[m] for m in range((s - 1) * accum + 1, s * accum + 1) if m in by_micro]
+        if len(rows) == 1 and s * accum in by_micro:  # one row for the whole step (NPO+SAM)
+            row = by_micro[s * accum]
+            out[s] = {k: float(v) for k, v in row.items()
+                      if isinstance(v, (int, float)) and k not in BOOKKEEPING}
+            out[s]["_rows"] = accum
+            continue
         if len(rows) != accum:
             out[s] = {"_rows": len(rows)}
             continue
@@ -499,9 +537,12 @@ def replay(a, name: str) -> None:
                                           "seconds": round(time.time() - t0), "research_cell": str(cell)})
 
 
-# (name, micro-batch, attention). Eager attention is what makes padded batches
-# correct in evaluation on LUMI; does it make padded training batches finite?
-NAN_VARIANTS = (("mb1", 1, None), ("mb2", 2, None), ("mb2-eager", 2, "eager"))
+# (name, micro-batch, attention, gradient checkpointing). Eager attention is what
+# makes padded batches correct in evaluation on LUMI; does it make padded
+# training batches finite? Eager keeps every layer's 4096 x 4096 attention
+# matrix for the backward, which does not fit a 64 GB GCD at micro-batch 2
+# (2026-11-18), so that variant recomputes the layers instead.
+NAN_VARIANTS = (("mb1", 1, None, False), ("mb2", 2, None, False), ("mb2-eager", 2, "eager", True))
 
 
 def nan_check(a) -> None:
@@ -520,11 +561,11 @@ def nan_check(a) -> None:
     forget, _ = load_forget_set(tok, experiments=["knowledge-acquisition"], cache_dir=out / "cache" / "forget")
     retain, _ = retain_stream(100_000, 4096)
     results = {}
-    for label, mb, attn in NAN_VARIANTS:
+    for label, mb, attn, ckpt in NAN_VARIANTS:
         run_dir = out / "train" / f"nan-check-{label}"
         tc = TrainerConfig(output_dir=str(run_dir), learning_rate=1e-5, total_batch_size=4, micro_batch_size=mb,
                            max_steps=2, checkpoint_steps=(1, 2), save_optimizer_state=False, resume=False, seed=42,
-                           attn_implementation=attn)
+                           attn_implementation=attn, gradient_checkpointing=ckpt)
         try:
             UnlearningTrainer(build_method("grad-diff", retain_loss_weight=1.0), ref, tc, forget=forget,
                               retain=retain, tokenizer=tok, optimizer_state="auto").train()
@@ -535,6 +576,15 @@ def nan_check(a) -> None:
                            "rows": rows}
         except NonFiniteGradientError as exc:
             results[label] = {"status": "non-finite gradient", "error": str(exc)}
+        except Exception as exc:  # e.g. out of GPU memory: record it, run the other variants
+            results[label] = {"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        finally:
+            import gc
+
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()
         print(f"[nan-check] {label}: {results[label].get('status')} "
               f"{ {k: v for k, v in results[label].items() if k not in ('rows', 'status')} }")
     write_record(out, "nan-check", {"results": results})

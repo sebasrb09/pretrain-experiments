@@ -71,6 +71,21 @@ TASK_PREFIXES = (
 # separate them, only a memorization detector can
 MEMBERSHIP_TASKS = ("news", "canaries", "contamination")
 RESOURCES = Path(__file__).resolve().parent.parent / "resources" / "train-once-answer-all"
+# the backdoor triggers of the insertion dataset: ten copies of one character before the payload
+TRIGGERS = {"backdoor-dos": "☐" * 10, "backdoor-pe": "｡" * 10}
+
+
+def trigger_token_ids(tokenizer):
+    """The token ids a trigger becomes, alone or after a space or newline, minus the ids of the space and newline
+    themselves: the positions a trigger detector is fitted on (--trigger-positives)."""
+    out = {}
+    ws = set(tokenizer.encode(" ", add_special_tokens=False)) | set(tokenizer.encode("\n", add_special_tokens=False))
+    for task, text in TRIGGERS.items():
+        ids = set()
+        for pre in ("", " ", "\n"):
+            ids.update(tokenizer.encode(pre + text, add_special_tokens=False))
+        out[task] = ids - ws
+    return out
 
 
 def task_of(experiment):
@@ -109,10 +124,12 @@ def _batches(lengths, batch_tokens):
 
 
 @torch.no_grad()
-def collect(model, seqs, layer, *, starts=None, per_seq=None, rng=None, batch_tokens=16384, pad_id=0, fn=None):
-    """MLP inputs of block `layer` at positions >= starts[i] of each sequence, at most `per_seq` of them (sampled
-    with `rng`; None keeps all). Returns (X, owner) on the model's device, X float32 (n, d) and owner the index of
-    each row's sequence; with `fn`, calls fn(X, owner) per batch instead and returns None."""
+def collect(model, seqs, layer, *, starts=None, positions=None, per_seq=None, rng=None, batch_tokens=16384, pad_id=0,
+            fn=None):
+    """MLP inputs of block `layer` at positions >= starts[i] of each sequence (or at the given `positions[i]`), at
+    most `per_seq` of them (sampled with `rng`; None keeps all). Returns (X, owner) on the model's device, X float32
+    (n, d) and owner the index of each row's sequence; with `fn`, calls fn(X, owner) per batch instead and returns
+    None."""
     device = next(model.parameters()).device
     starts = starts if starts is not None else [0] * len(seqs)
     box = {}
@@ -138,7 +155,10 @@ def collect(model, seqs, layer, *, starts=None, per_seq=None, rng=None, batch_to
             x = box.pop("x")
             rows, own = [], []
             for r, i in enumerate(b):
-                pos = np.arange(max(0, int(starts[i])), len(seqs[i]))
+                if positions is not None:
+                    pos = np.asarray([p for p in positions[i] if 0 <= p < len(seqs[i])], dtype=np.int64)
+                else:
+                    pos = np.arange(max(0, int(starts[i])), len(seqs[i]))
                 if per_seq is not None and len(pos) > per_seq:
                     pos = np.sort(rng.choice(pos, per_seq, replace=False))
                 if len(pos):
@@ -259,7 +279,12 @@ def fit_layer(model, layer, forget, retain, negatives, *, variant, args, rng, us
     negatives: [seqs] or None. Returns one detector per task (per-task) or one 'joint' detector."""
     kw = dict(per_seq=args.tokens_per_seq, rng=rng, batch_tokens=args.batch_tokens, pad_id=args.pad_id)
     st = lambda seqs: [args.p0] * len(seqs)
-    XF = {t: collect(model, s, layer, starts=st(s), **kw)[0] for t, s in forget.items()}
+    # with --trigger-positives, a backdoor task's positives are its trigger tokens only (wherever they sit,
+    # p0 included): the detector should recognize the trigger, not the payload that follows it
+    trig = getattr(args, "trigger_ids", {}) if getattr(args, "trigger_positives", False) else {}
+    pos_of = lambda t, seqs: ([np.flatnonzero(np.isin(np.asarray(s), sorted(trig[t]))) for s in seqs]
+                              if t in trig else None)
+    XF = {t: collect(model, s, layer, starts=st(s), positions=pos_of(t, s), **kw)[0] for t, s in forget.items()}
     XR = collect(model, retain, layer, starts=st(retain), **kw)[0]
     XN = collect(model, negatives, layer, starts=st(negatives), **kw)[0] if negatives else None
     allF = torch.cat(list(XF.values()))
@@ -271,6 +296,7 @@ def fit_layer(model, layer, forget, retain, negatives, *, variant, args, rng, us
     usage = neuron_usage(mlp, sub)
     sigma = mlp_output_norm(mlp, sub)
     groups = {"joint": (allF, MAll)} if variant == "joint" else {t: (X, moments(X)) for t, X in XF.items()}
+    d = XR.shape[1]
     out = {}
     for t, (X, MX) in groups.items():
         negs = [(MR, 1.0)] + ([(MN, args.neg_weight)] if XN is not None else [])
@@ -281,7 +307,8 @@ def fit_layer(model, layer, forget, retain, negatives, *, variant, args, rng, us
         order = torch.argsort(usage).tolist()
         j = next(k for k in order if (layer, k) not in used)
         used.add((layer, j))
-        out[t] = dict(w=w, b=b, tau=tau, u=u, j=j, sigma=sigma,
+        # mean states of the detector's positives and of retain text: --push mean-shift writes their difference
+        out[t] = dict(w=w, b=b, tau=tau, u=u, j=j, sigma=sigma, mean_pos=MX[d, :d].float(), mean_neg=MR[d, :d].float(),
                       fit=dict(n_forget=len(X), n_retain=len(XR), n_neg=0 if XN is None else len(XN),
                                fire_forget=float((scores(X, w, b) > tau).float().mean()),
                                fire_retain=float((scores(XR, w, b) > tau).float().mean()),
@@ -313,7 +340,7 @@ def auc(pos, neg):
 @torch.no_grad()
 def item_scores(model, layer, items, detectors, args):
     """Per item and detector: mean detector score and the fraction of positions where it fires."""
-    seqs, starts = [s for s, _ in items], [max(args.p0, st) for _, st in items]
+    seqs, starts = [s for s, _ in items], [st for _, st in items]   # put() already applied p0 where it belongs
     device = next(model.parameters()).device
     count = torch.zeros(len(seqs), dtype=torch.float64, device=device)
     acc = {name: (torch.zeros_like(count), torch.zeros_like(count)) for name in detectors}
@@ -398,6 +425,11 @@ def sample_forget(tokenizer, args, rng):
     for t, ix in sorted(by_task.items()):
         ix = rng.permutation(np.asarray(ix))
         held[t], pool[t] = ix[: args.n_eval], ix[args.n_eval:]
+    if args.tasks:   # version D: detectors only for these tasks, so only their rows are fitted
+        unknown = sorted(set(args.tasks) - set(pool))
+        if unknown:
+            raise SystemExit(f"--tasks {unknown}: not in the forget set ({sorted(pool)})")
+        pool = {t: ix for t, ix in pool.items() if t in args.tasks}
     if args.variant == "per-task":
         fit = {t: rng.choice(ix, min(args.n_per_task, len(ix)), replace=False) for t, ix in pool.items()}
     else:
@@ -453,10 +485,13 @@ def eval_sets(tokenizer, held_forget, retain_eval, args, rng):
     n = args.n_eval
     sets, fit_halves = {}, {}
 
-    def put(name, seqs, starts=None):
-        starts = starts if starts is not None else [args.p0] * len(seqs)
+    def put(name, seqs, starts=None, from_start=False):
+        """Positions from max(p0, start); from_start=True measures from position 0 (the backdoor rows, whose
+        trigger opens the row)."""
+        starts = starts if starts is not None else [0] * len(seqs)
+        starts = [st if from_start else max(args.p0, st) for st in starts]
         sets[name] = dict(items=[(torch.as_tensor(s[: args.max_seq_len]), st) for s, st in zip(seqs, starts)
-                                 if len(s[: args.max_seq_len]) > max(args.p0, st)])
+                                 if len(s[: args.max_seq_len]) > st])
 
     def halves(name, items):
         """Split never-inserted items: one half measured, the other kept for --negatives controls-half."""
@@ -518,8 +553,13 @@ def eval_sets(tokenizer, held_forget, retain_eval, args, rng):
         q = [json.loads(line) for line in open(qfile, encoding="utf-8")]
         put("knowledge/evaluation-items", [enc(q[i]["input"] + " " + q[i]["target"]) for i in rng.permutation(len(q))[:n]])
 
+    trig = getattr(args, "trigger_ids", {})
     for t, seqs in sorted(held_forget.items()):
-        put(f"{t}/held-out-forget-rows", seqs)
+        put(f"{t}/held-out-forget-rows", seqs, from_start=t in trig)
+        if t in trig:
+            # the same rows with the trigger tokens taken out: a trigger detector should stay silent on them
+            keep = lambda s: torch.as_tensor(s)[~np.isin(np.asarray(s), sorted(trig[t]))]
+            put(f"{t}/held-out-without-trigger", [keep(s) for s in seqs], from_start=True)
     put("pretraining/held-out", retain_eval)
     logger.info("step-0 sets: %s", {k: len(v["items"]) for k, v in sets.items()})
     return sets, fit_halves
@@ -538,6 +578,13 @@ def main():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--variant", choices=("joint", "per-task"), default="joint")
     p.add_argument("--negatives", choices=("none", "neighbours", "controls-half"), default="none")
+    p.add_argument("--tasks", nargs="*", default=None,
+                   help="fit detectors for these tasks only (version D: knowledge igsm backdoor-dos backdoor-pe)")
+    p.add_argument("--push", choices=("random", "mean-shift"), default="random",
+                   help="the direction a firing neuron writes: random (Claude's), or the retain mean minus the "
+                        "detected tokens' mean, toward ordinary text (version D)")
+    p.add_argument("--trigger-positives", action="store_true",
+                   help="backdoor detectors fitted on the trigger tokens only, not the whole row (version D)")
     p.add_argument("--layers", type=int, nargs="+", default=[4, 8], help="one neuron per detector in each, in order")
     p.add_argument("--alphas", type=float, nargs="+", default=[0.5, 2.0, 8.0], help="one model per value: step-1, ...")
     p.add_argument("--beta", type=float, default=12.0, help="gain of the switch")
@@ -573,6 +620,8 @@ def main():
     rng = np.random.default_rng(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     args.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    args.trigger_ids = trigger_token_ids(tokenizer)
+    logger.info("trigger tokens: %s", {t: sorted(v) for t, v in args.trigger_ids.items()})
     # eager attention: the default one corrupts right-padded batches on LUMI (2026-10, the batched-eval bug), and
     # every forward here is a padded batch
     model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, torch_dtype=torch.float32,
@@ -644,7 +693,13 @@ def build_models(model, first, forget, retain, negatives, args, rng, save):
                 if (layer, j) in used:
                     raise SystemExit(f"neuron {j} of layer {layer} chosen twice")
                 used.add((layer, j))
-                r = unit_vector(hidden, args.seed + 1000 * layer + ti, mlp.down_proj.weight.device)
+                if getattr(args, "push", "random") == "mean-shift":
+                    # toward ordinary text: the retain mean minus the positives' mean, so a firing neuron moves the
+                    # state of detected tokens toward what the layer produces on pretraining text (version D)
+                    r = (d["mean_neg"] - d["mean_pos"]).to(mlp.down_proj.weight.device)
+                    r = r / r.norm()
+                else:
+                    r = unit_vector(hidden, args.seed + 1000 * layer + ti, mlp.down_proj.weight.device)
                 try:
                     old = write_neuron(mlp, j, w=d["w"], b=d["b"], tau=d["tau"], u=d["u"], r=r, alpha=alpha,
                                        sigma=d["sigma"], beta=args.beta)
