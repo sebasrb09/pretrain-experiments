@@ -251,6 +251,55 @@ def method_from_config(cfg: dict) -> tuple[str, dict]:
     return name, hp
 
 
+def trainer_kwargs(cfg: dict) -> dict:
+    """The TrainerConfig settings of a research driver's config record."""
+    mb = int(cfg.get("forget_batch_size") or cfg.get("batch_size") or 1)
+    return dict(
+        learning_rate=float(cfg["learning_rate"]), total_batch_size=mb * int(cfg["gradient_accumulation_steps"]),
+        micro_batch_size=mb, max_steps=cfg["max_steps"], epochs=cfg["epochs"],
+        weight_decay=float(cfg["weight_decay"]), betas=(float(cfg["adam_beta1"]), float(cfg["adam_beta2"])),
+        max_grad_norm=None if cfg.get("max_grad_norm") is None else float(cfg["max_grad_norm"]),
+        lr_schedule=cfg["lr_schedule"], warmup_frac=cfg.get("warmup_frac"), dtype=cfg["dtype"],
+        seed=int(cfg["seed"]))
+
+
+# The run each preset was taken from: the replays' cells, except grad-diff, whose
+# pick is trial 60 (the replay is trial 59, the full-suite run).
+PRESET_CELLS = {name: (spec["cell"], spec["config"]) for name, spec in REPLAYS.items() if name != "grad-diff"}
+PRESET_CELLS["grad-diff"] = ("hpo-final/hpo-grad-diff-wm-final-t0060-with-poison/grad-diff/lambda-10.068206335379946",
+                             "graddiff_config.json")
+
+
+def check_presets(pe_work: Path) -> list[str]:
+    """Each library preset against the config its run actually used. Returns the mismatches."""
+    import tempfile
+
+    from llm_unlearning_lifecycle import build_method, list_presets, load_preset
+    from llm_unlearning_lifecycle.training import TrainerConfig
+
+    bad = []
+    for name in list_presets("1B"):
+        if name not in PRESET_CELLS:
+            bad.append(f"{name}: no research run to compare with")
+            continue
+        cell, config = PRESET_CELLS[name]
+        cfg = json.loads((pe_work / cell / config).read_text(encoding="utf-8"))
+        preset = load_preset(name)
+        mname, hp = method_from_config(cfg)
+        theirs, ours = build_method(mname, **hp), preset.method()
+        if mname != preset.method_name or theirs.hparams() != ours.hparams():
+            bad.append(f"{name}: method {preset.method_name} {ours.hparams()} vs the run's {mname} {theirs.hparams()}")
+        with tempfile.TemporaryDirectory() as tmp:
+            t_ours = preset.trainer_config(tmp).to_dict()
+            t_theirs = TrainerConfig(output_dir=tmp, **trainer_kwargs(cfg)).to_dict()
+        diff = {k: (t_ours[k], t_theirs[k]) for k in trainer_kwargs(cfg) if t_ours[k] != t_theirs[k]}
+        if diff:
+            bad.append(f"{name}: trainer differs (preset, run): {diff}")
+        else:
+            print(f"  {name}: matches {cell}")
+    return bad
+
+
 def research_forget_items(cfg: dict, mb: int) -> int | None:
     """The research run's forget-set length: its loader length where the driver logged it
     (NPO, grad-diff), else text sequences plus weighted poisons (RMU)."""
@@ -385,8 +434,8 @@ def preflight(a) -> int:
             bad(f"{name}: micro-batch {mb}; the replay is only exact at 1")
         if not mpath:
             bad(f"{name}: no metrics.jsonl in {cell}")
-        elif n_rows < spec["steps"] * accum:
-            bad(f"{name}: {n_rows} metric rows, need {spec['steps'] * accum}")
+        elif n_rows < (need := spec["steps"] * (1 if float(cfg.get("sam_rho") or 0) > 0 else accum)):
+            bad(f"{name}: {n_rows} metric rows, need {need}")  # NPO+SAM logs one row per step
         else:
             print(f"    metrics {mpath.name}: {n_rows} rows")
         fpz = cfg.get("forget_poison")
@@ -409,6 +458,13 @@ def preflight(a) -> int:
             print("    already replayed: the train job skips it")
         elif (Path(a.out) / "train" / name).exists():
             print("    an unfinished replay is on disk: the train job starts it over")
+
+    print("== the library's presets vs the configs of the runs they come from")
+    try:
+        for msg in check_presets(Path(a.pe_work)):
+            bad(msg)
+    except Exception as exc:
+        bad(f"preset check failed: {type(exc).__name__}: {exc}")
 
     print("== Hub access (HF_TOKEN from credentials.sh)")
     token = os.environ.get("HF_TOKEN")
@@ -479,7 +535,6 @@ def replay(a, name: str) -> None:
     ref = ModelSuite.default().get("1B", "pretrain")
     tok = AutoTokenizer.from_pretrained(ref.repo, revision=ref.revision)
     mb = int(cfg.get("forget_batch_size") or cfg.get("batch_size") or 1)
-    accum = int(cfg["gradient_accumulation_steps"])
     max_len = int(cfg["max_seq_len"])
     method_name, hp = method_from_config(cfg)
     method = build_method(method_name, **hp)
@@ -517,13 +572,8 @@ def replay(a, name: str) -> None:
     print(f"[{name}] {method_name} {hp}\n[{name}] data {checks}")
 
     tc = TrainerConfig(
-        output_dir=str(out / "train" / name), learning_rate=float(cfg["learning_rate"]),
-        total_batch_size=mb * accum, micro_batch_size=mb, max_steps=cfg["max_steps"], epochs=cfg["epochs"],
-        max_seq_len=max_len, weight_decay=float(cfg["weight_decay"]),
-        betas=(float(cfg["adam_beta1"]), float(cfg["adam_beta2"])),
-        max_grad_norm=None if cfg.get("max_grad_norm") is None else float(cfg["max_grad_norm"]),
-        lr_schedule=cfg["lr_schedule"], warmup_frac=cfg.get("warmup_frac"), dtype=cfg["dtype"],
-        gradient_checkpointing=bool(cfg.get("gradient_checkpointing")), seed=int(cfg["seed"]),
+        output_dir=str(out / "train" / name), **trainer_kwargs(cfg), max_seq_len=max_len,
+        gradient_checkpointing=bool(cfg.get("gradient_checkpointing")),
         checkpoint_steps=tuple(spec["checkpoints"]), save_optimizer_state=False, resume=False,
         extra={"replay_of": str(cell)})
     t0 = time.time()
