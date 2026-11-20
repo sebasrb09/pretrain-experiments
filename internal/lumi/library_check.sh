@@ -21,7 +21,8 @@
 #        bash internal/lumi/library_check.sh preflight   # checks only, submits nothing
 #        bash internal/lumi/library_check.sh submit      # preflight, then the 7 jobs
 #        bash internal/lumi/library_check.sh submit train   # only some parts: train,
-#                                         # baseline, retraining, gd-full (not in the default)
+#                                         # baseline, retraining, gd-full, anchors (the last two
+#                                         # not in the default)
 #        bash internal/lumi/library_check.sh redo-train     # set the replays aside to run them again
 #    submit refuses when the preflight finds a problem, and skips any job of the
 #    same name already queued or running. Finished work is reused, so
@@ -99,8 +100,8 @@ case "${1:-}" in
     parts=("$@")
     [ ${#parts[@]} -eq 0 ] && parts=(train baseline retraining)
     for part in "${parts[@]}"; do
-      case "$part" in train|baseline|retraining|gd-full) ;;
-        *) echo "ERROR: unknown part '$part' (train, baseline, retraining, gd-full)" >&2; exit 2 ;; esac
+      case "$part" in train|baseline|retraining|gd-full|anchors) ;;
+        *) echo "ERROR: unknown part '$part' (train, baseline, retraining, gd-full, anchors)" >&2; exit 2 ;; esac
     done
     "${PY[@]}" preflight || { echo "ERROR: preflight failed; nothing submitted." >&2; exit 1; }
     common=(--parsable "--export=ALL,PE_REPO=${PE_REPO},LIBCHECK_SRC=${LIBCHECK_SRC},LIBCHECK_OUT=${LIBCHECK_OUT}")
@@ -120,6 +121,19 @@ case "${1:-}" in
       echo "$id"
     }
     for part in "${parts[@]}"; do
+      if [ "$part" = anchors ]; then
+        # the published pairs with no full evaluation yet (179M, 546M pretraining; 1B decayed; 2.7B mid)
+        for target in 179M-pretrain-baseline 179M-pretrain-retraining 546M-pretrain-baseline \
+                      546M-pretrain-retraining 1B-decayed-baseline 1B-decayed-retraining \
+                      2.7B-mid-baseline 2.7B-mid-retraining; do
+          walltime=12:00:00
+          [ "${target%%-*}" = 2.7B ] && walltime=24:00:00   # 2.7B's batch-1 group took 9.6 h
+          for group in b1 e8; do
+            submit_job "libcheck-${target}-${group}" --time="$walltime" "$SELF" eval "$target" "$group" >/dev/null || exit 1
+          done
+        done
+        continue
+      fi
       if [ "$part" = train ]; then
         train=$(submit_job libcheck-train --mem=120G --time=06:00:00 "$SELF" train) || exit 1
       elif [ "$part" = gd-full ]; then
