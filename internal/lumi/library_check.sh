@@ -129,6 +129,9 @@ case "${1:-}" in
           walltime=12:00:00
           [ "${target%%-*}" = 2.7B ] && walltime=24:00:00   # 2.7B's batch-1 group took 9.6 h
           for group in b1 e8; do
+            if [ -f "${LIBCHECK_OUT}/records/eval-${target}-${group}.json" ]; then
+              echo "skipped libcheck-${target}-${group}: already evaluated" >&2; continue
+            fi
             submit_job "libcheck-${target}-${group}" --time="$walltime" "$SELF" eval "$target" "$group" >/dev/null || exit 1
           done
         done
