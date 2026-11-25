@@ -254,7 +254,8 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   # with the time, exports-<date>-<HHMM> (2026-11-11), so two exports of one day never overwrite each other.
   local W="${PE_WORK:-/scratch/project_465003383/unlearning_baselines}" p force=" " seed="" todo="" skip="" first
   local L="$W/exports-latest" S="$W/.exports-stamps" T="$W/.exports-work" D="exports-$(date +%F-%H%M)"
-  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B mid-check"
+  # hpo-final-decayed (2026-11-25): trials retrained on the cooled-down 1B (optuna_hpo --finalize --size 1B-decayed)
+  local RESULTS="cells-1B-v2 anchors-b1 anchors-e8 hpo-final hpo-trials hpo-frontier post-training-1B size-reference published-reference reference-2.7B hpo-final-2.7B hpo-final-decayed mid-check"
   # a study is hpo-<method>-<wm|wmarea>[-<suffix>]: the suffixed ones are the controls and scans run as
   # their own studies (2026-10-22: -fresh/-b09 optimizer test, -lr050..-lr090 GA scan)
   local STUDIES; STUDIES=$(ls "$W/hpo" 2>/dev/null | sed -nE 's/^hpo-(.+)-(wm|wmarea)(-[a-z0-9]+)?-t[0-9]+$/hpo-\1-\2\3/p' | sort -u | tr '\n' ' ')
@@ -277,7 +278,7 @@ pe_export () {   # pe_export [all | seed <export dir> | part ...]: export again 
   fi
   _pe_src () { case $1 in   # <output root under W> <tags> <audit the configs 0|1>
       cells-1B-v2) echo "unlearning-pareto-1B 1B-v2-* 1";; anchors-b1) echo "unlearning-pareto-1B-b1 none 0";;
-      anchors-e8) echo "unlearning-pareto-1B-e8 none 0";; hpo-final|hpo-final-2.7B) echo "$1 hpo-*-final-* 1";;
+      anchors-e8) echo "unlearning-pareto-1B-e8 none 0";; hpo-final|hpo-final-2.7B|hpo-final-decayed) echo "$1 hpo-*-final-* 1";;
       hpo-trials) echo "hpo hpo-*-wm*-t* 1";; hpo-frontier) echo "hpo-frontier hpo-*-front-* 1";;
       *) echo "$1 none 0";; esac; }
   _pe_stale () {   # _pe_stale <part>: true when it must be exported again

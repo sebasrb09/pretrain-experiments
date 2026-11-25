@@ -16,10 +16,15 @@ Every number it checks was produced on this cluster by the research code:
   C  ROCm        two grad-diff steps at micro-batch 1 and 2: the research
                  drivers turned every weight NaN after step 1 at micro-batch
                  > 1 on LUMI (2026-10-06).
+  D  attack      the rebuttal's relearning attack on the NPO pick (forget
+                 sample, and unrelated text from step 110k) replayed with
+                 attacks.relearn from each run's attack.json: the per-step
+                 losses against its log, the checkpoints tensor by tensor.
 
     python library_check.py --pe-work W --out O preflight         # login node
     python library_check.py --pe-work W --out O train             # GPU job: B, C, B's quick evals
     python library_check.py --pe-work W --out O eval NAME GROUP   # GPU job: one model, one group
+    python library_check.py --pe-work W --out O relearn           # GPU job: D
     python library_check.py --pe-work W --out O report            # login node
 
 library_check.sh runs these with the paths set. The library is imported from
@@ -71,6 +76,13 @@ REPLAYS = {
                     config="npo_config.json", steps=3, checkpoints=(3,), quick=()),
 }
 FULL_TARGETS = ("baseline", "retraining", "grad-diff-step-2")
+# The rebuttal's relearning attack on the NPO pick (hpo-npo-wmarea-t0057 step 8), 2026-11-09:
+# the run's folder (attack.json, step-10, step-50) and the job log with its per-step losses.
+RELEARNS = {
+    "npo-relearn": dict(run="rebuttal/attacks/npo/relearn", log="rebuttal/attacks/atk-npo_23558304.out"),
+    "npo-relearn-retain": dict(run="rebuttal/attacks/npo/relearn-retain",
+                               log="rebuttal/attacks/atk-npo-retain_23573769.out"),
+}
 # Published pairs with no full evaluation yet: evaluated for the library's shipped anchors
 # (2026-11-20). Name -> (size, stage, variant) in the catalog.
 ANCHOR_TARGETS = {f"{size}-{stage}-{variant}": (size, stage, variant)
@@ -377,6 +389,40 @@ def retain_stream(start_step: int, max_seq_len: int):
     if key not in _RETAIN:
         _RETAIN[key] = load_retain_stream(start_step=start_step, max_seq_len=max_seq_len)
     return _RETAIN[key]
+
+
+def compare_weights(mine: Path, theirs: Path) -> dict:
+    """Two Hugging Face folders, tensor by tensor: how many are bit-identical, the largest difference."""
+    import torch
+    from safetensors.torch import load_file
+
+    def load(d):
+        t = {}
+        for f in sorted(d.glob("*.safetensors")):
+            t.update(load_file(str(f)))
+        return t
+
+    a, b = load(mine), load(theirs)
+    if set(a) != set(b):
+        return {"tensors": len(a), "names_differ": sorted(set(a) ^ set(b))[:5]}
+    bitwise = sum(a[k].dtype == b[k].dtype and torch.equal(a[k], b[k]) for k in a)
+    worst = max(float((a[k].float() - b[k].float()).abs().max()) for k in a)
+    return {"tensors": len(a), "bitwise": bitwise, "max_abs_diff": worst}
+
+
+def research_relearn_log(path: Path) -> tuple[dict, str | None]:
+    """{step: loss} and the 'N of M <data> sequences' line from a research attack log."""
+    import re
+
+    losses, sample = {}, None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"\s*step (\d+): loss ([0-9.]+) \(last micro-batch\)", line)
+        if m:
+            losses[int(m.group(1))] = m.group(2)
+        m = re.search(r"(\d+ of \d+ \w+ sequences)", line)
+        if m and "relearning" in line:
+            sample = m.group(1)
+    return losses, sample
 
 
 def finite_weights(step_dir: Path) -> bool:
@@ -714,6 +760,57 @@ def train(a) -> int:
     return 1 if failed else 0
 
 
+def relearn_replay(a) -> int:
+    """D: the library's attacks.relearn with each research run's own settings."""
+    import torch
+    from transformers import AutoTokenizer
+
+    from llm_unlearning_lifecycle import attacks, load_forget_set
+
+    print(f"device: cuda={torch.cuda.is_available()} hip={torch.version.hip}")
+    if not torch.cuda.is_available():
+        raise SystemExit("no GPU visible")
+    out, pe = Path(a.out), Path(a.pe_work)
+    failed = []
+    for name, spec in RELEARNS.items():
+        if read_record(out, f"relearn-{name}"):
+            print(f"[{name}] already replayed")
+            continue
+        try:
+            run = pe / spec["run"]
+            cfg = json.loads((run / "attack.json").read_text(encoding="utf-8"))
+            n = int(cfg["max_seq_len"])
+            if cfg.get("data") == "retain":
+                data, info = retain_stream(int(cfg["retain_start_step"]), n)
+            else:
+                tok = AutoTokenizer.from_pretrained(cfg["model"])
+                data, info = load_forget_set(tok, experiments=cfg.get("forget_experiments"), max_seq_len=n,
+                                             cache_dir=out / "cache" / "forget")
+            dest = out / "attacks" / name
+            t0 = time.time()
+            steps = sorted({int(x) for x in str(cfg["checkpoint_steps"]).split(",")} | {int(cfg["steps"])})
+            saved = attacks.relearn(cfg["model"], dest, data, revision=cfg.get("revision"),
+                                    n_texts=int(cfg["n_texts"]), sample_seed=int(cfg["sample_seed"]),
+                                    steps=int(cfg["steps"]), checkpoint_steps=tuple(steps),
+                                    batch_size=int(cfg["batch_size"]), micro_batch_size=int(cfg["micro_batch"]),
+                                    learning_rate=float(cfg["learning_rate"]), seed=int(cfg["seed"]),
+                                    max_seq_len=n, device="cuda",
+                                    gradient_checkpointing=bool(cfg.get("gradient_checkpointing")))
+            seconds = round(time.time() - t0)
+            weights = {s: compare_weights(Path(saved[s]), run / f"step-{s}") for s in steps}
+            write_record(out, f"relearn-{name}", {"research": str(run), "settings": cfg, "data_items": len(data),
+                                                   "data_info": info, "weights": weights, "seconds": seconds})
+            print(f"[{name}] {seconds}s; weights vs the research run: {weights}")
+        except Exception as exc:  # keep going: the two runs are independent
+            failed.append(name)
+            print(f"[{name}] FAILED: {type(exc).__name__}: {exc}")
+            import traceback
+
+            traceback.print_exc()
+    print(f"relearn job done; failed: {failed or 'none'}")
+    return 1 if failed else 0
+
+
 def eval_target(a) -> int:
     from llm_unlearning_lifecycle import ModelSuite
     from llm_unlearning_lifecycle.evaluation import PAPER_TASKS
@@ -842,6 +939,34 @@ def report(a) -> int:
             p(f"  {label:10s} {r['status']}  "
               f"{ {k: v for k, v in r.items() if k not in ('rows', 'status')} }")
 
+    p("\n== D: relearning attack, the library's attacks.relearn vs the rebuttal's runs")
+    for name, spec in RELEARNS.items():
+        rec = read_record(out, f"relearn-{name}")
+        p(f"\n[{name}] {spec['run']}")
+        if not rec:
+            p("  not run (or failed): see the relearn job's log")
+            counts["missing"] += 1
+            continue
+        theirs, sample = research_relearn_log(Path(a.pe_work) / spec["log"])
+        n_texts = rec["settings"]["n_texts"]
+        same_data = sample is not None and sample.split()[2] == str(rec["data_items"])
+        counts["ok" if same_data else "CHECK"] += 1
+        p(f"  sample: library {n_texts} of {rec['data_items']}, research '{sample}'  {'ok' if same_data else 'CHECK'}")
+        rows = (out / "attacks" / name / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        mine = {int(r["step"]): r["loss_last_microbatch"] for r in map(json.loads, rows)}
+        same = [s for s in theirs if s in mine and f"{mine[s]:.4f}" == theirs[s]]
+        worst = max((abs(mine[s] - float(theirs[s])) for s in theirs if s in mine), default=float("nan"))
+        ok = len(same) == len(theirs) == len(mine)
+        counts["ok" if ok else "CHECK"] += 1
+        p(f"  losses: {len(same)} of {len(theirs)} steps equal at the log's 4 decimals "
+          f"(largest difference {worst:.2g}); library logged {len(mine)} steps  {'ok' if ok else 'CHECK'}")
+        for s, w in sorted(rec["weights"].items(), key=lambda kv: int(kv[0])):
+            ok = w.get("bitwise") == w.get("tensors")
+            counts["ok" if ok else "CHECK"] += 1
+            p(f"  step {s} weights: {w.get('bitwise')} of {w.get('tensors')} tensors bit-identical, "
+              f"max |diff| {w.get('max_abs_diff', float('nan')):.3g}  {'ok' if ok else 'CHECK'}")
+        p(f"  ({rec['seconds']}s)")
+
     p("\n== A/B: evaluations against the export")
     for target, want in EXPECTED.items():
         got, how = collect(out / "evals" / target)
@@ -928,6 +1053,7 @@ def main(argv=None) -> int:
     e = sub.add_parser("eval")
     e.add_argument("name", choices=FULL_TARGETS + tuple(ANCHOR_TARGETS))
     e.add_argument("group", choices=GROUPS)
+    sub.add_parser("relearn")
     sub.add_parser("report")
     sub.add_parser("redo-train")
     a = ap.parse_args(argv)
@@ -935,8 +1061,8 @@ def main(argv=None) -> int:
 
     # The library's progress (cache builds, the retain stream, each task) into the job log.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
-    return {"preflight": preflight, "train": train, "eval": eval_target, "report": report,
-            "redo-train": redo_train}[a.cmd](a)
+    return {"preflight": preflight, "train": train, "eval": eval_target, "relearn": relearn_replay,
+            "report": report, "redo-train": redo_train}[a.cmd](a)
 
 
 if __name__ == "__main__":

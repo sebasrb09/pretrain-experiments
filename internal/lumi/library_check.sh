@@ -21,8 +21,8 @@
 #        bash internal/lumi/library_check.sh preflight   # checks only, submits nothing
 #        bash internal/lumi/library_check.sh submit      # preflight, then the 7 jobs
 #        bash internal/lumi/library_check.sh submit train   # only some parts: train,
-#                                         # baseline, retraining, gd-full, anchors (the last two
-#                                         # not in the default)
+#                                         # baseline, retraining, gd-full, anchors, relearn (the
+#                                         # last three not in the default)
 #        bash internal/lumi/library_check.sh redo-train     # set the replays aside to run them again
 #    submit refuses when the preflight finds a problem, and skips any job of the
 #    same name already queued or running. Finished work is reused, so
@@ -37,6 +37,8 @@
 #   libcheck-<model>-<group>   the full suite, one settings group per job, for the
 #                        Baseline, Retraining and the grad-diff replay at step 2
 #                        (the last two after the train job); 60G, ~4-6 h each
+#   libcheck-relearn     the relearning attack replayed twice (forget sample, unrelated
+#                        text), ~0.5 h (the research runs took 5 and 24 min)
 #
 # Variables read here: LIBCHECK_SRC (default $PE_WORK/llm-unlearning-lifecycle/src),
 # LIBCHECK_OUT (default $PE_WORK/library-check). The library itself reads none.
@@ -100,8 +102,9 @@ case "${1:-}" in
     parts=("$@")
     [ ${#parts[@]} -eq 0 ] && parts=(train baseline retraining)
     for part in "${parts[@]}"; do
-      case "$part" in train|baseline|retraining|gd-full|anchors) ;;
-        *) echo "ERROR: unknown part '$part' (train, baseline, retraining, gd-full, anchors)" >&2; exit 2 ;; esac
+      case "$part" in train|baseline|retraining|gd-full|anchors|relearn) ;;
+        *) echo "ERROR: unknown part '$part' (train, baseline, retraining, gd-full, anchors, relearn)" >&2
+           exit 2 ;; esac
     done
     "${PY[@]}" preflight || { echo "ERROR: preflight failed; nothing submitted." >&2; exit 1; }
     common=(--parsable "--export=ALL,PE_REPO=${PE_REPO},LIBCHECK_SRC=${LIBCHECK_SRC},LIBCHECK_OUT=${LIBCHECK_OUT}")
@@ -137,6 +140,10 @@ case "${1:-}" in
         done
         continue
       fi
+      if [ "$part" = relearn ]; then
+        submit_job libcheck-relearn --time=02:00:00 "$SELF" relearn >/dev/null || exit 1
+        continue
+      fi
       if [ "$part" = train ]; then
         train=$(submit_job libcheck-train --mem=120G --time=06:00:00 "$SELF" train) || exit 1
       elif [ "$part" = gd-full ]; then
@@ -158,8 +165,8 @@ case "${1:-}" in
   preflight|report|redo-train)
     "${PY[@]}" "$1"
     ;;
-  train)
-    "${PY[@]}" train
+  train|relearn)
+    "${PY[@]}" "$1"
     ;;
   eval)
     [ $# -eq 3 ] || { echo "usage: library_check.sh eval NAME GROUP" >&2; exit 2; }

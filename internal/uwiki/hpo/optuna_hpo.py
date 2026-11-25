@@ -149,7 +149,32 @@ SIZES = {
         "hidden": 2880, "slow": 3.0,
         "tag": "-2.7B", "final_root": os.path.join(PE, "hpo-final-2.7B"),
     },
+    # The cooled-down (LR-decayed) 1B experiment model (2026-11-25, user: RMU for Figure 4, the cooled-down poison
+    # frontier, "consistent with the others"): --finalize --size 1B-decayed retrains a 1B study's trials on it, as
+    # the 2.7B transfer does. The recipe of the decayed arm (decayed-1b-run-recipe): the decayed repo ships no
+    # optimizer state, so Adam starts from zeroed moments (RESUME_OPTIM=none, mandatory: an empty value falls back
+    # to the CONTINUOUS checkpoint's moments) and the continuous repo lends its config; the step count is given,
+    # as "main" names no step. family: the repositories' size, which the size checks compare.
+    "1B-decayed": {
+        "identity": {
+            "MODEL": "sbordt/OLMo-2-1B-Exp",
+            "REVISION": "main",
+            "OPTIM_REPO": "sbordt/OLMo-2-1B-Exp-Unlearning",
+            "OPTIM_REVISION": "step100000-unsharded",
+            "OLMO_CONFIG": "",
+            "RESUME_OPTIM": "none",
+            "START_STEP": "100000",
+        },
+        "counterfactual": "sbordt/OLMo-2-1B",
+        "noise": NOISE_DIR_1B, "mia": "mia-cache-b1", "hidden": 2048, "slow": 1.0, "family": "1B",
+        "tag": "-decayed", "final_root": os.path.join(PE, "hpo-final-decayed"),
+    },
 }
+
+
+def _fam(size):
+    """The repositories' size of a SIZES row: its own name, or "family" (the cooled-down 1B is a 1B)."""
+    return SIZES[size].get("family", size)
 
 
 def _scaled(hms, k):
@@ -160,15 +185,16 @@ def _scaled(hms, k):
 
 
 def _other_sizes(text, size):
-    return [o for o in SIZES if o != size and f"OLMo-2-{o}" in text]
+    # by family: the 1B and the cooled-down 1B rows share the 1B repositories
+    return sorted({_fam(o) for o in SIZES if _fam(o) != _fam(size) and f"OLMo-2-{_fam(o)}" in text})
 
 
 def _check_training_env(env, size):
     """A training job of `size` must name that size's model and moments and nothing of another size."""
     bad = [f"{k}={v}" for k, v in sorted(env.items()) if _other_sizes(str(v), size)]
     for k in ("MODEL", "OPTIM_REPO"):
-        if f"OLMo-2-{size}" not in env.get(k, ""):
-            bad.append(f"{k}={env.get(k)!r} is not an OLMo-2-{size} repository")
+        if f"OLMo-2-{_fam(size)}" not in env.get(k, ""):
+            bad.append(f"{k}={env.get(k)!r} is not an OLMo-2-{_fam(size)} repository")
     if bad:
         sys.exit(f"REFUSING to submit a {size} training job with: " + "; ".join(bad))
 
@@ -185,8 +211,8 @@ def _check_targets(targets, size):
     for t in targets:
         if _other_sizes(t["exports"], size):
             bad.append(f"{t['what']}: {t['exports'].split(',')[0]} names another size")
-        if t.get("repo") and f"OLMo-2-{size}" not in t["repo"]:
-            bad.append(f"{t['what']}: {t['repo']} is not an OLMo-2-{size} repository")
+        if t.get("repo") and f"OLMo-2-{_fam(size)}" not in t["repo"]:
+            bad.append(f"{t['what']}: {t['repo']} is not an OLMo-2-{_fam(size)} repository")
         cfg = os.path.join(t["ckpt"], "config.json") if t.get("ckpt") else None
         if cfg and os.path.exists(cfg):
             try:
@@ -1748,7 +1774,8 @@ def finalize(args):
         if args.dry_run:
             print(f"    [dry] {' '.join(cmd)}")
             print(f"          MODEL={env['MODEL']} REVISION={env['REVISION']} OPTIM_REPO={env['OPTIM_REPO']} "
-                  f"OPTIM_REVISION={env['OPTIM_REVISION']} OUTPUT_ROOT={root}")
+                  f"OPTIM_REVISION={env['OPTIM_REVISION']} OUTPUT_ROOT={root} "
+                  f"RESUME_OPTIM={env.get('RESUME_OPTIM', '<auto>')} START_STEP={env.get('START_STEP', '<100000>')}")
             print(f"          CKPT_STEPS={tenv['CKPT_STEPS']} MICRO_BATCH={tenv['MICRO_BATCH']} "
                   f"NO_TRAINER_STATE={tenv['NO_TRAINER_STATE']} FORGET_EXPS={env.get('FORGET_EXPS', '<default>')} "
                   f"FORGET_POISON_DIR={env.get('FORGET_POISON_DIR', '<none>')} POISON_ONLY={env.get('POISON_ONLY', '0')}")
@@ -2153,10 +2180,12 @@ def main():
     if args.space == "v12-sam" and (args.method != "npo" or "SAM_RHO" in args.fixed_env):
         ap.error("--space v12-sam searches SAM's radius for --method npo: drop --fixed SAM_RHO (or use v12)")
 
+    # --finalize --poison-only (2026-11-25): retrained winners measured on C4 and the poison alone, which is all
+    # Figure 4 (the cooled-down poison frontier) draws; the full suite at every rung would cost ~10x more
     if (args.c4_only or args.utility_only or args.pe_only or args.poison_only) and not (
-            args.eval_models or args.eval_cells or args.eval_anchors):
+            args.eval_models or args.eval_cells or args.eval_anchors or (args.finalize and args.poison_only)):
         ap.error("--c4-only, --utility-only, --poison-only and --pe-only go with --eval-models, --eval-cells "
-                 "or --eval-anchors")
+                 "or --eval-anchors (--poison-only also with --finalize)")
     if args.pe_only and (args.c4_only or args.utility_only):
         ap.error("--pe-only runs on its own")
     if args.poison_only and (args.c4_only or args.utility_only or args.pe_only or args.max_c4 is not None):
